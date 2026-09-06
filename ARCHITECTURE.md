@@ -64,18 +64,42 @@ One generation:
    fitness, metrics.
 4. If this is a recording generation, **re-simulate** the top N plus a few random
    samples with trajectory capture, and write replays and genomes.
-5. Checkpoint if scheduled.
-6. Breed: elites, then tournament-selected offspring with crossover and mutation,
+5. Breed: elites, then tournament-selected offspring with crossover and mutation,
    then a small number of random immigrants.
+6. Checkpoint if scheduled — *after* breeding, so the snapshot holds the new,
+   unevaluated generation.
 
 Step 4 is worth noting: recording is a *second* evaluation of a handful of
 organisms rather than a flag threaded through the hot loop. Because evaluation is
 pure this costs a few evaluations per recorded generation and keeps the common
 path free of frame buffers it would throw away.
 
-The controller is held off during `settle_time`. Motors stay at target zero
-while the organism drops, so the measured window does not start from a pose
-the network already shoved.
+Step 6's ordering is load-bearing, and is the reason resume is idempotent. A
+checkpoint holds a generation that has been bred but not yet evaluated, appended
+to `stats.csv` or written to `organisms.jsonl`. Snapshotting the generation just
+*finished* instead would make a resume redo work that is already on disk and
+append a second copy of its records — and that is the common case, not the exotic
+one, because a preempted worker has no on-finish checkpoint to land on and must
+resume from a periodic one. `ARTIFACT_FORMAT` 2 marks the change, and resume
+refuses an older checkpoint rather than silently duplicating a generation.
+
+## The measured window
+
+The controller is held off during `settle_time`. Motors stay at target zero while
+the organism drops, so the measured window does not start from a pose the network
+already shoved.
+
+Every field on `Metrics` describes the same interval: from the settled pose at
+`settle_time` to the end of the evaluation. That includes `actuation`, which
+subtracts the impulse spent during the drop. Charging for the settle would price a
+fall the organism cannot influence, and would make the charge scale with
+`settle_time`, mass and hinge count — turning `energy_penalty` into a morphology
+penalty applied before the controller has any say.
+
+`Trace::measure_start_t` names the instant `Metrics::start` was taken from, and
+the recorder always emits a frame there even when the boundary does not fall on
+the recording grid, so a viewer can draw that pose rather than interpolate
+towards it.
 
 ## Key data structures
 
@@ -112,6 +136,13 @@ that, and each is closed:
    generator is in-repo and pinned by a golden-value test.
 3. **Scheduling.** Seeds derive from identity, not from draw order; parallel
    results are collected by index.
+
+Each of those is closed at the level it occurs, and the *result* is pinned
+end to end: `tests/golden.rs` asserts committed fitness and metric bit patterns
+for a frozen configuration, and CI runs it on Linux, Windows and macOS. Without
+that, all three mechanisms could be intact while the pipeline still produced
+different numbers than it did last year — which is the failure the mechanisms
+exist to prevent, and the only one an in-process comparison cannot see.
 
 `Real` is `f32`. Bodies are few, so throughput and cache behaviour matter more
 than precision. It is a type alias; changing it is one line.
@@ -191,8 +222,17 @@ The pieces that matter are in place, and nothing else has been built:
 - checkpoint and restart, with a config-digest check that refuses to resume a run
   whose dynamics changed (while still allowing `generations` to be raised, so a
   finished run can be extended). A version mismatch is refused unless
-  `--force-resume` is given. Checkpoints and replays are written to a temp file
-  and renamed into place;
+  `--force-resume` is given, and so is a checkpoint older than
+  `MIN_RESUMABLE_FORMAT`. Resume is *idempotent*: it never re-appends a generation
+  that is already on disk, whether it lands on a periodic checkpoint or the
+  on-finish one;
+- checkpoints and replays are written to a temp file, fsynced, and renamed into
+  place, with the containing directory flushed afterwards on Unix so the rename
+  itself survives a kill. There is deliberately no delete-then-rename fallback:
+  unlinking a good manifest before its replacement is in place would turn a
+  transient failure into permanent loss;
+- append-only text for the growing files, and every reader of a `.jsonl` tolerates
+  the truncated final line a kill mid-append leaves behind;
 - pure evaluation, so work can be distributed and re-done freely after a
   preemption;
 - `evo bench` reports scaling efficiency and cost per million evaluations,
@@ -215,5 +255,23 @@ until the simulator is fast and measured.
   improves, the same seed gives the same answer on any thread count, a recorded
   champion re-simulates to the identical fitness, a run directory is
   self-describing.
+- **Golden values** (`tests/golden.rs`) for the reproducibility contract itself.
+  Every other determinism test compares two runs inside the same process on the
+  same binary, which cannot catch the simulator quietly producing *different*
+  numbers than it used to — after a refactor, on another platform, under another
+  compiler. These compare against committed constants instead, over a frozen
+  config in `tests/golden.toml`, and are what make a multi-platform CI matrix
+  meaningful. They are sensitive enough to catch a change in the seventh decimal
+  place of a cosine coefficient, which the `2e-5` tolerance in
+  `dsincos_matches_std` sails straight past. A failure here is a bug report, not a
+  constant to update.
+- **CLI tests** (`tests/cli.rs`) drive the real binary, for the behaviours that
+  only exist at that level: which file a command decides to write, and whether it
+  survives a run directory damaged by a kill.
 - **`evo verify`** does the determinism check as a command, so it can be run
   against a real experiment config rather than a test fixture.
+
+CI runs the suite on Linux, Windows and macOS — the determinism claim is a
+cross-platform one, and `math`'s hand-rolled transcendentals exist precisely so
+that results do not depend on the platform libm. It also enforces `cargo fmt` and
+`clippy -D warnings`, and runs `evo verify` against a real experiment.

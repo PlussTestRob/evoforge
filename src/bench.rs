@@ -25,10 +25,15 @@ pub struct ThreadResult {
     pub seconds: f64,
     pub organisms_per_second: f64,
     pub steps_per_second: f64,
-    /// Throughput relative to the single-threaded result.
+    /// Throughput relative to the first measurement in the sweep.
     pub speedup: f64,
-    /// `speedup / threads`. This is the number that decides whether a larger
-    /// instance is worth its price.
+    /// Speedup divided by the *core ratio* over the baseline measurement. This is
+    /// the number that decides whether a larger instance is worth its price.
+    ///
+    /// Normalised against the baseline's thread count rather than against
+    /// `threads` outright, so a sweep that does not start at one thread (`--threads
+    /// 4,8`) still reports meaningful scaling instead of charging the baseline for
+    /// cores it was never compared against.
     pub efficiency: f64,
 }
 
@@ -50,9 +55,7 @@ pub struct BenchReport {
 
 impl BenchReport {
     pub fn best(&self) -> Option<&ThreadResult> {
-        self.results
-            .iter()
-            .max_by(|a, b| a.organisms_per_second.total_cmp(&b.organisms_per_second))
+        self.results.iter().max_by(|a, b| a.organisms_per_second.total_cmp(&b.organisms_per_second))
     }
 
     /// USD per million organism evaluations at the given price per core-hour.
@@ -97,6 +100,7 @@ pub fn run(cfg: &Config, thread_counts: &[usize], repeats: usize) -> anyhow::Res
 
     let mut results: Vec<ThreadResult> = Vec::new();
     let mut baseline_rate = 0.0;
+    let mut baseline_threads = 1usize;
 
     for (i, &threads) in thread_counts.iter().enumerate() {
         let pool = runner::build_pool(threads)?;
@@ -113,24 +117,22 @@ pub fn run(cfg: &Config, thread_counts: &[usize], repeats: usize) -> anyhow::Res
         let organisms_per_second = reference.len() as f64 / best_seconds;
         if i == 0 {
             baseline_rate = organisms_per_second;
+            baseline_threads = actual_threads.max(1);
         }
         let speedup = organisms_per_second / baseline_rate;
+        let core_ratio = actual_threads as f64 / baseline_threads as f64;
         results.push(ThreadResult {
             threads: actual_threads,
             seconds: best_seconds,
             organisms_per_second,
             steps_per_second: organisms_per_second * steps_per_organism as f64,
             speedup,
-            efficiency: speedup / actual_threads as f64,
+            efficiency: speedup / core_ratio,
         });
     }
 
     let total_parts: usize = reference.individuals.iter().map(|i| i.genome.part_count()).sum();
-    let total_joints: usize = reference
-        .individuals
-        .iter()
-        .map(|i| i.genome.joint_count())
-        .sum();
+    let total_joints: usize = reference.individuals.iter().map(|i| i.genome.joint_count()).sum();
     let n = reference.len();
     let genome_bytes = genome_footprint(&reference);
 
@@ -163,13 +165,18 @@ fn genome_footprint(pop: &Population) -> usize {
 /// Linux only, read straight from `/proc`. Everywhere else this returns `None`
 /// rather than pulling in a dependency for a number that is only advisory —
 /// the deployment target for long runs is Linux.
+///
+/// Reads `VmRSS` from `status` rather than the page count from `statm`, because
+/// the latter would need the kernel page size and assuming 4 KiB is wrong by 16x
+/// on a 64 KiB-page aarch64 host.
 fn resident_bytes() -> Option<u64> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = text.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * 4096)
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let rest = text.lines().find_map(|l| l.strip_prefix("VmRSS:"))?;
+    let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Thread counts to sweep on a machine with `cores` cores: 1, 2, 4, ... capped
@@ -225,6 +232,32 @@ mod tests {
         // The single-threaded case is the baseline by definition.
         assert!((report.results[0].speedup - 1.0).abs() < 1e-9);
         assert!(report.best().is_some());
+    }
+
+    /// A sweep that does not start at one thread must still report honest
+    /// scaling. Taking the first measurement as the unit baseline regardless of
+    /// its thread count made `--threads 4,8` claim 25% efficiency for the
+    /// baseline itself.
+    #[test]
+    fn efficiency_is_relative_to_the_baseline_thread_count() {
+        let cfg = bench_config();
+        let report = run(&cfg, &[2, 2], 1).unwrap();
+
+        let baseline = &report.results[0];
+        assert_eq!(baseline.threads, 2);
+        assert!(
+            (baseline.speedup - 1.0).abs() < 1e-9,
+            "the first measurement is the baseline by definition"
+        );
+        assert!(
+            (baseline.efficiency - 1.0).abs() < 1e-9,
+            "a baseline cannot be inefficient relative to itself, got {}",
+            baseline.efficiency
+        );
+        // Same thread count twice: the second measurement carries no core ratio,
+        // so its efficiency tracks its speedup exactly.
+        let second = &report.results[1];
+        assert!((second.efficiency - second.speedup).abs() < 1e-9);
     }
 
     #[test]

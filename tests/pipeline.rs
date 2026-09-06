@@ -24,10 +24,7 @@ impl TempDir {
     fn new(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "evoforge-it-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
@@ -159,7 +156,8 @@ fn a_different_seed_gives_a_different_experiment() {
 fn a_recorded_champion_re_simulates_to_the_same_fitness() {
     let tmp = TempDir::new("champion");
     let cfg = base_config(&tmp, "champion");
-    let summary = runner::run(&cfg, &RunOptions { threads: 4, quiet: true, ..Default::default() }).unwrap();
+    let summary =
+        runner::run(&cfg, &RunOptions { threads: 4, quiet: true, ..Default::default() }).unwrap();
 
     let run = Run::open(&summary.dir).unwrap();
     let stored_text = fs::read_to_string(summary.dir.join(record::GENOMES_FILE)).unwrap();
@@ -209,17 +207,15 @@ fn replaying_at_higher_fidelity_does_not_change_the_outcome() {
     assert_eq!(low.metrics, high.metrics);
     let low_frames = low.trace.unwrap().frames.len();
     let high_frames = high.trace.unwrap().frames.len();
-    assert!(
-        high_frames > low_frames * 5,
-        "{high_frames} frames at 120Hz vs {low_frames} at 10Hz"
-    );
+    assert!(high_frames > low_frames * 5, "{high_frames} frames at 120Hz vs {low_frames} at 10Hz");
 }
 
 #[test]
 fn a_run_directory_is_self_describing() {
     let tmp = TempDir::new("artefacts");
     let cfg = base_config(&tmp, "artefacts");
-    let summary = runner::run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
+    let summary =
+        runner::run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
     // Everything needed to understand or continue the run is in one directory.
     let run = Run::open(&summary.dir).unwrap();

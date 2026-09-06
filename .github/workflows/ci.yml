@@ -8,10 +8,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The determinism contract is a cross-platform claim: `math`'s hand-rolled
+  # transcendentals exist precisely so that results do not depend on the platform
+  # libm. Testing on one OS and one architecture cannot show that. The golden
+  # values in tests/golden.rs are what make this matrix meaningful — they compare
+  # against committed constants rather than against another run on the same
+  # machine.
   test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  # `evo verify` is the determinism check as a command rather than a test, run
+  # against a real experiment config. Cheap, and it exercises the CLI path.
+  verify:
+    name: verify determinism
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.82.0
-      - name: Test
-        run: cargo test --workspace
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release --bin evo -- verify experiments/first-walkers.toml --generations 3
+
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

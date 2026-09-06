@@ -34,8 +34,7 @@ const LN_2: Real = std::f32::consts::LN_2;
 fn poly_sin(r: Real) -> Real {
     let r2 = r * r;
     r * (1.0
-        + r2 * (-1.0 / 6.0
-            + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362_880.0)))))
+        + r2 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362_880.0)))))
 }
 
 /// cos(r) for |r| <= pi/4. Taylor to r^8; error < 2e-9 on the interval.
@@ -98,9 +97,8 @@ pub fn dln(x: Real) -> Real {
     }
     let t = (m - 1.0) / (m + 1.0);
     let t2 = t * t;
-    let series = 2.0
-        * t
-        * (1.0 + t2 * (1.0 / 3.0 + t2 * (0.2 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0)))));
+    let series =
+        2.0 * t * (1.0 + t2 * (1.0 / 3.0 + t2 * (0.2 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0)))));
     series + (exp as Real) * LN_2
 }
 
@@ -154,8 +152,6 @@ pub struct Vec3 {
     pub z: Real,
 }
 
-pub const ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
-
 #[inline]
 pub const fn vec3(x: Real, y: Real, z: Real) -> Vec3 {
     Vec3 { x, y, z }
@@ -179,11 +175,7 @@ impl Vec3 {
 
     #[inline]
     pub fn cross(self, o: Vec3) -> Vec3 {
-        vec3(
-            self.y * o.z - self.z * o.y,
-            self.z * o.x - self.x * o.z,
-            self.x * o.y - self.y * o.x,
-        )
+        vec3(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
     }
 
     #[inline]
@@ -409,17 +401,13 @@ impl Mat3 {
 
     #[inline]
     pub fn diagonal(d: Vec3) -> Mat3 {
-        Mat3 {
-            cols: [vec3(d.x, 0.0, 0.0), vec3(0.0, d.y, 0.0), vec3(0.0, 0.0, d.z)],
-        }
+        Mat3 { cols: [vec3(d.x, 0.0, 0.0), vec3(0.0, d.y, 0.0), vec3(0.0, 0.0, d.z)] }
     }
 
     /// Skew-symmetric matrix such that `skew(a) * b == a.cross(b)`.
     #[inline]
     pub fn skew(a: Vec3) -> Mat3 {
-        Mat3 {
-            cols: [vec3(0.0, a.z, -a.y), vec3(-a.z, 0.0, a.x), vec3(a.y, -a.x, 0.0)],
-        }
+        Mat3 { cols: [vec3(0.0, a.z, -a.y), vec3(-a.z, 0.0, a.x), vec3(a.y, -a.x, 0.0)] }
     }
 
     #[inline]
@@ -429,9 +417,7 @@ impl Mat3 {
 
     #[inline]
     pub fn mul_mat(&self, o: &Mat3) -> Mat3 {
-        Mat3 {
-            cols: [self.mul_vec(o.cols[0]), self.mul_vec(o.cols[1]), self.mul_vec(o.cols[2])],
-        }
+        Mat3 { cols: [self.mul_vec(o.cols[0]), self.mul_vec(o.cols[1]), self.mul_vec(o.cols[2])] }
     }
 
     pub fn transpose(&self) -> Mat3 {
@@ -447,21 +433,13 @@ impl Mat3 {
 
     pub fn sub(&self, o: &Mat3) -> Mat3 {
         Mat3 {
-            cols: [
-                self.cols[0] - o.cols[0],
-                self.cols[1] - o.cols[1],
-                self.cols[2] - o.cols[2],
-            ],
+            cols: [self.cols[0] - o.cols[0], self.cols[1] - o.cols[1], self.cols[2] - o.cols[2]],
         }
     }
 
     pub fn add(&self, o: &Mat3) -> Mat3 {
         Mat3 {
-            cols: [
-                self.cols[0] + o.cols[0],
-                self.cols[1] + o.cols[1],
-                self.cols[2] + o.cols[2],
-            ],
+            cols: [self.cols[0] + o.cols[0], self.cols[1] + o.cols[1], self.cols[2] + o.cols[2]],
         }
     }
 
@@ -596,9 +574,7 @@ mod tests {
 
     #[test]
     fn mat3_inverse() {
-        let m = Mat3 {
-            cols: [vec3(2.0, 0.3, -0.1), vec3(0.3, 1.5, 0.2), vec3(-0.1, 0.2, 3.0)],
-        };
+        let m = Mat3 { cols: [vec3(2.0, 0.3, -0.1), vec3(0.3, 1.5, 0.2), vec3(-0.1, 0.2, 3.0)] };
         let inv = m.inverse().unwrap();
         let id = m.mul_mat(&inv);
         for i in 0..3 {

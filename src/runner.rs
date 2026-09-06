@@ -39,15 +39,23 @@ pub struct RunSummary {
 
 /// Run an experiment to completion.
 pub fn run(cfg: &Config, opts: &RunOptions) -> Result<RunSummary> {
+    // Validated here as well as in the CLI: this is a public entry point, and a
+    // configuration that never went through `Config::load` has never been checked.
+    cfg.validate().context("invalid configuration")?;
+
     let pool = build_pool(opts.threads)?;
 
     let (run, mut population) = match &opts.resume {
-        Some(dir) => resume(dir, cfg, opts.force_resume)?,
+        Some(dir) => resume(dir, cfg, opts)?,
         None => {
             let run = Run::create(cfg).context("creating run directory")?;
             (run, Population::founding(cfg))
         }
     };
+
+    // Continue the wall-clock column rather than restarting it, so a resumed run
+    // does not appear to travel backwards in time at the resume boundary.
+    let elapsed_before = run.elapsed_seconds_so_far()?;
 
     if !opts.quiet {
         println!(
@@ -67,13 +75,16 @@ pub fn run(cfg: &Config, opts: &RunOptions) -> Result<RunSummary> {
     let mut final_stats = None;
     let mut generations_completed = 0;
 
+    let mut last_checkpointed: Option<u32> = None;
+
     while population.generation < cfg.evolution.generations {
         let eval_started = Instant::now();
         evolution::evaluate_population(&mut population, cfg, &pool);
         let eval_seconds = eval_started.elapsed().as_secs_f64();
         organisms_evaluated += population.len() as u64;
 
-        let summary = stats::summarise(&population, eval_seconds, started.elapsed().as_secs_f64());
+        let elapsed = elapsed_before + started.elapsed().as_secs_f64();
+        let summary = stats::summarise(&population, eval_seconds, elapsed);
         if !opts.quiet {
             if summary.generation % 20 == 0 && summary.generation > 0 {
                 println!("{}", GenerationStats::TABLE_HEADER);
@@ -84,19 +95,28 @@ pub fn run(cfg: &Config, opts: &RunOptions) -> Result<RunSummary> {
         run.append_organisms(&population)?;
         record_selected(&run, &population, cfg)?;
 
-        if record::should_checkpoint(population.generation, cfg) {
-            run.write_checkpoint(&population, cfg)?;
-        }
-
+        let completed = population.generation;
         generations_completed += 1;
         final_stats = Some(summary);
         population = evolution::next_generation(&population, cfg);
+
+        // Checkpoint *after* breeding, so the snapshot holds a generation that has
+        // not yet been evaluated or written to disk. Checkpointing the generation
+        // just finished instead would make a resume re-evaluate it and append a
+        // second copy of its stats row and its organism records — which is exactly
+        // what a preempted worker would hit, since it has no on-finish checkpoint
+        // to land on. The schedule still counts completed generations; only the
+        // population inside the file changed.
+        if record::should_checkpoint(completed, cfg) {
+            run.write_checkpoint(&population, cfg)?;
+            last_checkpointed = Some(population.generation);
+        }
     }
 
-    if cfg.checkpoint.on_finish {
-        // The loop leaves `population` holding the unevaluated next generation;
-        // checkpointing it means a resume picks up exactly where this run
-        // stopped.
+    // The loop leaves `population` holding the unevaluated next generation;
+    // checkpointing it means a resume picks up exactly where this run stopped.
+    // Skipped when the schedule already wrote this very generation.
+    if cfg.checkpoint.on_finish && last_checkpointed != Some(population.generation) {
         run.write_checkpoint(&population, cfg)?;
     }
 
@@ -131,11 +151,26 @@ fn record_selected(run: &Run, pop: &Population, cfg: &Config) -> Result<()> {
 }
 
 /// Load the newest checkpoint from an existing run directory.
-fn resume(dir: &Path, cfg: &Config, force: bool) -> Result<(Run, Population)> {
+fn resume(dir: &Path, cfg: &Config, opts: &RunOptions) -> Result<(Run, Population)> {
+    let force = opts.force_resume;
     let run = Run::open(dir).with_context(|| format!("opening run {}", dir.display()))?;
     let Some(checkpoint) = run.latest_checkpoint()? else {
         bail!("{} has no checkpoints to resume from", dir.display());
     };
+
+    // A checkpoint older than `MIN_RESUMABLE_FORMAT` holds a population that has
+    // already been evaluated and written out, so resuming it would duplicate a
+    // generation's records. The layout is still readable — `evo inspect` and
+    // `evo replay` work fine against it — but continuing the run is not safe.
+    if checkpoint.format < record::MIN_RESUMABLE_FORMAT && !force {
+        bail!(
+            "checkpoint is in format {} and holds an already-evaluated generation; \
+             resuming it would append a second copy of generation {}'s records. \
+             Start a new run, or pass --force-resume to accept the duplication",
+            checkpoint.format,
+            checkpoint.population.generation
+        );
+    }
 
     // A checkpoint is only meaningful under the configuration that produced it.
     // Refusing loudly is better than silently continuing an experiment whose
@@ -167,10 +202,12 @@ fn resume(dir: &Path, cfg: &Config, force: bool) -> Result<(Run, Population)> {
     }
 
     let population = checkpoint.population;
-    println!(
-        "resuming {} from generation {}",
-        run.manifest.experiment_id, population.generation
-    );
+    if !opts.quiet {
+        println!(
+            "resuming {} from generation {}",
+            run.manifest.experiment_id, population.generation
+        );
+    }
     Ok((run, population))
 }
 
@@ -224,7 +261,8 @@ mod tests {
     fn a_run_produces_the_expected_artefacts() {
         let tmp = TempDir::new("artefacts");
         let cfg = tiny_config(&tmp);
-        let summary = run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
+        let summary =
+            run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
         assert_eq!(summary.generations_completed, 4);
         assert_eq!(summary.organisms_evaluated, 32);
@@ -232,8 +270,7 @@ mod tests {
         let stats_text = fs::read_to_string(summary.dir.join(record::STATS_FILE)).unwrap();
         assert_eq!(stats_text.lines().count(), 5, "header plus four generations");
 
-        let organisms =
-            fs::read_to_string(summary.dir.join(record::ORGANISMS_FILE)).unwrap();
+        let organisms = fs::read_to_string(summary.dir.join(record::ORGANISMS_FILE)).unwrap();
         assert_eq!(organisms.lines().count(), 32);
 
         let replays: Vec<_> = fs::read_dir(summary.dir.join(record::REPLAY_DIR))
@@ -256,9 +293,7 @@ mod tests {
 
         let read_stats = |dir: &Path| fs::read_to_string(dir.join(record::STATS_FILE)).unwrap();
         let strip_timings = |text: String| -> Vec<String> {
-            text.lines()
-                .map(|l| l.split(',').take(10).collect::<Vec<_>>().join(","))
-                .collect()
+            text.lines().map(|l| l.split(',').take(10).collect::<Vec<_>>().join(",")).collect()
         };
 
         let a = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
@@ -282,11 +317,13 @@ mod tests {
         full.evolution.generations = 4;
 
         // The uninterrupted reference run.
-        let reference = run(&full, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
+        let reference =
+            run(&full, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
         // A run stopped after two generations, then extended. Raising
         // `generations` must not invalidate the checkpoint.
-        let partial = run(&short, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
+        let partial =
+            run(&short, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
         let resumed = run(
             &full,
             &RunOptions {
@@ -314,11 +351,165 @@ mod tests {
         assert_eq!(reference_rows, resumed_rows);
     }
 
+    /// The preemption path: a run killed between checkpoints has no on-finish
+    /// snapshot to land on, so it resumes from a periodic one. That must not
+    /// replay a generation whose stats row and organism records are already on
+    /// disk.
+    #[test]
+    fn resume_from_a_periodic_checkpoint_does_not_duplicate_a_generation() {
+        let tmp = TempDir::new("periodic");
+        let mut short = tiny_config(&tmp);
+        short.evolution.generations = 3;
+        short.checkpoint.every_generations = 1;
+        short.checkpoint.on_finish = false; // as if killed mid-run
+
+        let mut full = short.clone();
+        full.evolution.generations = 5;
+
+        let partial =
+            run(&short, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        run(
+            &full,
+            &RunOptions {
+                threads: 1,
+                quiet: true,
+                resume: Some(partial.dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(partial.dir.join(record::STATS_FILE)).unwrap();
+        let generations: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split(',').next().unwrap())
+            .collect();
+        assert_eq!(
+            generations,
+            ["0", "1", "2", "3", "4"],
+            "every generation must appear exactly once in stats.csv"
+        );
+
+        let organisms = fs::read_to_string(partial.dir.join(record::ORGANISMS_FILE)).unwrap();
+        let mut ids: Vec<u64> = organisms
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<record::OrganismRecord>(l).unwrap().id)
+            .collect();
+        let total = ids.len();
+        assert_eq!(total, 5 * 8, "one record per organism per generation");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "organisms.jsonl contains duplicate ids");
+    }
+
+    /// A checkpoint must hold a generation that has *not* been written out yet,
+    /// which is what makes resume idempotent.
+    #[test]
+    fn a_checkpoint_holds_the_next_unevaluated_generation() {
+        let tmp = TempDir::new("unevaluated-checkpoint");
+        let mut cfg = tiny_config(&tmp);
+        cfg.evolution.generations = 2;
+        cfg.checkpoint.every_generations = 1;
+        cfg.checkpoint.on_finish = false;
+
+        let summary =
+            run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        let opened = Run::open(&summary.dir).unwrap();
+        for path in opened.checkpoint_paths().unwrap() {
+            let checkpoint: record::Checkpoint = record::read_json(&path).unwrap();
+            assert!(
+                checkpoint
+                    .population
+                    .individuals
+                    .iter()
+                    .all(|i| i.fitness == evolution::UNEVALUATED_FITNESS),
+                "{} holds an already-evaluated population",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn elapsed_seconds_does_not_go_backwards_across_a_resume() {
+        let tmp = TempDir::new("elapsed");
+        let mut short = tiny_config(&tmp);
+        short.evolution.generations = 2;
+        let mut full = short.clone();
+        full.evolution.generations = 4;
+
+        let partial =
+            run(&short, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        run(
+            &full,
+            &RunOptions {
+                threads: 1,
+                quiet: true,
+                resume: Some(partial.dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(partial.dir.join(record::STATS_FILE)).unwrap();
+        let elapsed: Vec<f64> = text
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.split(',').nth(GenerationStats::ELAPSED_SECONDS_COLUMN).unwrap().parse().unwrap()
+            })
+            .collect();
+        assert_eq!(elapsed.len(), 4);
+        for w in elapsed.windows(2) {
+            assert!(w[1] >= w[0], "elapsed went backwards: {elapsed:?}");
+        }
+    }
+
+    /// A pre-v2 checkpoint holds an evaluated generation, so resuming it would
+    /// duplicate records. It must be refused by default and only accepted when
+    /// the operator says so.
+    #[test]
+    fn resume_refuses_a_pre_v2_checkpoint_unless_forced() {
+        let tmp = TempDir::new("legacy");
+        let cfg = tiny_config(&tmp);
+        let first =
+            run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+
+        let opened = Run::open(&first.dir).unwrap();
+        let mut checkpoint = opened.latest_checkpoint().unwrap().unwrap();
+        checkpoint.format = 1;
+        record::write_json(&opened.checkpoint_path(checkpoint.population.generation), &checkpoint)
+            .unwrap();
+
+        let opts = |force| RunOptions {
+            threads: 1,
+            quiet: true,
+            resume: Some(first.dir.clone()),
+            force_resume: force,
+        };
+        let err = run(&cfg, &opts(false)).unwrap_err();
+        assert!(err.to_string().contains("already-evaluated"), "{err}");
+        assert!(run(&cfg, &opts(true)).is_ok());
+    }
+
+    #[test]
+    fn run_rejects_an_invalid_configuration() {
+        let tmp = TempDir::new("invalid");
+        let mut cfg = tiny_config(&tmp);
+        cfg.evolution.elite_count = cfg.evolution.population_size;
+        let err = run(&cfg, &RunOptions { quiet: true, ..Default::default() }).unwrap_err();
+        assert!(err.to_string().contains("invalid configuration"), "{err}");
+    }
+
     #[test]
     fn resume_rejects_a_mismatched_config() {
         let tmp = TempDir::new("mismatch");
         let cfg = tiny_config(&tmp);
-        let first = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        let first =
+            run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
 
         let mut changed = cfg.clone();
         changed.evolution.tournament_size += 1;
@@ -339,7 +530,8 @@ mod tests {
     fn resume_rejects_a_version_mismatch_unless_forced() {
         let tmp = TempDir::new("version");
         let cfg = tiny_config(&tmp);
-        let first = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        let first =
+            run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
 
         let opened = Run::open(&first.dir).unwrap();
         let mut checkpoint = opened.latest_checkpoint().unwrap().unwrap();

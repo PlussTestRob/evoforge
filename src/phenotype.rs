@@ -142,13 +142,19 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
         joint_slots.push(part.slot);
     }
 
-    // Drop the organism onto the terrain: translate so its lowest corner sits
-    // just above the ground under its own centre.
-    let lowest = bodies
+    // Drop the organism onto the terrain: translate straight up until no corner
+    // is below the ground beneath *that corner*, plus a little clearance.
+    //
+    // Sampling the terrain per corner rather than once under the root costs one
+    // pass over eight corners per body and is what keeps this correct when
+    // `TerrainModel` grows a non-flat variant. For `Flat` it reduces to exactly
+    // the same arithmetic.
+    let terrain = cfg_terrain(cfg);
+    let deepest = bodies
         .iter()
-        .fold(Real::INFINITY, |m, b| m.min(b.lowest_corner_y()));
-    let ground = cfg_terrain(cfg).height_at(0.0, 0.0);
-    let lift = ground + SPAWN_CLEARANCE - lowest;
+        .flat_map(|b| b.corners())
+        .fold(Real::NEG_INFINITY, |m, c| m.max(terrain.height_at(c.x, c.z) - c.y));
+    let lift = deepest + SPAWN_CLEARANCE;
     for b in bodies.iter_mut() {
         b.pos.y += lift;
     }
@@ -215,11 +221,8 @@ mod tests {
             let mut rng = Rng::new(seed);
             let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
             let p = build(&g, &cfg);
-            let lowest = p
-                .world
-                .bodies
-                .iter()
-                .fold(Real::INFINITY, |m, b| m.min(b.lowest_corner_y()));
+            let lowest =
+                p.world.bodies.iter().fold(Real::INFINITY, |m, b| m.min(b.lowest_corner_y()));
             assert!(
                 (lowest - SPAWN_CLEARANCE).abs() < 1e-4,
                 "seed {seed}: lowest corner at {lowest}"

@@ -34,10 +34,17 @@ pub struct Metrics {
     /// Seconds spent with the root block's local up axis within ~45 degrees of
     /// world up.
     pub upright_seconds: Real,
-    /// Accumulated absolute motor angular impulse: a proxy for effort.
+    /// Accumulated absolute motor angular impulse over the measured window: a
+    /// proxy for effort.
     ///
     /// Includes the impulse spent *holding* a joint still, because that is what
     /// a real actuator spends too. An organism that does nothing is not free.
+    ///
+    /// Excludes the settle drop. The controller is held off there, so charging
+    /// for it would price a fall the organism could not influence — and would
+    /// make the charge scale with `settle_time`, mass and hinge count, turning
+    /// `energy_penalty` into a morphology penalty applied before the controller
+    /// has any say.
     pub actuation: Real,
     /// Measured window length, seconds.
     pub duration: Real,
@@ -111,11 +118,8 @@ mod tests {
     #[test]
     fn penalties_and_bonuses_apply() {
         let m = metrics();
-        let cfg = FitnessCfg {
-            objective: Objective::Distance,
-            energy_penalty: 0.01,
-            upright_bonus: 0.5,
-        };
+        let cfg =
+            FitnessCfg { objective: Objective::Distance, energy_penalty: 0.01, upright_bonus: 0.5 };
         // 5 + 0.5*6 - 0.01*100
         assert!((score(&cfg, &m) - 7.0).abs() < 1e-5);
     }

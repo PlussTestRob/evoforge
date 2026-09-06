@@ -51,8 +51,8 @@ impl Config {
 
     /// Number of physics steps in one evaluation, including the settling period.
     pub fn total_steps(&self) -> u32 {
-        ((self.simulation.settle_time + self.simulation.duration) / self.simulation.timestep)
-            .ceil() as u32
+        ((self.simulation.settle_time + self.simulation.duration) / self.simulation.timestep).ceil()
+            as u32
     }
 
     /// Number of physics steps to run before the controller is enabled and
@@ -212,11 +212,7 @@ pub struct ExperimentCfg {
 
 impl Default for ExperimentCfg {
     fn default() -> Self {
-        ExperimentCfg {
-            name: "unnamed".into(),
-            seed: 1,
-            output_dir: PathBuf::from("runs"),
-        }
+        ExperimentCfg { name: "unnamed".into(), seed: 1, output_dir: PathBuf::from("runs") }
     }
 }
 
@@ -351,11 +347,7 @@ pub struct BrainCfg {
 
 impl Default for BrainCfg {
     fn default() -> Self {
-        BrainCfg {
-            hidden: 10,
-            init_sigma: 0.8,
-            weight_limit: 8.0,
-        }
+        BrainCfg { hidden: 10, init_sigma: 0.8, weight_limit: 8.0 }
     }
 }
 
@@ -460,11 +452,7 @@ pub struct FitnessCfg {
 
 impl Default for FitnessCfg {
     fn default() -> Self {
-        FitnessCfg {
-            objective: Objective::Distance,
-            energy_penalty: 0.0,
-            upright_bonus: 0.0,
-        }
+        FitnessCfg { objective: Objective::Distance, energy_penalty: 0.0, upright_bonus: 0.0 }
     }
 }
 
@@ -508,10 +496,7 @@ pub struct CheckpointCfg {
 
 impl Default for CheckpointCfg {
     fn default() -> Self {
-        CheckpointCfg {
-            every_generations: 25,
-            on_finish: true,
-        }
+        CheckpointCfg { every_generations: 25, on_finish: true }
     }
 }
 
@@ -712,9 +697,7 @@ mod tests {
     #[test]
     fn bundled_experiments_validate() {
         for name in ["first-walkers.toml", "directed-walkers.toml"] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("experiments")
-                .join(name);
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("experiments").join(name);
             Config::load(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
@@ -834,7 +817,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(compact.evolution_digest(), padded.evolution_digest());
-        assert_eq!(compact.digest(), Config::from_toml_str("[experiment]\nseed = 99\n").unwrap().digest());
+        assert_eq!(
+            compact.digest(),
+            Config::from_toml_str("[experiment]\nseed = 99\n").unwrap().digest()
+        );
     }
 
     #[test]

@@ -213,7 +213,10 @@ fn cmd_bench(args: BenchArgs) -> Result<()> {
         cfg.simulation.control_hz,
         cfg.simulation.solver_iterations,
     );
-    println!("machine reports {cores} cores; best of {} runs per thread count", args.repeats.max(1));
+    println!(
+        "machine reports {cores} cores; best of {} runs per thread count",
+        args.repeats.max(1)
+    );
     println!();
 
     let report = bench::run(&cfg, &thread_counts, args.repeats)?;
@@ -267,8 +270,8 @@ fn cmd_bench(args: BenchArgs) -> Result<()> {
 }
 
 fn cmd_inspect(args: InspectArgs) -> Result<()> {
-    let run = Run::open(&args.run)
-        .with_context(|| format!("opening run {}", args.run.display()))?;
+    let run =
+        Run::open(&args.run).with_context(|| format!("opening run {}", args.run.display()))?;
     let cfg = run.config()?;
 
     println!("experiment    {}", run.manifest.experiment_id);
@@ -296,42 +299,41 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
     println!("{}", stats::GenerationStats::TABLE_HEADER);
     for row in rows.iter().skip(rows.len().saturating_sub(args.tail)) {
         let f: Vec<&str> = row.split(',').collect();
-        if f.len() < 13 {
+        if f.len() < stats::GenerationStats::CSV_COLUMNS {
             continue;
         }
         println!(
             "{:>5} | {:>7} {:>8} {:>8} {:>8} | {:>4} {:>6} {:>4} | {:>7} {:>8}s",
-            f[0], trim(f[2]), trim(f[3]), trim(f[4]), trim(f[5]), f[7], trim(f[8]), f[9],
-            trim(f[11]), trim(f[12])
+            f[0],
+            trim(f[2]),
+            trim(f[3]),
+            trim(f[4]),
+            trim(f[5]),
+            f[7],
+            trim(f[8]),
+            f[9],
+            trim(f[11]),
+            trim(f[12])
         );
     }
 
     let checkpoints = run.checkpoint_paths()?;
     println!();
-    println!("{} checkpoint(s), newest {}",
+    println!(
+        "{} checkpoint(s), newest {}",
         checkpoints.len(),
-        checkpoints.first().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
+        checkpoints.first().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
+    );
 
-    let genomes_path = args.run.join(record::GENOMES_FILE);
-    if genomes_path.exists() {
-        let stored = std::fs::read_to_string(&genomes_path)?;
-        let mut best: Option<record::StoredGenome> = None;
-        for line in stored.lines().filter(|l| !l.trim().is_empty()) {
-            let g: record::StoredGenome = serde_json::from_str(line)?;
-            if best.as_ref().is_none_or(|b| g.fitness > b.fitness) {
-                best = Some(g);
-            }
-        }
-        if let Some(b) = best {
-            println!(
-                "best stored genome: organism {} from generation {}, fitness {:.3}, {} parts",
-                b.id,
-                b.generation,
-                b.fitness,
-                b.genome.part_count()
-            );
-            println!("  evo replay {} --organism {}", args.run.display(), b.id);
-        }
+    if let Some(b) = run.best_stored_genome()? {
+        println!(
+            "best stored genome: organism {} from generation {}, fitness {:.3}, {} parts",
+            b.id,
+            b.generation,
+            b.fitness,
+            b.genome.part_count()
+        );
+        println!("  evo replay {} --organism {}", args.run.display(), b.id);
     }
     Ok(())
 }
@@ -344,18 +346,22 @@ fn trim(s: &str) -> String {
 }
 
 fn cmd_replay(args: ReplayArgs) -> Result<()> {
-    let run = Run::open(&args.run)
-        .with_context(|| format!("opening run {}", args.run.display()))?;
+    let run =
+        Run::open(&args.run).with_context(|| format!("opening run {}", args.run.display()))?;
     let mut cfg = run.config()?;
 
     let stored = match (args.organism, args.best) {
-        (Some(id), _) => run
-            .find_genome(id)?
-            .with_context(|| format!("no stored genome for organism {id}"))?,
-        (None, true) => best_stored_genome(&args.run)?,
+        (Some(id), _) => {
+            run.find_genome(id)?.with_context(|| format!("no stored genome for organism {id}"))?
+        }
+        (None, true) => run.best_stored_genome()?.context("no genomes were stored for this run")?,
         (None, false) => bail!("specify --organism <id> or --best"),
     };
 
+    // The run's own dynamics, before any override. `--hz` only changes how often
+    // the trajectory is sampled and leaves this untouched, which is the whole
+    // point of the command; `--duration` changes the simulation itself.
+    let run_digest = cfg.evolution_digest();
     if let Some(hz) = args.hz {
         cfg.recording.record_hz = hz;
     }
@@ -363,6 +369,7 @@ fn cmd_replay(args: ReplayArgs) -> Result<()> {
         cfg.simulation.duration = d;
     }
     cfg.validate()?;
+    let dynamics_changed = cfg.evolution_digest() != run_digest;
 
     println!(
         "organism {} from generation {} (parents {:?}), recorded fitness {:.4}",
@@ -398,54 +405,46 @@ fn cmd_replay(args: ReplayArgs) -> Result<()> {
     };
     let frames = trace.frames.len();
 
+    // The re-simulated organism, carrying the fitness it just earned rather than
+    // the one it was recorded with.
+    let individual = evolution::Individual {
+        id: stored.id,
+        generation: stored.generation,
+        parents: stored.parents,
+        genome: stored.genome.clone(),
+        fitness: result.fitness,
+        metrics: result.metrics,
+    };
+
     let path = match args.out {
         Some(p) => {
-            let replay = record::Replay {
-                format: record::ARTIFACT_FORMAT,
-                experiment_id: run.manifest.experiment_id.clone(),
-                organism_id: stored.id,
-                generation: stored.generation,
-                parents: stored.parents,
-                fitness: result.fitness,
-                metrics: result.metrics,
-                config_digest: cfg.evolution_digest(),
-                timestep: cfg.simulation.timestep,
-                genome: stored.genome.clone(),
-                trace,
-            };
-            record::write_json(&p, &replay)?;
+            run.write_replay_to(&p, &individual, trace, &cfg)?;
             p
         }
-        None => {
-            let individual = evolution::Individual {
-                id: stored.id,
-                generation: stored.generation,
-                parents: stored.parents,
-                genome: stored.genome.clone(),
-                fitness: result.fitness,
-                metrics: result.metrics,
-            };
-            run.write_replay(&individual, trace, &cfg)?
+        // Re-simulating under different dynamics must not overwrite the trajectory
+        // the run itself recorded: that file is the run's own evidence, and this
+        // one was produced by a different experiment.
+        None if dynamics_changed => {
+            let p = run.variant_replay_path(
+                individual.generation,
+                individual.id,
+                cfg.evolution_digest(),
+            );
+            run.write_replay_to(&p, &individual, trace, &cfg)?;
+            println!();
+            println!(
+                "note: these dynamics differ from the run's own, so the run's \
+                 recording of organism {} was left untouched",
+                individual.id
+            );
+            p
         }
+        None => run.write_replay(&individual, trace, &cfg)?,
     };
 
     println!();
     println!("wrote {frames} frames at {}Hz to {}", cfg.recording.record_hz, path.display());
     Ok(())
-}
-
-fn best_stored_genome(dir: &std::path::Path) -> Result<record::StoredGenome> {
-    let path = dir.join(record::GENOMES_FILE);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut best: Option<record::StoredGenome> = None;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let g: record::StoredGenome = serde_json::from_str(line)?;
-        if best.as_ref().is_none_or(|b| g.fitness > b.fitness) {
-            best = Some(g);
-        }
-    }
-    best.context("no genomes were stored for this run")
 }
 
 fn describe_genome(g: &evoforge::genome::Genome) {

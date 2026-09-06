@@ -44,17 +44,17 @@ pub fn summarise(pop: &Population, eval_seconds: f64, elapsed_seconds: f64) -> G
 
     let n = fitnesses.len();
     let sum: f64 = fitnesses.iter().map(|&f| f as f64).sum();
+    // Averaged in `f64`: two `UNEVALUATED_FITNESS` sentinels are each close to
+    // `Real::MIN`, and summing them in `Real` would overflow to -inf and put a
+    // non-numeric token in the CSV.
     let median = if n % 2 == 1 {
         fitnesses[n / 2]
     } else {
-        0.5 * (fitnesses[n / 2 - 1] + fitnesses[n / 2])
+        (0.5 * (fitnesses[n / 2 - 1] as f64 + fitnesses[n / 2] as f64)) as Real
     };
 
-    let structures: HashSet<u64> = pop
-        .individuals
-        .iter()
-        .map(|i| i.genome.structure_hash())
-        .collect();
+    let structures: HashSet<u64> =
+        pop.individuals.iter().map(|i| i.genome.structure_hash()).collect();
     let total_parts: usize = pop.individuals.iter().map(|i| i.genome.part_count()).sum();
     let best = pop.best();
 
@@ -70,17 +70,25 @@ pub fn summarise(pop: &Population, eval_seconds: f64, elapsed_seconds: f64) -> G
         mean_parts: total_parts as Real / n as Real,
         diverged: pop.individuals.iter().filter(|i| i.metrics.diverged).count(),
         eval_seconds,
-        organisms_per_second: if eval_seconds > 0.0 {
-            n as f64 / eval_seconds
-        } else {
-            f64::INFINITY
-        },
+        // Denominator floored rather than special-cased: a coarse platform clock
+        // can report a zero-length generation, and `inf` in a CSV column breaks
+        // every downstream numeric parser.
+        organisms_per_second: n as f64 / eval_seconds.max(1e-9),
         elapsed_seconds,
     }
 }
 
 impl GenerationStats {
     pub const CSV_HEADER: &'static str = "generation,population,best,mean,median,worst,best_id,unique_structures,mean_parts,diverged,eval_seconds,organisms_per_second,elapsed_seconds";
+
+    /// Number of columns in [`Self::CSV_HEADER`].
+    pub const CSV_COLUMNS: usize = 13;
+
+    /// Index of `elapsed_seconds` in [`Self::CSV_HEADER`]. Named rather than
+    /// spelled as a literal at the two places that read the column back, so a
+    /// new column cannot silently repoint them; `csv_column_indices_are_correct`
+    /// pins it to the header.
+    pub const ELAPSED_SECONDS_COLUMN: usize = 12;
 
     pub fn to_csv_row(&self) -> String {
         format!(
@@ -186,5 +194,29 @@ mod tests {
             s.to_csv_row().split(',').count(),
             GenerationStats::CSV_HEADER.split(',').count()
         );
+        assert_eq!(GenerationStats::CSV_HEADER.split(',').count(), GenerationStats::CSV_COLUMNS);
+    }
+
+    /// The named column indices are what the readers of `stats.csv` rely on.
+    #[test]
+    fn csv_column_indices_are_correct() {
+        let columns: Vec<&str> = GenerationStats::CSV_HEADER.split(',').collect();
+        assert_eq!(columns[GenerationStats::ELAPSED_SECONDS_COLUMN], "elapsed_seconds");
+
+        let s = summarise(&evaluated_population().1, 1.0, 42.5);
+        let csv = s.to_csv_row();
+        let row: Vec<&str> = csv.split(',').collect();
+        let elapsed: f64 = row[GenerationStats::ELAPSED_SECONDS_COLUMN].parse().unwrap();
+        assert!((elapsed - 42.5).abs() < 1e-6);
+    }
+
+    /// `inf` in a numeric column breaks every downstream CSV parser, so a
+    /// zero-length generation must still report a finite rate.
+    #[test]
+    fn throughput_stays_finite_for_an_instant_generation() {
+        let (_, pop) = evaluated_population();
+        let s = summarise(&pop, 0.0, 1.0);
+        assert!(s.organisms_per_second.is_finite());
+        assert!(s.to_csv_row().split(',').all(|f| !f.contains("inf")));
     }
 }

@@ -55,21 +55,13 @@ impl Rng {
     pub fn new(seed: u64) -> Rng {
         let mut sm = seed;
         Rng {
-            s: [
-                splitmix64(&mut sm),
-                splitmix64(&mut sm),
-                splitmix64(&mut sm),
-                splitmix64(&mut sm),
-            ],
+            s: [splitmix64(&mut sm), splitmix64(&mut sm), splitmix64(&mut sm), splitmix64(&mut sm)],
         }
     }
 
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
-        let result = self.s[0]
-            .wrapping_add(self.s[3])
-            .rotate_left(23)
-            .wrapping_add(self.s[0]);
+        let result = self.s[0].wrapping_add(self.s[3]).rotate_left(23).wrapping_add(self.s[0]);
         let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
         self.s[3] ^= self.s[1];

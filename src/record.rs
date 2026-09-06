@@ -44,10 +44,43 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 
 /// On-disk schema version for manifest, checkpoint, replay and stored-genome
 /// records. Bump when a field is added, removed or reinterpreted.
-pub const ARTIFACT_FORMAT: u32 = 1;
+///
+/// History:
+///
+/// * `0` — pre-versioning artefacts, tagged by [`legacy_format`] on read.
+/// * `1` — first versioned layout.
+/// * `2` — a checkpoint now holds the *bred, unevaluated* next generation rather
+///   than the evaluated generation just finished. Resuming a v1 checkpoint would
+///   re-evaluate and re-append a generation that is already on disk, so
+///   [`check_readable`] refuses it.
+pub const ARTIFACT_FORMAT: u32 = 2;
+
+/// Oldest checkpoint layout this build can resume from. Read-only artefacts
+/// (manifests, stored genomes, replays) stay readable across the whole range;
+/// only resume carries semantics that cannot be reinterpreted after the fact.
+pub const MIN_RESUMABLE_FORMAT: u32 = 2;
 
 fn legacy_format() -> u32 {
     0
+}
+
+/// Reject an artefact this build cannot interpret.
+///
+/// Being unable to read the *future* is the only unconditional failure: a newer
+/// evoforge may have added fields whose absence changes meaning. Older artefacts
+/// are still readable, which is the point of recording the version at all.
+pub fn check_readable(kind: &str, found: u32) -> std::io::Result<()> {
+    if found > ARTIFACT_FORMAT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{kind} is in format {found}, but this evoforge ({}) understands \
+                 at most {ARTIFACT_FORMAT}; use a newer build",
+                crate::VERSION
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -135,6 +168,7 @@ pub struct Replay {
 }
 
 /// A run directory on disk.
+#[derive(Debug)]
 pub struct Run {
     pub dir: PathBuf,
     pub manifest: Manifest,
@@ -168,16 +202,14 @@ impl Run {
         let run = Run { dir, manifest };
         write_json(&run.dir.join(MANIFEST_FILE), &run.manifest)?;
         fs::write(run.dir.join(CONFIG_FILE), cfg.to_toml_string())?;
-        fs::write(
-            run.dir.join(STATS_FILE),
-            format!("{}\n", GenerationStats::CSV_HEADER),
-        )?;
+        fs::write(run.dir.join(STATS_FILE), format!("{}\n", GenerationStats::CSV_HEADER))?;
         Ok(run)
     }
 
     /// Open an existing run directory.
     pub fn open(dir: &Path) -> std::io::Result<Run> {
         let manifest: Manifest = read_json(&dir.join(MANIFEST_FILE))?;
+        check_readable(MANIFEST_FILE, manifest.format)?;
         Ok(Run { dir: dir.to_path_buf(), manifest })
     }
 
@@ -228,6 +260,7 @@ impl Run {
                     continue;
                 };
                 if stored.id == id {
+                    check_readable(GENOMES_FILE, stored.format)?;
                     return Ok(Some(stored));
                 }
             }
@@ -235,6 +268,7 @@ impl Run {
 
         for path in self.checkpoint_paths()? {
             let checkpoint: Checkpoint = read_json(&path)?;
+            check_readable(&path.display().to_string(), checkpoint.format)?;
             if let Some(individual) = checkpoint.population.find(id) {
                 return Ok(Some(StoredGenome {
                     format: ARTIFACT_FORMAT,
@@ -250,25 +284,29 @@ impl Run {
     }
 
     pub fn checkpoint_path(&self, generation: u32) -> PathBuf {
-        self.dir
-            .join(CHECKPOINT_DIR)
-            .join(format!("gen_{generation:06}.json"))
+        self.dir.join(CHECKPOINT_DIR).join(format!("gen_{generation:06}.json"))
     }
 
     /// Checkpoint files, newest first — the order a resume wants.
+    ///
+    /// Ordered by the generation parsed out of the filename, not lexicographically:
+    /// `gen_{:06}` stops being order-preserving as soon as a run passes a million
+    /// generations, at which point `gen_1000000` sorts *before* `gen_999999` and a
+    /// resume would silently load an older population. Files whose name does not
+    /// parse are ignored rather than sorted arbitrarily.
     pub fn checkpoint_paths(&self) -> std::io::Result<Vec<PathBuf>> {
         let dir = self.dir.join(CHECKPOINT_DIR);
         if !dir.exists() {
             return Ok(Vec::new());
         }
-        let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        let mut found: Vec<(u32, PathBuf)> = fs::read_dir(&dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .filter_map(|p| checkpoint_generation(&p).map(|g| (g, p)))
             .collect();
-        paths.sort();
-        paths.reverse();
-        Ok(paths)
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(found.into_iter().map(|(_, p)| p).collect())
     }
 
     pub fn write_checkpoint(&self, pop: &Population, cfg: &Config) -> std::io::Result<PathBuf> {
@@ -285,15 +323,71 @@ impl Run {
 
     pub fn latest_checkpoint(&self) -> std::io::Result<Option<Checkpoint>> {
         match self.checkpoint_paths()?.first() {
-            Some(path) => Ok(Some(read_json(path)?)),
+            Some(path) => {
+                let checkpoint: Checkpoint = read_json(path)?;
+                check_readable(&path.display().to_string(), checkpoint.format)?;
+                Ok(Some(checkpoint))
+            }
             None => Ok(None),
         }
     }
 
+    /// The highest-fitness genome in `genomes.jsonl`, if any were stored.
+    ///
+    /// Tolerant of a truncated final line, because the commands that call this
+    /// (`evo inspect`, `evo replay --best`) are the first ones reached for after a
+    /// run was killed mid-append.
+    pub fn best_stored_genome(&self) -> std::io::Result<Option<StoredGenome>> {
+        let path = self.dir.join(GENOMES_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut best: Option<StoredGenome> = None;
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let Some(stored) = parse_jsonl_line::<StoredGenome>(&line?)? else {
+                continue;
+            };
+            check_readable(GENOMES_FILE, stored.format)?;
+            if best.as_ref().is_none_or(|b| stored.fitness > b.fitness) {
+                best = Some(stored);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Cumulative wall-clock seconds already recorded in `stats.csv`.
+    ///
+    /// A resumed run continues this rather than restarting from zero, so the
+    /// `elapsed_seconds` column stays monotonic across a preemption instead of
+    /// jumping backwards at the resume boundary.
+    pub fn elapsed_seconds_so_far(&self) -> std::io::Result<f64> {
+        let path = self.dir.join(STATS_FILE);
+        if !path.exists() {
+            return Ok(0.0);
+        }
+        let text = fs::read_to_string(&path)?;
+        let last = text.lines().skip(1).filter(|l| !l.trim().is_empty()).last();
+        Ok(last
+            .and_then(|l| l.split(',').nth(GenerationStats::ELAPSED_SECONDS_COLUMN))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0))
+    }
+
     pub fn replay_path(&self, generation: u32, id: u64) -> PathBuf {
+        self.dir.join(REPLAY_DIR).join(format!("gen_{generation:06}_org_{id:08}.json"))
+    }
+
+    /// Path for a replay simulated under dynamics that differ from the run's own
+    /// configuration, tagged with the digest of the configuration used.
+    ///
+    /// Kept apart from [`Self::replay_path`] so that re-simulating an organism
+    /// with, say, a longer `duration` cannot overwrite the run's own recording
+    /// with a trajectory the run never produced. The digest in the name is the
+    /// same one stored in the file, so the two can always be matched up.
+    pub fn variant_replay_path(&self, generation: u32, id: u64, digest: u64) -> PathBuf {
         self.dir
             .join(REPLAY_DIR)
-            .join(format!("gen_{generation:06}_org_{id:08}.json"))
+            .join(format!("gen_{generation:06}_org_{id:08}_cfg_{digest:016x}.json"))
     }
 
     pub fn write_replay(
@@ -302,6 +396,22 @@ impl Run {
         trace: Trace,
         cfg: &Config,
     ) -> std::io::Result<PathBuf> {
+        let path = self.replay_path(individual.generation, individual.id);
+        self.write_replay_to(&path, individual, trace, cfg)?;
+        Ok(path)
+    }
+
+    /// Write a replay to an explicit path.
+    ///
+    /// Separate from [`Self::write_replay`] so a re-simulation can be directed
+    /// somewhere other than the slot the run's own recording occupies.
+    pub fn write_replay_to(
+        &self,
+        path: &Path,
+        individual: &Individual,
+        trace: Trace,
+        cfg: &Config,
+    ) -> std::io::Result<()> {
         let replay = Replay {
             format: ARTIFACT_FORMAT,
             experiment_id: self.manifest.experiment_id.clone(),
@@ -315,9 +425,7 @@ impl Run {
             genome: individual.genome.clone(),
             trace,
         };
-        let path = self.replay_path(individual.generation, individual.id);
-        write_json(&path, &replay)?;
-        Ok(path)
+        write_json(path, &replay)
     }
 }
 
@@ -327,8 +435,7 @@ impl Run {
 /// exclusively of winners — a population of near-identical also-rans is a fact
 /// worth being able to see afterwards.
 pub fn selection_for_recording(pop: &Population, cfg: &Config) -> Vec<u64> {
-    if cfg.recording.every_generations == 0
-        || pop.generation % cfg.recording.every_generations != 0
+    if cfg.recording.every_generations == 0 || pop.generation % cfg.recording.every_generations != 0
     {
         return Vec::new();
     }
@@ -342,11 +449,8 @@ pub fn selection_for_recording(pop: &Population, cfg: &Config) -> Vec<u64> {
 
     if cfg.recording.random_samples > 0 {
         let mut seen: HashSet<u64> = chosen.iter().copied().collect();
-        let mut rng = Rng::new(derive_seed(&[
-            cfg.experiment.seed,
-            pop.generation as u64,
-            STREAM_SAMPLING,
-        ]));
+        let mut rng =
+            Rng::new(derive_seed(&[cfg.experiment.seed, pop.generation as u64, STREAM_SAMPLING]));
         // Bounded attempts: with a small population and many requested samples,
         // insisting on distinct picks could otherwise spin.
         for _ in 0..cfg.recording.random_samples * 8 {
@@ -379,11 +483,7 @@ pub fn should_checkpoint(generation: u32, cfg: &Config) -> bool {
 fn claim_run_directory(parent: &Path, base: &str) -> std::io::Result<(String, PathBuf)> {
     fs::create_dir_all(parent)?;
     for attempt in 0..1000 {
-        let id = if attempt == 0 {
-            base.to_string()
-        } else {
-            format!("{base}-{attempt}")
-        };
+        let id = if attempt == 0 { base.to_string() } else { format!("{base}-{attempt}") };
         let dir = parent.join(&id);
         match fs::create_dir(&dir) {
             Ok(()) => return Ok((id, dir)),
@@ -399,6 +499,12 @@ fn claim_run_directory(parent: &Path, base: &str) -> std::io::Result<(String, Pa
 
 fn append_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Generation number encoded in a checkpoint filename, or `None` if the name is
+/// not one this module wrote.
+fn checkpoint_generation(path: &Path) -> Option<u32> {
+    path.file_stem()?.to_str()?.strip_prefix("gen_")?.parse::<u32>().ok()
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
@@ -418,25 +524,41 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
-    replace_file(&tmp, path)
+    // Rename over the destination. `fs::rename` replaces an existing file on
+    // every platform we target — on Windows it goes through `MoveFileEx` with
+    // `MOVEFILE_REPLACE_EXISTING` — so there is no delete-first path to take,
+    // and deliberately none is offered: unlinking the good file before the new
+    // one is in place would turn a transient failure (a reader holding the file
+    // open, a scanner) into permanent loss of a manifest or checkpoint.
+    fs::rename(&tmp, path)?;
+    // The rename itself is only durable once the directory entry is flushed.
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
-/// Replace `to` with `from`. `rename` over an existing file is atomic on
-/// Unix and fails on Windows, so Windows removes the destination first.
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) if to.exists() => {
-            fs::remove_file(to)?;
-            fs::rename(from, to)
-        }
-        Err(e) => Err(e),
-    }
+/// Flush a directory entry, so a rename survives a hard kill.
+///
+/// Unix only: Windows has no equivalent handle to fsync, and `MoveFileEx` is
+/// already ordered against the target's metadata there.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Parse one JSON Lines record. Empty lines and a truncated final line
 /// (typical of a kill mid-append) are skipped rather than failing the run.
-fn parse_jsonl_line<T: for<'de> Deserialize<'de>>(line: &str) -> std::io::Result<Option<T>> {
+///
+/// Public because every reader of a `.jsonl` file in this project needs to be
+/// this tolerant — the commands most likely to run against a half-written file
+/// are the ones used to work out what happened after a run died.
+pub fn parse_jsonl_line<T: for<'de> Deserialize<'de>>(line: &str) -> std::io::Result<Option<T>> {
     let line = line.trim();
     if line.is_empty() {
         return Ok(None);
@@ -639,10 +761,7 @@ mod tests {
 
         let mut pop = evaluated(&cfg);
         pop = evolution::next_generation(&pop, &cfg);
-        assert!(pop
-            .individuals
-            .iter()
-            .all(|i| i.fitness == evolution::UNEVALUATED_FITNESS));
+        assert!(pop.individuals.iter().all(|i| i.fitness == evolution::UNEVALUATED_FITNESS));
 
         let path = run.write_checkpoint(&pop, &cfg).unwrap();
         let loaded: Checkpoint = read_json(&path).unwrap();
@@ -713,6 +832,142 @@ mod tests {
         // Not a recording generation.
         pop.generation = 6;
         assert!(selection_for_recording(&pop, &cfg).is_empty());
+    }
+
+    /// `gen_{:06}` stops being lexicographically ordered past a million
+    /// generations, which ARCHITECTURE.md explicitly contemplates. Ordering must
+    /// come from the number, not the string, or a resume silently loads an older
+    /// population.
+    #[test]
+    fn checkpoint_ordering_survives_seven_digit_generations() {
+        let tmp = TempDir::new("wide");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        let mut pop = evaluated(&cfg);
+
+        for generation in [999_999u32, 1_000_000, 42] {
+            pop.generation = generation;
+            run.write_checkpoint(&pop, &cfg).unwrap();
+        }
+
+        let ordered: Vec<u32> = run
+            .checkpoint_paths()
+            .unwrap()
+            .iter()
+            .map(|p| checkpoint_generation(p).unwrap())
+            .collect();
+        assert_eq!(ordered, [1_000_000, 999_999, 42], "newest first, numerically");
+        assert_eq!(run.latest_checkpoint().unwrap().unwrap().population.generation, 1_000_000);
+    }
+
+    #[test]
+    fn unrecognised_checkpoint_filenames_are_ignored() {
+        let tmp = TempDir::new("junk");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        let pop = evaluated(&cfg);
+        run.write_checkpoint(&pop, &cfg).unwrap();
+        fs::write(run.dir.join(CHECKPOINT_DIR).join("notes.json"), "{}").unwrap();
+
+        let paths = run.checkpoint_paths().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(run.latest_checkpoint().unwrap().is_some());
+    }
+
+    /// An artefact from a future evoforge may have fields whose absence changes
+    /// meaning, so reading it is refused rather than guessed at. Older artefacts
+    /// stay readable — that is the point of recording the version.
+    #[test]
+    fn a_future_format_artefact_is_refused_and_an_older_one_is_not() {
+        let tmp = TempDir::new("format");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+
+        let mut manifest = run.manifest.clone();
+        manifest.format = ARTIFACT_FORMAT + 1;
+        write_json(&run.dir.join(MANIFEST_FILE), &manifest).unwrap();
+        let err = Run::open(&run.dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("understands at most"), "{err}");
+
+        // A legacy manifest with no `format` field at all still opens.
+        let legacy = r#"{"experiment_id":"x","experiment_name":"x",
+            "evoforge_version":"0.0.1","seed":1,"config_digest":7,"created_unix":0}"#;
+        fs::write(run.dir.join(MANIFEST_FILE), legacy).unwrap();
+        let opened = Run::open(&run.dir).unwrap();
+        assert_eq!(opened.manifest.format, legacy_format());
+    }
+
+    #[test]
+    fn a_future_format_checkpoint_is_refused() {
+        let tmp = TempDir::new("format-ckpt");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        let pop = evaluated(&cfg);
+        let path = run.write_checkpoint(&pop, &cfg).unwrap();
+
+        let mut checkpoint: Checkpoint = read_json(&path).unwrap();
+        checkpoint.format = ARTIFACT_FORMAT + 1;
+        write_json(&path, &checkpoint).unwrap();
+
+        let err = run.latest_checkpoint().unwrap_err();
+        assert!(err.to_string().contains("understands at most"), "{err}");
+    }
+
+    /// `evo inspect` and `evo replay --best` go through this, and they are the
+    /// first commands reached for after a run was killed mid-append.
+    #[test]
+    fn best_stored_genome_tolerates_a_truncated_final_line() {
+        let tmp = TempDir::new("best");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        let pop = evaluated(&cfg);
+
+        assert!(run.best_stored_genome().unwrap().is_none(), "nothing stored yet");
+
+        let ranked = pop.ranking();
+        for &i in ranked.iter().take(3) {
+            run.append_genome(&pop.individuals[i]).unwrap();
+        }
+        {
+            let mut f = append_file(&run.dir.join(GENOMES_FILE)).unwrap();
+            write!(f, "{{\"format\":2,\"id\":").unwrap();
+        }
+
+        let best = run.best_stored_genome().unwrap().unwrap();
+        assert_eq!(best.id, pop.individuals[ranked[0]].id);
+        assert_eq!(best.fitness, pop.individuals[ranked[0]].fitness);
+    }
+
+    #[test]
+    fn elapsed_seconds_so_far_reads_the_last_row() {
+        let tmp = TempDir::new("elapsed");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        // A fresh run has no rows yet.
+        assert_eq!(run.elapsed_seconds_so_far().unwrap(), 0.0);
+
+        let pop = evaluated(&cfg);
+        for elapsed in [1.5, 9.25] {
+            let mut s = stats::summarise(&pop, 1.0, elapsed);
+            s.generation = 0;
+            run.append_stats(&s).unwrap();
+        }
+        assert!((run.elapsed_seconds_so_far().unwrap() - 9.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_variant_replay_never_collides_with_the_runs_own() {
+        let tmp = TempDir::new("variant");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+
+        let mut other = cfg.clone();
+        other.simulation.duration *= 3.0;
+        let own = run.replay_path(4, 17);
+        let variant = run.variant_replay_path(4, 17, other.evolution_digest());
+        assert_ne!(own, variant);
+        assert!(variant.to_string_lossy().contains(&format!("{:016x}", other.evolution_digest())));
     }
 
     #[test]

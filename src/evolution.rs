@@ -82,11 +82,7 @@ impl Population {
             let genome = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
             individuals.push(Individual::unevaluated(i as u64 + 1, 0, [0, 0], genome));
         }
-        Population {
-            generation: 0,
-            next_id: cfg.evolution.population_size as u64 + 1,
-            individuals,
-        }
+        Population { generation: 0, next_id: cfg.evolution.population_size as u64 + 1, individuals }
     }
 
     #[inline]
@@ -162,11 +158,8 @@ pub fn evaluate_population_serial(pop: &mut Population, cfg: &Config) {
 /// describe organisms actually simulated under the current configuration.
 pub fn next_generation(pop: &Population, cfg: &Config) -> Population {
     let layout = cfg.brain_layout();
-    let mut rng = Rng::new(derive_seed(&[
-        cfg.experiment.seed,
-        pop.generation as u64,
-        STREAM_REPRODUCTION,
-    ]));
+    let mut rng =
+        Rng::new(derive_seed(&[cfg.experiment.seed, pop.generation as u64, STREAM_REPRODUCTION]));
 
     let ranked = pop.ranking();
     let target = cfg.evolution.population_size;
@@ -230,11 +223,7 @@ pub fn next_generation(pop: &Population, cfg: &Config) -> Population {
         next.push(Individual::unevaluated(take_id(), generation, [0, 0], g));
     }
 
-    Population {
-        generation,
-        individuals: next,
-        next_id,
-    }
+    Population { generation, individuals: next, next_id }
 }
 
 /// Pick the best of `size` uniformly sampled individuals.
@@ -348,8 +337,7 @@ mod tests {
         evaluate_population_serial(&mut pop, &cfg);
         let next = next_generation(&pop, &cfg);
 
-        let known: std::collections::HashSet<u64> =
-            pop.individuals.iter().map(|i| i.id).collect();
+        let known: std::collections::HashSet<u64> = pop.individuals.iter().map(|i| i.id).collect();
         let mut with_two_parents = 0;
         for child in &next.individuals {
             for p in child.parents {
@@ -414,10 +402,7 @@ mod tests {
                 rank_of[i] = r;
             }
             let n = 4000;
-            (0..n)
-                .map(|_| rank_of[tournament(&pop, &mut rng, size)] as f64)
-                .sum::<f64>()
-                / n as f64
+            (0..n).map(|_| rank_of[tournament(&pop, &mut rng, size)] as f64).sum::<f64>() / n as f64
         };
         assert!(mean_rank(8) < mean_rank(2), "larger tournaments must select better");
     }

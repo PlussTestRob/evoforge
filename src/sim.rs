@@ -64,9 +64,7 @@ pub struct EvalWorkspace {
 
 impl EvalWorkspace {
     pub fn new(cfg: &Config) -> EvalWorkspace {
-        EvalWorkspace {
-            scratch: BrainScratch::new(&cfg.brain_layout()),
-        }
+        EvalWorkspace { scratch: BrainScratch::new(&cfg.brain_layout()) }
     }
 }
 
@@ -98,16 +96,34 @@ pub fn evaluate_with(
         bodies: pheno.body_specs(),
         record_hz: cfg.recording.record_hz,
         measure_start_t: settle_steps as Real * dt,
-        frames: Vec::with_capacity((total_steps / record_interval) as usize + 1),
+        // Plus the closing frame and the measurement-boundary frame.
+        frames: Vec::with_capacity((total_steps / record_interval) as usize + 2),
     });
 
     let mut metrics = Metrics::default();
     let mut previous_com = Vec3::ZERO;
     let mut height_sum = 0.0;
     let mut measured_steps: u32 = 0;
+    let mut measurement_began = false;
+    // Actuation spent during the settle drop belongs to no measured window: the
+    // controller is held off, so it is impulse the organism could not have
+    // influenced. Subtracting the settle total keeps every metric on `Metrics`
+    // describing the same interval.
+    let mut settle_actuation = 0.0;
 
     for step in 0..total_steps {
         let t = step as Real * dt;
+
+        // Measurement starts from the state the settled organism is *in*, before
+        // the first controlled step acts on it. Capturing it after that step
+        // would put `Trace::measure_start_t` one step ahead of the pose the
+        // window is actually measured from.
+        if step == settle_steps {
+            metrics.start = pheno.world.centre_of_mass();
+            previous_com = metrics.start;
+            settle_actuation = pheno.world.actuation_impulse;
+            measurement_began = true;
+        }
 
         if should_apply_control(step, settle_steps, control_interval) {
             let measured_t = (step - settle_steps) as Real * dt;
@@ -115,7 +131,10 @@ pub fn evaluate_with(
         }
 
         if let Some(tr) = trace.as_mut() {
-            if step % record_interval == 0 {
+            // The measurement boundary always gets a frame, even when it does not
+            // fall on the recording grid. Without it a viewer cannot draw the pose
+            // that `measure_start_t` names and has to interpolate towards it.
+            if step % record_interval == 0 || step == settle_steps {
                 tr.frames.push(capture_frame(&pheno, t));
             }
         }
@@ -127,12 +146,6 @@ pub fn evaluate_with(
             break;
         }
 
-        // Measurement begins once the organism has settled, so that the initial
-        // drop onto the terrain is not scored as locomotion.
-        if step == settle_steps {
-            metrics.start = pheno.world.centre_of_mass();
-            previous_com = metrics.start;
-        }
         if step >= settle_steps {
             let com = pheno.world.centre_of_mass();
             let delta = horizontal(com - previous_com);
@@ -155,28 +168,27 @@ pub fn evaluate_with(
         if let Some(tr) = trace.as_mut() {
             tr.frames.push(capture_frame(&pheno, total_steps as Real * dt));
         }
-        let com = pheno.world.centre_of_mass();
-        metrics.end = com;
-        let offset = horizontal(com - metrics.start);
-        metrics.displacement = offset.length();
-        metrics.displacement_x = offset.x;
-        metrics.mean_height = if measured_steps > 0 {
-            height_sum / measured_steps as Real
-        } else {
-            0.0
-        };
+        // Guarded on measurement having begun at all: a configuration whose
+        // `settle_time` rounds up to the whole evaluation never sets
+        // `metrics.start`, and differencing against a default origin would report
+        // the organism's absolute position as displacement.
+        if measurement_began {
+            let com = pheno.world.centre_of_mass();
+            metrics.end = com;
+            let offset = horizontal(com - metrics.start);
+            metrics.displacement = offset.length();
+            metrics.displacement_x = offset.x;
+        }
+        metrics.mean_height =
+            if measured_steps > 0 { height_sum / measured_steps as Real } else { 0.0 };
     }
 
     metrics.steps = measured_steps;
     metrics.duration = measured_steps as Real * dt;
-    metrics.actuation = pheno.world.actuation_impulse;
+    metrics.actuation = pheno.world.actuation_impulse - settle_actuation;
 
     let fitness = fitness::score(&cfg.fitness, &metrics);
-    EvalResult {
-        fitness,
-        metrics,
-        trace: if metrics.diverged { None } else { trace },
-    }
+    EvalResult { fitness, metrics, trace: if metrics.diverged { None } else { trace } }
 }
 
 /// Gather sensors, run the controller, and write motor targets.
@@ -227,13 +239,7 @@ fn capture_frame(pheno: &Phenotype, t: Real) -> Frame {
     let mut poses = Vec::with_capacity(pheno.world.bodies.len() * 7);
     for b in &pheno.world.bodies {
         poses.extend_from_slice(&[
-            b.pos.x,
-            b.pos.y,
-            b.pos.z,
-            b.orient.x,
-            b.orient.y,
-            b.orient.z,
-            b.orient.w,
+            b.pos.x, b.pos.y, b.pos.z, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
         ]);
     }
     Frame { t, poses }
@@ -402,37 +408,80 @@ mod tests {
         assert!(should_apply_control(66, 60, interval));
     }
 
+    /// Effort must be charged for the measured window only. The settle drop
+    /// spends real motor impulse holding joints against gravity, but the
+    /// controller is switched off for it, so including it would make
+    /// `energy_penalty` scale with `settle_time` — pricing a fall the organism
+    /// could not influence.
     #[test]
-    fn a_live_controller_is_silent_during_settle() {
-        // Long drop, one control tick of measurement. An active network and a
-        // zeroed one should spend almost the same impulse: both sit at motor
-        // target 0 for the settle, then the active one gets a single tick.
-        let mut cfg = quick_config();
-        cfg.simulation.settle_time = 1.0;
-        cfg.simulation.duration = 0.05;
+    fn settle_actuation_is_not_charged_to_the_measured_window() {
+        // Same settle, so the physics up to the measurement boundary is identical
+        // and only the window length differs. Shrinking the window towards zero
+        // must take reported effort towards zero with it; while the settle total
+        // was included, this left a large constant intercept instead.
+        let mut brief = quick_config();
+        brief.simulation.settle_time = 1.0; // 120 steps of holding impulse
+        brief.simulation.duration = 0.025; // 3 measured steps
+        let mut full = brief.clone();
+        full.simulation.duration = 1.0; // 120 measured steps
 
-        let mut g = random_genome(&cfg, 11);
-        if g.hinge_count() == 0 {
-            return;
+        let mut checked = 0;
+        for seed in 0..40 {
+            let g = random_genome(&full, 700 + seed);
+            if g.hinge_count() == 0 {
+                continue;
+            }
+            let a = evaluate(&g, &brief, false).metrics;
+            let b = evaluate(&g, &full, false).metrics;
+            if a.diverged || b.diverged || b.actuation <= 0.0 {
+                continue;
+            }
+            assert!(
+                a.actuation < 0.1 * b.actuation,
+                "seed {seed}: {} over 3 measured steps vs {} over 120 — \
+                 the settle window is leaking into the total",
+                a.actuation,
+                b.actuation
+            );
+            checked += 1;
         }
-        let active = evaluate(&g, &cfg, false).metrics;
-        for w in g.weights.iter_mut() {
-            *w = 0.0;
-        }
-        let still = evaluate(&g, &cfg, false).metrics;
-        if active.diverged || still.diverged {
-            return;
-        }
-        let ratio = if still.actuation > 0.0 {
-            active.actuation / still.actuation
-        } else {
-            1.0
-        };
+        assert!(checked > 5, "only {checked} organisms actuated at all");
+    }
+
+    #[test]
+    fn measurement_starts_where_the_trace_says_it_does() {
+        let cfg = quick_config();
+        let g = random_genome(&cfg, 12);
+        let r = evaluate(&g, &cfg, true);
+        let tr = r.trace.unwrap();
+        // The frame at `measure_start_t` must be the pose that `metrics.start`
+        // was taken from, or a viewer highlights the wrong window.
+        let frame = tr
+            .frames
+            .iter()
+            .find(|f| (f.t - tr.measure_start_t).abs() < 1e-6)
+            .expect("no frame at the declared measurement start");
+        let com = centre_of_mass_of(&frame.poses, &tr.bodies, &cfg);
         assert!(
-            ratio < 2.5,
-            "active settle actuation {} vs still {} (ratio {ratio})",
-            active.actuation,
-            still.actuation
+            (com - r.metrics.start).length() < 1e-4,
+            "trace says measurement starts at {:?}, metrics say {:?}",
+            com,
+            r.metrics.start
         );
+    }
+
+    /// Mass-weighted centre of a recorded frame, reconstructed the way a viewer
+    /// would have to.
+    fn centre_of_mass_of(poses: &[Real], bodies: &[BodySpec], cfg: &Config) -> Vec3 {
+        let mut total = 0.0;
+        let mut acc = Vec3::ZERO;
+        for (i, spec) in bodies.iter().enumerate() {
+            let h = spec.half_extents;
+            let m = 8.0 * h.x * h.y * h.z * cfg.body.density;
+            let p = crate::math::vec3(poses[i * 7], poses[i * 7 + 1], poses[i * 7 + 2]);
+            acc += p * m;
+            total += m;
+        }
+        acc * (1.0 / total)
     }
 }

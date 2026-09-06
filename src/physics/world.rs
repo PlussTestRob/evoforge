@@ -400,15 +400,9 @@ impl World {
             // Friction, clamped to the Coulomb cone around the normal impulse
             // accumulated so far.
             let limit = mu * new_pn;
-            for (tangent, k, stored) in [
-                (c.tangent1, c.k_t1, 1usize),
-                (c.tangent2, c.k_t2, 2usize),
-            ] {
-                let old = if stored == 1 {
-                    self.contacts[ci].pt1
-                } else {
-                    self.contacts[ci].pt2
-                };
+            for (tangent, k, stored) in [(c.tangent1, c.k_t1, 1usize), (c.tangent2, c.k_t2, 2usize)]
+            {
+                let old = if stored == 1 { self.contacts[ci].pt1 } else { self.contacts[ci].pt2 };
                 let vt = self.bodies[bi].point_velocity(c.r).dot(tangent);
                 let new = clamp(old - vt / k, -limit, limit);
                 let delta = new - old;
@@ -520,7 +514,11 @@ impl World {
                             continue;
                         }
                         let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
-                        let target = clamp(-beta * inv_dt * misalign.dot(t), -max_corr * 4.0, max_corr * 4.0);
+                        let target = clamp(
+                            -beta * inv_dt * misalign.dot(t),
+                            -max_corr * 4.0,
+                            max_corr * 4.0,
+                        );
                         let lambda = (target - w_rel.dot(t)) / k;
                         let imp = t * lambda;
                         self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);

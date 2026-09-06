@@ -50,11 +50,8 @@ pub struct JointGene {
 
 impl JointGene {
     fn random(rng: &mut Rng, limits: &BodyLimits) -> JointGene {
-        let kind = if rng.chance(limits.hinge_probability) {
-            JointKind::Hinge
-        } else {
-            JointKind::Fixed
-        };
+        let kind =
+            if rng.chance(limits.hinge_probability) { JointKind::Hinge } else { JointKind::Fixed };
         JointGene {
             kind,
             axis: rng.below(2) as u8,
@@ -125,8 +122,8 @@ impl Genome {
         brain: &BrainCfg,
         layout: &BrainLayout,
     ) -> Genome {
-        let n = limits.min_parts
-            + rng.below((limits.max_parts - limits.min_parts + 1) as u32) as usize;
+        let n =
+            limits.min_parts + rng.below((limits.max_parts - limits.min_parts + 1) as u32) as usize;
 
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
@@ -143,7 +140,9 @@ impl Genome {
         }
 
         let weights = (0..layout.weight_count())
-            .map(|_| clamp(rng.normal_scaled(brain.init_sigma), -brain.weight_limit, brain.weight_limit))
+            .map(|_| {
+                clamp(rng.normal_scaled(brain.init_sigma), -brain.weight_limit, brain.weight_limit)
+            })
             .collect();
 
         Genome { parts, weights }
@@ -162,10 +161,7 @@ impl Genome {
     }
 
     pub fn hinge_count(&self) -> usize {
-        self.parts[1..]
-            .iter()
-            .filter(|p| p.joint.kind == JointKind::Hinge)
-            .count()
+        self.parts[1..].iter().filter(|p| p.joint.kind == JointKind::Hinge).count()
     }
 
     /// A fingerprint of the *morphology* only, ignoring controller weights and
@@ -469,10 +465,7 @@ mod tests {
         let mut g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
         for step in 0..3_000 {
             mutate(&mut g, &mut rng, &cfg.mutation, &cfg.body, &cfg.brain, &layout);
-            assert!(
-                g.is_valid(&cfg.body, &layout),
-                "invalid after {step} mutations: {g:?}"
-            );
+            assert!(g.is_valid(&cfg.body, &layout), "invalid after {step} mutations: {g:?}");
         }
     }
 
