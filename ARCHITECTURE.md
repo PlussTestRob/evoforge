@@ -35,7 +35,7 @@ config      TOML experiment configuration
 genome      heritable description; mutation and crossover
 brain       fixed-topology feed-forward controller, evaluated over a weight slice
 phenotype   genome -> bodies and joints (the only place genes become geometry)
-physics     rigid bodies, contacts, joints, motors, limits
+physics     rigid bodies, shapes, contacts, joints, motors, limits
 sim         one evaluation: sensors -> controller -> motors -> step -> metrics
 fitness     metrics -> scalar
 evolution   population, selection, reproduction, lineage
@@ -154,12 +154,12 @@ whether a checkpoint is considered the same experiment.
 ## Physics: what and why
 
 Semi-implicit Euler with sequential-impulse constraint solving in maximal
-coordinates, Baumgarte stabilisation, box-corner contacts against a terrain
+coordinates, Baumgarte stabilisation, per-shape contacts against a terrain
 height function, Coulomb friction.
 
 **Why not Rapier or similar.** They solve a much larger problem: arbitrary
 geometry, broad-phase acceleration, continuous collision, sleeping, scene graphs.
-We need boxes on a ground plane connected by hinges, with organisms that do not
+We need a few convex primitives on a ground plane connected by hinges, with organisms that do not
 collide with themselves. Each of those simplifications deletes a subsystem. What
 remains is small enough to read in one sitting, has no version-drift risk to
 reproducibility, and has no per-evaluation setup cost worth measuring — which

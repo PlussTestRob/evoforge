@@ -6,7 +6,9 @@
 //! upgrade path.
 
 pub mod body;
+pub mod shape;
 pub mod world;
 
 pub use body::RigidBody;
+pub use shape::Shape;
 pub use world::{Joint, TerrainModel, World, WorldParams};

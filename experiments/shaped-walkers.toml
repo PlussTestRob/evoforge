@@ -1,0 +1,96 @@
+# The directed-walkers experiment, with the full set of body shapes enabled.
+#
+# Parts are no longer all cuboids: each one is carved from the box its
+# half-extents describe, as a box, a taper, a sphere, a capsule or a cylinder.
+# Shape does not change what an organism can be built out of — parts still do
+# not collide with each other — but it changes how a part meets the ground,
+# which is where a gait actually lives. A cuboid catches on its corners; a
+# capsule rolls and pivots; a sphere or a cylinder can roll outright.
+#
+# Everything else is identical to directed-walkers.toml, so the two are worth
+# running against each other.
+
+[experiment]
+name = "shaped-walkers"
+seed = 20260905
+output_dir = "runs"
+
+[evolution]
+population_size = 100
+generations = 100
+elite_count = 2
+tournament_size = 4
+crossover_rate = 0.7
+immigrant_rate = 0.02
+
+[body]
+min_parts = 2
+max_parts = 6
+min_half_extent = 0.08
+max_half_extent = 0.35
+density = 250.0
+min_joint_limit = 0.3
+max_joint_limit = 1.4
+max_motor_speed = 6.0
+max_motor_torque = 120.0
+hinge_probability = 0.85
+# Anything but a single "box" entry opts the experiment into shapes, which
+# changes the random stream and so the results. A one-entry list spends no
+# randomness choosing, and reproduces a pre-shapes run exactly.
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+# Cross-section of a taper's far end, as a fraction of its base.
+taper_top_scale = 0.45
+
+[brain]
+hidden = 10
+init_sigma = 0.8
+weight_limit = 8.0
+
+[mutation]
+weight_rate = 0.08
+weight_sigma = 0.25
+weight_reset_rate = 0.05
+size_rate = 0.05
+size_sigma = 0.05
+attach_rate = 0.05
+attach_sigma = 0.15
+joint_limit_rate = 0.05
+joint_limit_sigma = 0.2
+joint_kind_rate = 0.02
+joint_axis_rate = 0.03
+motor_rate = 0.05
+motor_sigma = 0.15
+# Per part, per generation: how often a part is recarved as another shape.
+shape_rate = 0.04
+add_part_rate = 0.06
+remove_part_rate = 0.05
+
+[simulation]
+duration = 8.0
+control_hz = 20.0
+solver_iterations = 10
+settle_time = 0.5
+
+[environment]
+terrain = "flat"
+gravity = 9.81
+friction = 0.8
+restitution = 0.0
+linear_damping = 0.02
+angular_damping = 0.05
+
+[fitness]
+objective = "distance_x"
+energy_penalty = 0.0
+upright_bonus = 0.15
+
+[recording]
+top_n = 3
+random_samples = 1
+record_hz = 30.0
+every_generations = 10
+store_genomes = true
+
+[checkpoint]
+every_generations = 25
+on_finish = true

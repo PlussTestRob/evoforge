@@ -69,6 +69,31 @@ impl JointGene {
     }
 }
 
+/// Which primitive a part's block is carved from.
+///
+/// The gene is only the *kind*. Dimensions always come from
+/// [`PartGene::half_extents`], and every shape is inscribed in that box, so one
+/// size gene keeps doing one job and the existing size operator mutates a
+/// capsule as sensibly as it mutates a cuboid. [`crate::phenotype::carve`] is
+/// the rule that turns the two into geometry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    /// Fills the box.
+    #[default]
+    Box,
+    /// Rectangular frustum along the box's longest axis: a wedge, a foot, a claw.
+    Taper,
+    /// Inscribed sphere. One ground contact, so it rolls.
+    Sphere,
+    /// Inscribed capsule along the box's longest axis. Rolls sideways, slides
+    /// lengthwise, and does not catch on its corners the way a cuboid does.
+    Capsule,
+    /// Inscribed cylinder along the box's longest axis. A wheel, or a limb that
+    /// can stand on its end.
+    Cylinder,
+}
+
 /// One block of the body.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PartGene {
@@ -77,8 +102,12 @@ pub struct PartGene {
     /// Index of the parent part; always less than this part's own index.
     /// Meaningless for part 0.
     pub parent: u8,
-    /// Half-extents of the box, metres.
+    /// Half-extents of the box the part is inscribed in, metres.
     pub half_extents: Vec3,
+    /// Which primitive is carved from that box. Defaults to a box, so genomes
+    /// recorded before shapes existed load unchanged.
+    #[serde(default)]
+    pub shape: ShapeKind,
     /// Which face of the parent this part attaches to (0..6, see
     /// [`crate::phenotype::FACES`]). Meaningless for part 0.
     pub attach_face: u8,
@@ -101,6 +130,12 @@ impl PartGene {
         self.attach_face %= 6;
         self.attach_u = clamp(self.attach_u, -1.0, 1.0);
         self.attach_v = clamp(self.attach_v, -1.0, 1.0);
+        // A genome carried into an experiment that does not allow its shape
+        // falls back to the first shape that experiment does allow, the same way
+        // an out-of-range motor torque is pulled into bounds rather than refused.
+        if !limits.shapes.is_empty() && !limits.shapes.contains(&self.shape) {
+            self.shape = limits.shapes[0];
+        }
         self.joint.clamp_to(limits);
     }
 }
@@ -132,6 +167,7 @@ impl Genome {
                 slot: i as u8,
                 parent,
                 half_extents: random_extents(rng, limits),
+                shape: random_shape(rng, limits),
                 attach_face: rng.below(6) as u8,
                 attach_u: rng.range(-0.7, 0.7),
                 attach_v: rng.range(-0.7, 0.7),
@@ -182,6 +218,15 @@ impl Genome {
             // the same structure for this purpose.
             for e in [p.half_extents.x, p.half_extents.y, p.half_extents.z] {
                 bytes.push((e * 20.0) as u8);
+            }
+        }
+        // Appended only when some part is not a box, so that a box-only genome
+        // hashes exactly as it did before shapes existed. Two organisms that
+        // differ only in shape are genuinely different structures, so when
+        // shapes are in use they have to be part of the identity.
+        if self.parts.iter().any(|p| p.shape != ShapeKind::Box) {
+            for p in &self.parts {
+                bytes.push(p.shape as u8);
             }
         }
         fnv1a(&bytes)
@@ -244,6 +289,20 @@ impl Genome {
     }
 }
 
+/// Draw a shape, consuming randomness only when there is a choice to make.
+///
+/// The guard is not an optimisation. An experiment that has not opted into
+/// shapes has to produce exactly the random stream it produced before shapes
+/// existed, or every result recorded before this feature becomes unreproducible
+/// and the constants in `tests/golden.rs` become lies.
+fn random_shape(rng: &mut Rng, limits: &BodyLimits) -> ShapeKind {
+    match limits.shapes.len() {
+        0 => ShapeKind::Box,
+        1 => limits.shapes[0],
+        n => limits.shapes[rng.pick(n)],
+    }
+}
+
 fn random_extents(rng: &mut Rng, limits: &BodyLimits) -> Vec3 {
     vec3(
         rng.range(limits.min_half_extent, limits.max_half_extent),
@@ -293,6 +352,13 @@ pub fn mutate(
                 1 => p.half_extents.y += delta,
                 _ => p.half_extents.z += delta,
             }
+        }
+
+        // Order matters: the length check has to short-circuit before `chance`,
+        // or a box-only experiment would consume a random number here that it
+        // did not consume before shapes existed.
+        if limits.shapes.len() > 1 && rng.chance(params.shape_rate) {
+            p.shape = random_shape(rng, limits);
         }
 
         if !is_root {
@@ -345,6 +411,7 @@ fn add_random_part(genome: &mut Genome, rng: &mut Rng, limits: &BodyLimits, layo
         slot,
         parent,
         half_extents: random_extents(rng, limits),
+        shape: random_shape(rng, limits),
         attach_face: rng.below(6) as u8,
         attach_u: rng.range(-0.7, 0.7),
         attach_v: rng.range(-0.7, 0.7),
@@ -402,6 +469,11 @@ pub fn crossover(primary: &Genome, secondary: &Genome, rng: &mut Rng) -> Genome 
         let other = &secondary.parts[j];
         if rng.chance(0.5) {
             part.half_extents = other.half_extents;
+            // Shape travels with the box it is carved from: inheriting a
+            // capsule's proportions but a cuboid's geometry would be a
+            // recombination of two things that only mean anything together. It
+            // also costs no extra draw, so the stream is unchanged.
+            part.shape = other.shape;
         }
         // Attachment and joint genes only mean anything for non-root parts, and
         // only if the other genome's part is also non-root.
@@ -436,6 +508,45 @@ mod tests {
         let cfg = Config::default();
         let layout = cfg.brain_layout();
         (cfg, layout)
+    }
+
+    /// The compatibility invariant, stated directly: when there is only one
+    /// shape to choose, choosing it must cost no randomness. If it ever does,
+    /// every result recorded before shapes existed stops reproducing — which is
+    /// what the constants in `tests/golden.rs` would then be quietly wrong about.
+    #[test]
+    fn a_single_shape_roster_spends_no_randomness() {
+        let (mut cfg, layout) = fixture();
+        let mut ends = Vec::new();
+        for only in [ShapeKind::Box, ShapeKind::Sphere, ShapeKind::Cylinder] {
+            cfg.body.shapes = vec![only];
+            let mut rng = Rng::new(99);
+            let mut g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            mutate(&mut g, &mut rng, &cfg.mutation, &cfg.body, &cfg.brain, &layout);
+            // The state of the stream after the same work, for different shapes.
+            ends.push(rng.next_u64());
+            assert!(g.parts.iter().all(|p| p.shape == only));
+        }
+        assert!(
+            ends.windows(2).all(|w| w[0] == w[1]),
+            "the shape of a one-shape experiment changed the random stream: {ends:?}"
+        );
+    }
+
+    /// And the other half: offering a choice does draw, so the guard above is
+    /// not simply dead code that never picks anything.
+    #[test]
+    fn a_multi_shape_roster_actually_varies_shapes() {
+        let (mut cfg, layout) = fixture();
+        cfg.body.shapes =
+            vec![ShapeKind::Box, ShapeKind::Sphere, ShapeKind::Capsule, ShapeKind::Cylinder];
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..50 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            seen.extend(g.parts.iter().map(|p| p.shape));
+        }
+        assert_eq!(seen.len(), 4, "not every offered shape was ever drawn: {seen:?}");
     }
 
     #[test]

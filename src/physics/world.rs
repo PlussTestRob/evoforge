@@ -4,9 +4,11 @@
 //!
 //! Rapier and friends are good libraries, but they solve a much larger problem
 //! than this one: arbitrary geometry, broad-phase acceleration, continuous
-//! collision, sleeping, scene graphs. We need boxes on a ground plane connected
-//! by hinges, with organisms that do not collide with themselves. Every one of
-//! those simplifications removes an entire subsystem. What is left is small
+//! collision, sleeping, scene graphs. We need a handful of convex primitives on a
+//! ground plane connected by hinges, with organisms that do not collide with
+//! themselves. Every one of those simplifications removes an entire subsystem —
+//! and the last one is what keeps [`super::shape`] small, because it means the
+//! only collision query is a shape against the terrain. What is left is small
 //! enough to read in one sitting, has no version-drift risk to reproducibility,
 //! and has no per-evaluation setup cost worth mentioning — which matters when the
 //! workload is millions of very short evaluations rather than one long one.
@@ -337,7 +339,14 @@ impl World {
 
         for (bi, body) in self.bodies.iter().enumerate() {
             let inv_i = &self.inv_inertia[bi];
-            for corner in body.corners() {
+            // Which points of a curved shape are candidates depends on the
+            // ground normal, so ask the terrain first. Under the body's centre
+            // is close enough: a shape is small relative to any terrain feature
+            // we intend to support, and the per-point height below is still
+            // sampled exactly.
+            let under = terrain.normal_at(body.pos.x, body.pos.z);
+            let (points, count) = body.ground_points(under);
+            for &corner in &points[..count] {
                 let ground = terrain.height_at(corner.x, corner.z);
                 let depth = ground - corner.y;
                 if depth <= 0.0 {

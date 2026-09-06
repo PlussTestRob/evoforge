@@ -53,7 +53,10 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 ///   than the evaluated generation just finished. Resuming a v1 checkpoint would
 ///   re-evaluate and re-append a generation that is already on disk, so
 ///   [`check_readable`] refuses it.
-pub const ARTIFACT_FORMAT: u32 = 2;
+/// * `3` — parts carry a shape. A `PartGene` gained `shape` and a `BodySpec`
+///   gained the geometry itself; both default to a box on read, so v2 genomes
+///   and replays still load and still mean what they meant.
+pub const ARTIFACT_FORMAT: u32 = 3;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

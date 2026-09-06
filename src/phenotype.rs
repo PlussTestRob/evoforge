@@ -10,9 +10,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::genome::{Genome, JointKind};
+use crate::genome::{Genome, JointKind, ShapeKind};
 use crate::math::{dcos, vec3, Real, Vec3};
-use crate::physics::{Joint, RigidBody, TerrainModel, World, WorldParams};
+use crate::physics::{Joint, RigidBody, Shape, TerrainModel, World, WorldParams};
 
 /// Height above the terrain at which an organism is spawned. Small but nonzero,
 /// so the first step resolves a shallow contact rather than a deep overlap.
@@ -40,8 +40,22 @@ pub const FACES: [Face; 6] = [
 /// organism without re-expressing the genome.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BodySpec {
+    /// Half-extents of the box bounding the part. Kept alongside `shape` because
+    /// it is what the attachment rules and any bounding query want, and because
+    /// it is enough on its own to draw a recognisable organism.
     pub half_extents: Vec3,
+    /// The part's geometry. Absent in replays recorded before shapes existed,
+    /// where every part was exactly the box `half_extents` describes.
+    #[serde(default)]
+    pub shape: Option<Shape>,
     pub slot: u8,
+}
+
+impl BodySpec {
+    /// The part's geometry, filling in what an older replay meant by omission.
+    pub fn geometry(&self) -> Shape {
+        self.shape.unwrap_or(Shape::Box { half_extents: self.half_extents })
+    }
 }
 
 /// An expressed organism, ready to simulate.
@@ -62,8 +76,77 @@ impl Phenotype {
             .bodies
             .iter()
             .zip(&self.body_slots)
-            .map(|(b, &slot)| BodySpec { half_extents: b.half_extents, slot })
+            .map(|(b, &slot)| BodySpec { half_extents: b.bounds(), shape: Some(b.shape), slot })
             .collect()
+    }
+}
+
+/// Turn a shape gene and the box it is inscribed in into geometry.
+///
+/// Every primitive is *inscribed* in `half_extents` rather than sized by its own
+/// genes. One size gene therefore keeps doing one job, the existing size
+/// mutation operator works unchanged for every shape, and a part never grows
+/// when its shape changes — only its mass and the way it meets the ground do.
+///
+/// Shapes with a long direction take the box's longest axis. That means a size
+/// mutation which makes a different axis the longest will swing a capsule
+/// through ninety degrees, which is a large morphological jump from a small
+/// mutation; it is also exactly the kind of jump that a limb becoming a leg
+/// needs, so it is left in deliberately.
+pub fn carve(kind: ShapeKind, half_extents: Vec3, taper_top_scale: Real) -> Shape {
+    let h = half_extents;
+    match kind {
+        ShapeKind::Box => Shape::Box { half_extents: h },
+        ShapeKind::Taper => {
+            Shape::Taper { half_extents: h, axis: longest_axis(h), top_scale: taper_top_scale }
+        }
+        ShapeKind::Sphere => Shape::Sphere { radius: h.x.min(h.y).min(h.z) },
+        ShapeKind::Capsule => {
+            let axis = longest_axis(h);
+            let radius = shortest_cross_extent(h, axis);
+            // The hemispherical caps are part of the length, so the cylindrical
+            // section is what is left of the box's half-extent after them.
+            Shape::Capsule { radius, half_length: (component(h, axis) - radius).max(0.0), axis }
+        }
+        ShapeKind::Cylinder => {
+            let axis = longest_axis(h);
+            Shape::Cylinder {
+                radius: shortest_cross_extent(h, axis),
+                half_length: component(h, axis),
+                axis,
+            }
+        }
+    }
+}
+
+#[inline]
+fn component(v: Vec3, axis: u8) -> Real {
+    match axis {
+        0 => v.x,
+        1 => v.y,
+        _ => v.z,
+    }
+}
+
+/// Index of the largest half-extent; ties go to the lowest axis, so the rule is
+/// total and deterministic.
+fn longest_axis(h: Vec3) -> u8 {
+    if h.x >= h.y && h.x >= h.z {
+        0
+    } else if h.y >= h.z {
+        1
+    } else {
+        2
+    }
+}
+
+/// The smaller of the two half-extents perpendicular to `axis`, which is the
+/// largest radius that still fits inside the box.
+fn shortest_cross_extent(h: Vec3, axis: u8) -> Real {
+    match axis {
+        0 => h.y.min(h.z),
+        1 => h.x.min(h.z),
+        _ => h.x.min(h.y),
     }
 }
 
@@ -76,7 +159,12 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
     debug_assert!(n >= 1);
 
     let density = cfg.body.density;
+    let top_scale = cfg.body.taper_top_scale;
+    // Geometric centres, not centres of mass: the attachment rules below are
+    // written about the box a part is inscribed in, and for a taper the two
+    // differ. The conversion happens once, where each body is constructed.
     let mut centres: Vec<Vec3> = Vec::with_capacity(n);
+    let mut shapes: Vec<Shape> = Vec::with_capacity(n);
     let mut bodies: Vec<RigidBody> = Vec::with_capacity(n);
     let mut joints: Vec<Joint> = Vec::with_capacity(n.saturating_sub(1));
     let mut body_slots: Vec<u8> = Vec::with_capacity(n);
@@ -84,14 +172,21 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
 
     // Root at the origin; the whole organism is translated onto the terrain once
     // every part has been placed.
+    let root = carve(genome.parts[0].shape, genome.parts[0].half_extents, top_scale);
     centres.push(Vec3::ZERO);
-    bodies.push(RigidBody::box_body(Vec3::ZERO, genome.parts[0].half_extents, density));
+    shapes.push(root);
+    bodies.push(RigidBody::new(root.com_offset(), root, density));
     body_slots.push(genome.parts[0].slot);
 
     for i in 1..n {
         let part = &genome.parts[i];
         let parent_index = part.parent as usize;
-        let parent_extents = genome.parts[parent_index].half_extents;
+        let shape = carve(part.shape, part.half_extents, top_scale);
+        // Attachment works in bounding boxes, so a sphere's child sits on the
+        // sphere's own bound rather than on the box it was carved from and every
+        // shape presents the same six faces to the rules below.
+        let extents = shape.bounds();
+        let parent_extents = shapes[parent_index].bounds();
         let face = &FACES[(part.attach_face % 6) as usize];
 
         // Point on the parent's face, in the parent's local frame.
@@ -103,10 +198,14 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
             + face.tangents[1] * (part.attach_v * parent_extents.dot(t1_abs));
 
         // The child sits just outside that face, touching it.
-        let child_offset = face.normal * part.half_extents.dot(n_abs);
+        let child_offset = face.normal * extents.dot(n_abs);
         let centre = centres[parent_index] + anchor_in_parent + child_offset;
         centres.push(centre);
-        bodies.push(RigidBody::box_body(centre, part.half_extents, density));
+        shapes.push(shape);
+        // Parts are spawned axis-aligned, so the centre-of-mass offset needs no
+        // rotation here; it does once the body starts moving, which is why
+        // `Shape::ground_points` rotates it.
+        bodies.push(RigidBody::new(centre + shape.com_offset(), shape, density));
         body_slots.push(part.slot);
 
         // All parts are spawned axis-aligned, so local and world frames coincide
@@ -120,8 +219,8 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
             body_a: parent_index as u16,
             body_b: i as u16,
             kind: part.joint.kind,
-            anchor_a: anchor_in_parent,
-            anchor_b: -child_offset,
+            anchor_a: anchor_in_parent - shapes[parent_index].com_offset(),
+            anchor_b: -child_offset - shape.com_offset(),
             axis_a: axis,
             axis_b: axis,
             ref_a: reference,
@@ -150,10 +249,13 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
     // `TerrainModel` grows a non-flat variant. For `Flat` it reduces to exactly
     // the same arithmetic.
     let terrain = cfg_terrain(cfg);
-    let deepest = bodies
-        .iter()
-        .flat_map(|b| b.corners())
-        .fold(Real::NEG_INFINITY, |m, c| m.max(terrain.height_at(c.x, c.z) - c.y));
+    let mut deepest = Real::NEG_INFINITY;
+    for body in &bodies {
+        let (points, count) = body.ground_points(Vec3::Y);
+        for p in &points[..count] {
+            deepest = deepest.max(terrain.height_at(p.x, p.z) - p.y);
+        }
+    }
     let lift = deepest + SPAWN_CLEARANCE;
     for b in bodies.iter_mut() {
         b.pos.y += lift;
@@ -201,6 +303,20 @@ mod tests {
         Config::default()
     }
 
+    /// A configuration with every shape available, so the tests below exercise
+    /// the carving rules rather than only the box path.
+    fn shaped_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.body.shapes = vec![
+            ShapeKind::Box,
+            ShapeKind::Taper,
+            ShapeKind::Sphere,
+            ShapeKind::Capsule,
+            ShapeKind::Cylinder,
+        ];
+        cfg
+    }
+
     #[test]
     fn faces_are_orthonormal() {
         for f in FACES.iter() {
@@ -213,6 +329,74 @@ mod tests {
         }
     }
 
+    /// Every carved shape has to fit inside the box its genome asked for, or the
+    /// attachment rules and the spawn drop are working from a bound that is not
+    /// a bound.
+    #[test]
+    fn every_shape_is_inscribed_in_its_box() {
+        let cfg = shaped_cfg();
+        let layout = cfg.brain_layout();
+        for seed in 0..200 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            for p in &g.parts {
+                let shape = carve(p.shape, p.half_extents, cfg.body.taper_top_scale);
+                let b = shape.bounds();
+                assert!(
+                    b.x <= p.half_extents.x + 1e-6
+                        && b.y <= p.half_extents.y + 1e-6
+                        && b.z <= p.half_extents.z + 1e-6,
+                    "seed {seed}: {:?} bounds {b:?} escape {:?}",
+                    p.shape,
+                    p.half_extents
+                );
+                assert!(b.x > 0.0 && b.y > 0.0 && b.z > 0.0, "seed {seed}: degenerate {b:?}");
+            }
+        }
+    }
+
+    /// The same drop test as for boxes, but over organisms made of every shape.
+    /// A curved part reports a different lowest point than its bounding box
+    /// would, so this is what catches a shape whose ground points disagree with
+    /// its own bounds.
+    #[test]
+    fn a_shaped_organism_also_sits_on_the_ground() {
+        let cfg = shaped_cfg();
+        let layout = cfg.brain_layout();
+        for seed in 0..100 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            let p = build(&g, &cfg);
+            let lowest =
+                p.world.bodies.iter().fold(Real::INFINITY, |m, b| m.min(b.lowest_point_y()));
+            assert!(
+                (lowest - SPAWN_CLEARANCE).abs() < 1e-4,
+                "seed {seed}: lowest point at {lowest}"
+            );
+        }
+    }
+
+    /// A taper is the only shape whose centre of mass is not its geometric
+    /// centre, and getting that offset backwards would put the body half a part
+    /// away from where the attachment rules placed it.
+    #[test]
+    fn a_tapered_part_is_placed_by_its_centre_of_mass() {
+        let mut cfg = cfg();
+        cfg.body.shapes = vec![ShapeKind::Taper];
+        let layout = cfg.brain_layout();
+        let mut rng = Rng::new(7);
+        let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+        let p = build(&g, &cfg);
+        for (body, gene) in p.world.bodies.iter().zip(&g.parts) {
+            let shape = carve(gene.shape, gene.half_extents, cfg.body.taper_top_scale);
+            assert!(shape.com_offset().length() > 0.0, "a taper should be off-centre");
+            // The body sits at the centre of mass, so backing the offset out has
+            // to land on the geometric centre the bounds are measured about.
+            let centre = body.pos - shape.com_offset();
+            assert!((body.lowest_point_y() - (centre.y - shape.bounds().y)).abs() < 1e-5);
+        }
+    }
+
     #[test]
     fn built_organism_sits_on_the_ground() {
         let cfg = cfg();
@@ -222,7 +406,7 @@ mod tests {
             let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
             let p = build(&g, &cfg);
             let lowest =
-                p.world.bodies.iter().fold(Real::INFINITY, |m, b| m.min(b.lowest_corner_y()));
+                p.world.bodies.iter().fold(Real::INFINITY, |m, b| m.min(b.lowest_point_y()));
             assert!(
                 (lowest - SPAWN_CLEARANCE).abs() < 1e-4,
                 "seed {seed}: lowest corner at {lowest}"
@@ -289,7 +473,7 @@ mod tests {
         let b = build(&g, &cfg);
         for (x, y) in a.world.bodies.iter().zip(&b.world.bodies) {
             assert_eq!(x.pos, y.pos);
-            assert_eq!(x.half_extents, y.half_extents);
+            assert_eq!(x.shape, y.shape);
         }
         assert_eq!(a.total_mass, b.total_mass);
     }

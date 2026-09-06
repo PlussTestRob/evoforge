@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::brain::BrainLayout;
+use crate::genome::ShapeKind;
 use crate::math::Real;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -122,6 +123,15 @@ impl Config {
             bad("body motor limits must be non-negative")?;
         }
         rate(self.body.hinge_probability, "body.hinge_probability")?;
+        if self.body.shapes.is_empty() {
+            bad("body.shapes must list at least one shape")?;
+        }
+        // A taper wider at the top than the base would put its bounding box
+        // somewhere other than where `Shape::bounds` says it is, and every
+        // attachment and spawn calculation trusts that bound.
+        if !(0.0..=1.0).contains(&self.body.taper_top_scale) {
+            bad("body.taper_top_scale must be within [0, 1]")?;
+        }
         if self.body.density <= 0.0 {
             bad("body.density must be positive")?;
         }
@@ -176,6 +186,7 @@ impl Config {
         rate(self.mutation.weight_rate, "mutation.weight_rate")?;
         rate(self.mutation.weight_reset_rate, "mutation.weight_reset_rate")?;
         rate(self.mutation.size_rate, "mutation.size_rate")?;
+        rate(self.mutation.shape_rate, "mutation.shape_rate")?;
         rate(self.mutation.attach_rate, "mutation.attach_rate")?;
         rate(self.mutation.joint_limit_rate, "mutation.joint_limit_rate")?;
         rate(self.mutation.joint_kind_rate, "mutation.joint_kind_rate")?;
@@ -269,6 +280,10 @@ pub struct MutationParams {
     pub joint_axis_rate: Real,
     pub motor_rate: Real,
     pub motor_sigma: Real,
+    /// Probability per part of redrawing its shape. Only consulted when
+    /// `body.shapes` offers more than one, so a box-only experiment never spends
+    /// a draw on it.
+    pub shape_rate: Real,
     /// Probability per genome of appending one new part.
     pub add_part_rate: Real,
     /// Probability per genome of deleting one leaf part.
@@ -291,6 +306,7 @@ impl Default for MutationParams {
             joint_axis_rate: 0.03,
             motor_rate: 0.05,
             motor_sigma: 0.15,
+            shape_rate: 0.04,
             add_part_rate: 0.06,
             remove_part_rate: 0.05,
         }
@@ -314,6 +330,17 @@ pub struct BodyLimits {
     pub max_motor_torque: Real,
     /// Probability that a newly generated joint is a hinge rather than fixed.
     pub hinge_probability: Real,
+    /// Which primitives parts may be carved from, e.g.
+    /// `shapes = ["box", "capsule", "sphere"]`.
+    ///
+    /// A single-entry list means every part is that shape and *no randomness is
+    /// spent choosing*, which is what lets a box-only experiment reproduce
+    /// results recorded before shapes existed, bit for bit.
+    pub shapes: Vec<ShapeKind>,
+    /// Cross-section of a taper's far end as a fraction of its base. Fixed per
+    /// experiment rather than evolved, because a second size gene would mostly
+    /// duplicate what `half_extents` already says.
+    pub taper_top_scale: Real,
 }
 
 impl Default for BodyLimits {
@@ -329,6 +356,8 @@ impl Default for BodyLimits {
             max_motor_speed: 6.0,
             max_motor_torque: 120.0,
             hinge_probability: 0.85,
+            shapes: vec![ShapeKind::Box],
+            taper_top_scale: 0.45,
         }
     }
 }
@@ -528,6 +557,11 @@ const FINGERPRINT_VERSION: u32 = 1;
 ///
 /// New dynamics fields must be appended here. Pretty-printed TOML is not used:
 /// field order, comments and crate upgrades must not change the digest.
+/// Whether a shape roster asks for anything a pre-shapes build would not have done.
+fn uses_shapes(shapes: &[ShapeKind]) -> bool {
+    shapes.len() > 1 || (shapes.len() == 1 && shapes[0] != ShapeKind::Box)
+}
+
 fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     let mut f = Fingerprint::new();
     f.u32(FINGERPRINT_VERSION);
@@ -578,6 +612,17 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     f.real(cfg.body.max_motor_speed);
     f.real(cfg.body.max_motor_torque);
     f.real(cfg.body.hinge_probability);
+    // Folded in only when the experiment actually uses shapes. A box-only
+    // configuration therefore keeps the digest it had before shapes existed,
+    // which is what lets a run started before this feature still be resumed.
+    if uses_shapes(&cfg.body.shapes) {
+        f.tag(b"shapes");
+        for kind in &cfg.body.shapes {
+            f.u32(*kind as u32);
+        }
+        f.real(cfg.body.taper_top_scale);
+        f.real(cfg.mutation.shape_rate);
+    }
 
     f.tag(b"brain");
     f.usize(cfg.brain.hidden);

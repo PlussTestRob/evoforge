@@ -138,6 +138,81 @@ function validate(r) {
   }
 }
 
+// The two axes that are not `axis`, in ascending order. Mirrors `cross_axes` in
+// src/physics/shape.rs.
+const CROSS_AXES = [[1, 2], [0, 2], [0, 1]];
+
+/** Turn a body's local +Y into its shape axis. Shapes are built along Y. */
+function alignToAxis(geo, axis) {
+  if (axis === 0) geo.rotateZ(-Math.PI / 2);
+  else if (axis === 2) geo.rotateX(Math.PI / 2);
+  return geo;
+}
+
+/**
+ * Geometry for one recorded body, in its body frame.
+ *
+ * A replay written before shapes existed has no `shape`, and every part in it
+ * was exactly the box `half_extents` describes — which is the fallback here.
+ */
+function buildGeometry(body) {
+  const bounds = body.half_extents;
+  const s = body.shape || { kind: 'box', half_extents: bounds };
+  const size = (v) => [v.x, v.y, v.z];
+
+  switch (s.kind) {
+    case 'sphere':
+      return new THREE.SphereGeometry(s.radius, 28, 18);
+
+    case 'capsule':
+      // CapsuleGeometry's `length` is the cylindrical section only, so the total
+      // height is length + 2r — the same convention the simulator uses.
+      return alignToAxis(
+        new THREE.CapsuleGeometry(s.radius, s.half_length * 2, 8, 24),
+        s.axis,
+      );
+
+    case 'cylinder':
+      return alignToAxis(
+        new THREE.CylinderGeometry(s.radius, s.radius, s.half_length * 2, 28),
+        s.axis,
+      );
+
+    case 'taper': {
+      // A four-sided cylinder is a square frustum once it is turned an eighth of
+      // a turn; at that angle the circumradius sqrt(2) gives unit half-sides.
+      const e = size(s.half_extents);
+      const [b, c] = CROSS_AXES[s.axis];
+      const geo = new THREE.CylinderGeometry(
+        Math.SQRT2 * s.top_scale,
+        Math.SQRT2,
+        2,
+        4,
+      );
+      geo.rotateY(Math.PI / 4);
+      geo.scale(e[b], e[s.axis], e[c]);
+      alignToAxis(geo, s.axis);
+      // A frustum's centre of mass is not its geometric centre, and the pose in
+      // the trace is the centre of mass. Same expression as `Shape::com_offset`
+      // in src/physics/shape.rs; at top_scale 1 it is zero and at 0 it is half
+      // the half-height, which is a pyramid's quarter-height from the base.
+      const a = s.top_scale - 1;
+      const off = (e[s.axis] * (a * (2 + a))) / (2 * (a * a + 3 * a + 3));
+      const shift = [0, 0, 0];
+      shift[s.axis] = -off;
+      geo.translate(shift[0], shift[1], shift[2]);
+      return geo;
+    }
+
+    case 'box':
+    default: {
+      const h = s.half_extents || bounds;
+      // BoxGeometry takes full extents; the trace stores half-extents.
+      return new THREE.BoxGeometry(h.x * 2, h.y * 2, h.z * 2);
+    }
+  }
+}
+
 function buildMeshes(bodies) {
   for (const m of meshes) {
     organism.remove(m);
@@ -145,9 +220,7 @@ function buildMeshes(bodies) {
     m.material.dispose();
   }
   meshes = bodies.map((b) => {
-    const h = b.half_extents;
-    // BoxGeometry takes full extents; the trace stores half-extents.
-    const geo = new THREE.BoxGeometry(h.x * 2, h.y * 2, h.z * 2);
+    const geo = buildGeometry(b);
     const mat = new THREE.MeshStandardMaterial({
       color: PALETTE[(b.slot ?? 0) % PALETTE.length],
       roughness: 0.55,
@@ -173,6 +246,15 @@ function fillHud(r) {
   el('h-dx').textContent = `${num(m.displacement_x)} m`;
   el('h-up').textContent = `${num(m.upright_seconds, 2)} s`;
   el('h-bodies').textContent = r.trace.bodies.length;
+  const counts = new Map();
+  for (const b of r.trace.bodies) {
+    const kind = (b.shape && b.shape.kind) || 'box';
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+  el('h-shapes').textContent = [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([kind, n]) => `${n} ${kind}`)
+    .join(', ');
   el('h-hz').textContent = num(r.trace.record_hz, 0);
   el('h-diverged').hidden = !m.diverged;
   ui.hud.hidden = false;

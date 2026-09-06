@@ -458,18 +458,20 @@ fn describe_genome(g: &evoforge::genome::Genome) {
     for (i, p) in g.parts.iter().enumerate() {
         if i == 0 {
             println!(
-                "    part 0 (slot {}): root, {:.2} x {:.2} x {:.2} m",
+                "    part 0 (slot {}): root, {:?} {:.2} x {:.2} x {:.2} m",
                 p.slot,
+                p.shape,
                 p.half_extents.x * 2.0,
                 p.half_extents.y * 2.0,
                 p.half_extents.z * 2.0
             );
         } else {
             println!(
-                "    part {} (slot {}): {:.2} x {:.2} x {:.2} m, {:?} on face {} of part {}, \
+                "    part {} (slot {}): {:?} {:.2} x {:.2} x {:.2} m, {:?} on face {} of part {}, \
                  limit {:.2} rad, motor {:.1} rad/s / {:.0} N m",
                 i,
                 p.slot,
+                p.shape,
                 p.half_extents.x * 2.0,
                 p.half_extents.y * 2.0,
                 p.half_extents.z * 2.0,

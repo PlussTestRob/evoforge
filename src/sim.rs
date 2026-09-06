@@ -389,6 +389,30 @@ mod tests {
         assert!(diverged < n / 10, "{diverged}/{n} organisms diverged");
     }
 
+    /// Shapes are new geometry meeting an old solver. A sphere resting on one
+    /// contact point and a cylinder standing on its rim are both cases a box
+    /// never produced, so the divergence budget has to be checked against them
+    /// specifically rather than inferred from the box result.
+    #[test]
+    fn most_random_shaped_organisms_do_not_diverge() {
+        let mut cfg = quick_config();
+        cfg.body.shapes = vec![
+            crate::genome::ShapeKind::Box,
+            crate::genome::ShapeKind::Taper,
+            crate::genome::ShapeKind::Sphere,
+            crate::genome::ShapeKind::Capsule,
+            crate::genome::ShapeKind::Cylinder,
+        ];
+        let mut diverged = 0;
+        let n = 100;
+        for seed in 0..n {
+            if evaluate(&random_genome(&cfg, 500 + seed), &cfg, false).metrics.diverged {
+                diverged += 1;
+            }
+        }
+        assert!(diverged < n / 10, "{diverged}/{n} shaped organisms diverged");
+    }
+
     #[test]
     fn steps_per_rounds_sensibly() {
         assert_eq!(steps_per(20.0, 1.0 / 120.0), 6);
@@ -476,8 +500,7 @@ mod tests {
         let mut total = 0.0;
         let mut acc = Vec3::ZERO;
         for (i, spec) in bodies.iter().enumerate() {
-            let h = spec.half_extents;
-            let m = 8.0 * h.x * h.y * h.z * cfg.body.density;
+            let (m, _) = spec.geometry().mass_properties(cfg.body.density);
             let p = crate::math::vec3(poses[i * 7], poses[i * 7 + 1], poses[i * 7 + 2]);
             acc += p * m;
             total += m;

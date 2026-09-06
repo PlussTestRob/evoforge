@@ -1,13 +1,15 @@
 //! Rigid bodies.
 //!
-//! Every body is a box. That is not a placeholder for a general collision
-//! system: boxes give us mass properties, ground contact and a visual identity
-//! for free, and the whole point of the initial experiment is to see whether
-//! evolution finds locomotion, not to support arbitrary geometry.
+//! A body is a single convex primitive — see [`super::shape::Shape`] for which
+//! ones and why the set is small. The body itself is deliberately ignorant of
+//! geometry beyond delegating three questions to its shape: what it weighs, what
+//! could be touching the ground, and what box it fits in.
 
 use crate::math::{vec3, Mat3, Quat, Real, Vec3};
 
-/// A box-shaped rigid body in maximal coordinates.
+use super::shape::{Shape, MAX_GROUND_POINTS};
+
+/// A rigid body in maximal coordinates.
 ///
 /// Stored flat in [`super::World::bodies`] and referenced by index. There are no
 /// back-references, no parent pointers and no `Rc`: the whole world is a couple
@@ -15,42 +17,48 @@ use crate::math::{vec3, Mat3, Quat, Real, Vec3};
 /// cheap to iterate and trivially `Send`.
 #[derive(Clone, Copy, Debug)]
 pub struct RigidBody {
-    /// World-space centre of mass.
+    /// World-space centre of mass. For a shape whose centre of mass is not its
+    /// geometric centre — a taper — the two differ by
+    /// [`Shape::com_offset`], and this is the former.
     pub pos: Vec3,
     pub orient: Quat,
     pub lin_vel: Vec3,
     pub ang_vel: Vec3,
-    /// Box half-extents in the body frame.
-    pub half_extents: Vec3,
+    /// Collision geometry in the body frame.
+    pub shape: Shape,
     pub inv_mass: Real,
-    /// Diagonal of the inverse inertia tensor in the body frame. A box's inertia
-    /// tensor is diagonal in its own frame, so there is no reason to store nine
-    /// numbers.
+    /// Diagonal of the inverse inertia tensor in the body frame. Every shape we
+    /// admit is symmetric enough for its inertia tensor to be diagonal in its own
+    /// frame, so there is no reason to store nine numbers.
     pub inv_inertia_local: Vec3,
 }
 
 impl RigidBody {
-    /// Create a dynamic box of the given density.
-    pub fn box_body(pos: Vec3, half_extents: Vec3, density: Real) -> RigidBody {
-        let h = half_extents;
-        let mass = 8.0 * h.x * h.y * h.z * density;
+    /// Create a dynamic body of the given shape and density.
+    pub fn new(pos: Vec3, shape: Shape, density: Real) -> RigidBody {
+        let (mass, i) = shape.mass_properties(density);
         debug_assert!(mass > 0.0);
-        // For a box, I_xx = m/12 * (height^2 + depth^2) with full extents,
-        // which reduces to m/3 * (hy^2 + hz^2) in half-extents.
-        let i = vec3(
-            mass / 3.0 * (h.y * h.y + h.z * h.z),
-            mass / 3.0 * (h.x * h.x + h.z * h.z),
-            mass / 3.0 * (h.x * h.x + h.y * h.y),
-        );
         RigidBody {
             pos,
             orient: Quat::IDENTITY,
             lin_vel: Vec3::ZERO,
             ang_vel: Vec3::ZERO,
-            half_extents: h,
+            shape,
             inv_mass: 1.0 / mass,
             inv_inertia_local: vec3(1.0 / i.x, 1.0 / i.y, 1.0 / i.z),
         }
+    }
+
+    /// Create a dynamic box. Kept as a named constructor because boxes are still
+    /// what most of the tests want.
+    pub fn box_body(pos: Vec3, half_extents: Vec3, density: Real) -> RigidBody {
+        RigidBody::new(pos, Shape::Box { half_extents }, density)
+    }
+
+    /// Half-extents of the box bounding this body, about its geometric centre.
+    #[inline]
+    pub fn bounds(&self) -> Vec3 {
+        self.shape.bounds()
     }
 
     #[inline]
@@ -91,27 +99,16 @@ impl RigidBody {
         self.ang_vel += inv_inertia.mul_vec(impulse);
     }
 
-    /// The eight corners of the box in world space.
-    pub fn corners(&self) -> [Vec3; 8] {
-        let h = self.half_extents;
-        let mut out = [Vec3::ZERO; 8];
-        let mut n = 0;
-        for sx in [-1.0, 1.0] {
-            for sy in [-1.0, 1.0] {
-                for sz in [-1.0, 1.0] {
-                    let local: Vec3 = vec3(sx * h.x, sy * h.y, sz * h.z);
-                    out[n] = self.pos + self.orient.rotate(local);
-                    n += 1;
-                }
-            }
-        }
-        out
+    /// World-space points that may be touching ground whose normal is `normal`.
+    pub fn ground_points(&self, normal: Vec3) -> ([Vec3; MAX_GROUND_POINTS], usize) {
+        self.shape.ground_points(self.pos, self.orient, normal)
     }
 
-    /// Lowest world-space corner height. Used to place an organism on the ground
-    /// at spawn.
-    pub fn lowest_corner_y(&self) -> Real {
-        self.corners().iter().fold(Real::INFINITY, |m, c| m.min(c.y))
+    /// Lowest world-space point of the body. Used to place an organism on the
+    /// ground at spawn.
+    pub fn lowest_point_y(&self) -> Real {
+        let (pts, n) = self.ground_points(Vec3::Y);
+        pts[..n].iter().fold(Real::INFINITY, |m, c| m.min(c.y))
     }
 
     pub fn is_finite(&self) -> bool {
@@ -158,15 +155,15 @@ mod tests {
     #[test]
     fn corners_bound_the_box() {
         let b = RigidBody::box_body(vec3(1.0, 2.0, 3.0), vec3(0.5, 0.25, 0.75), 100.0);
-        let cs = b.corners();
-        assert_eq!(cs.len(), 8);
-        for c in cs {
-            let d = c - b.pos;
+        let (cs, n) = b.ground_points(Vec3::Y);
+        assert_eq!(n, 8);
+        for c in &cs[..n] {
+            let d = *c - b.pos;
             assert!(d.x.abs() <= 0.5 + 1e-6);
             assert!(d.y.abs() <= 0.25 + 1e-6);
             assert!(d.z.abs() <= 0.75 + 1e-6);
         }
-        assert!((b.lowest_corner_y() - 1.75).abs() < 1e-6);
+        assert!((b.lowest_point_y() - 1.75).abs() < 1e-6);
     }
 
     #[test]

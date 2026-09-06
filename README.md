@@ -126,7 +126,7 @@ The initial concept is based on modular, block-based organisms.
 
 A creature may consist of:
 
-* Rigid blocks
+* Rigid parts — a box, a taper, a sphere, a capsule or a cylinder
 * Fixed connections
 * Hinged joints
 * Rotational/orbital joints
@@ -345,6 +345,9 @@ cargo build --release
 # Stricter locomotion: signed +X progress and an upright bonus.
 ./target/release/evo run experiments/directed-walkers.toml
 
+# The same experiment with all five part shapes enabled.
+./target/release/evo run experiments/shaped-walkers.toml
+
 # Measure throughput and its scaling across cores.
 ./target/release/evo bench experiments/first-walkers.toml
 
@@ -375,6 +378,51 @@ runs/first-walkers-1788654317/
 Resume an interrupted run, or extend a finished one, with
 `--resume runs/<dir>`; raising `generations` is allowed, but changing anything
 that affects the dynamics is refused rather than silently accepted.
+
+### Part shapes
+
+A part is not necessarily a cuboid. Each one is *carved* from the box its
+`half_extents` describe, as one of five primitives:
+
+| `shape` | what it is | ground contact |
+|---|---|---|
+| `box` | fills the box | 8 corners |
+| `taper` | rectangular frustum along the box's longest axis — a wedge, a foot, a claw | 8 corners |
+| `sphere` | inscribed sphere | 1 point |
+| `capsule` | inscribed capsule along the longest axis | 2 points |
+| `cylinder` | inscribed cylinder along the longest axis | 3 points per rim |
+
+The gene is only the *kind*; dimensions always come from `half_extents`, so one
+size gene keeps doing one job and a part never grows when its shape changes.
+
+Shape matters because of that last column, not because of appearance. Parts do
+not collide with each other, so geometry reaches the simulation through exactly
+two doors: how mass is distributed, and how a part meets the ground. A cuboid
+catches on its corners; a capsule rolls and pivots; a sphere or a cylinder can
+roll outright, which is a gait that was not previously available. What shape
+does *not* change is what can be built — that is the genome's tree structure,
+a separate question.
+
+Enable them per experiment:
+
+```toml
+[body]
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+taper_top_scale = 0.45   # a taper's far end, as a fraction of its base
+
+[mutation]
+shape_rate = 0.04        # per part, per generation
+```
+
+`experiments/shaped-walkers.toml` is `directed-walkers.toml` with exactly that
+added, so the two can be run against each other.
+
+The default is `shapes = ["box"]`, and a single-entry roster is not merely a
+restriction — it spends *no randomness* choosing, so a box-only experiment draws
+the identical random stream it drew before shapes existed and reproduces earlier
+results bit for bit. That is what lets `tests/golden.rs` keep the constants it
+was born with. Replays and stored genomes gain a `shape` field that defaults to
+`box` on read, so v2 artefacts still load and still mean what they meant.
 
 ### Viewer
 
