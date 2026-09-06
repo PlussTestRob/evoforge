@@ -23,6 +23,9 @@ pub struct RunOptions {
     pub quiet: bool,
     /// Resume from the latest checkpoint in this existing run directory.
     pub resume: Option<PathBuf>,
+    /// Allow resume when the checkpoint was written by a different evoforge
+    /// version. Dynamics may not match; the default is to refuse.
+    pub force_resume: bool,
 }
 
 #[derive(Debug)]
@@ -39,7 +42,7 @@ pub fn run(cfg: &Config, opts: &RunOptions) -> Result<RunSummary> {
     let pool = build_pool(opts.threads)?;
 
     let (run, mut population) = match &opts.resume {
-        Some(dir) => resume(dir, cfg)?,
+        Some(dir) => resume(dir, cfg, opts.force_resume)?,
         None => {
             let run = Run::create(cfg).context("creating run directory")?;
             (run, Population::founding(cfg))
@@ -128,7 +131,7 @@ fn record_selected(run: &Run, pop: &Population, cfg: &Config) -> Result<()> {
 }
 
 /// Load the newest checkpoint from an existing run directory.
-fn resume(dir: &Path, cfg: &Config) -> Result<(Run, Population)> {
+fn resume(dir: &Path, cfg: &Config, force: bool) -> Result<(Run, Population)> {
     let run = Run::open(dir).with_context(|| format!("opening run {}", dir.display()))?;
     let Some(checkpoint) = run.latest_checkpoint()? else {
         bail!("{} has no checkpoints to resume from", dir.display());
@@ -147,9 +150,17 @@ fn resume(dir: &Path, cfg: &Config) -> Result<(Run, Population)> {
         );
     }
     if checkpoint.evoforge_version != crate::VERSION {
+        if !force {
+            bail!(
+                "checkpoint was written by evoforge {}, this is {}; \
+                 resume with --force-resume if you intend to continue anyway",
+                checkpoint.evoforge_version,
+                crate::VERSION
+            );
+        }
         eprintln!(
             "warning: checkpoint was written by evoforge {}, this is {}; \
-             results may not be comparable",
+             --force-resume accepted, results may not be comparable",
             checkpoint.evoforge_version,
             crate::VERSION
         );
@@ -213,7 +224,7 @@ mod tests {
     fn a_run_produces_the_expected_artefacts() {
         let tmp = TempDir::new("artefacts");
         let cfg = tiny_config(&tmp);
-        let summary = run(&cfg, &RunOptions { threads: 2, quiet: true, resume: None }).unwrap();
+        let summary = run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
         assert_eq!(summary.generations_completed, 4);
         assert_eq!(summary.organisms_evaluated, 32);
@@ -250,8 +261,8 @@ mod tests {
                 .collect()
         };
 
-        let a = run(&cfg, &RunOptions { threads: 1, quiet: true, resume: None }).unwrap();
-        let b = run(&cfg, &RunOptions { threads: 4, quiet: true, resume: None }).unwrap();
+        let a = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+        let b = run(&cfg, &RunOptions { threads: 4, quiet: true, ..Default::default() }).unwrap();
 
         assert_eq!(
             strip_timings(read_stats(&a.dir)),
@@ -271,14 +282,19 @@ mod tests {
         full.evolution.generations = 4;
 
         // The uninterrupted reference run.
-        let reference = run(&full, &RunOptions { threads: 2, quiet: true, resume: None }).unwrap();
+        let reference = run(&full, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
         // A run stopped after two generations, then extended. Raising
         // `generations` must not invalidate the checkpoint.
-        let partial = run(&short, &RunOptions { threads: 2, quiet: true, resume: None }).unwrap();
+        let partial = run(&short, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
         let resumed = run(
             &full,
-            &RunOptions { threads: 2, quiet: true, resume: Some(partial.dir.clone()) },
+            &RunOptions {
+                threads: 2,
+                quiet: true,
+                resume: Some(partial.dir.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(resumed.generations_completed, 2, "should only run the remaining two");
@@ -302,15 +318,56 @@ mod tests {
     fn resume_rejects_a_mismatched_config() {
         let tmp = TempDir::new("mismatch");
         let cfg = tiny_config(&tmp);
-        let first = run(&cfg, &RunOptions { threads: 1, quiet: true, resume: None }).unwrap();
+        let first = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
 
         let mut changed = cfg.clone();
         changed.evolution.tournament_size += 1;
         let err = run(
             &changed,
-            &RunOptions { threads: 1, quiet: true, resume: Some(first.dir.clone()) },
+            &RunOptions {
+                threads: 1,
+                quiet: true,
+                resume: Some(first.dir.clone()),
+                ..Default::default()
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn resume_rejects_a_version_mismatch_unless_forced() {
+        let tmp = TempDir::new("version");
+        let cfg = tiny_config(&tmp);
+        let first = run(&cfg, &RunOptions { threads: 1, quiet: true, ..Default::default() }).unwrap();
+
+        let opened = Run::open(&first.dir).unwrap();
+        let mut checkpoint = opened.latest_checkpoint().unwrap().unwrap();
+        checkpoint.evoforge_version = "0.0.0-test".into();
+        record::write_json(&opened.checkpoint_path(checkpoint.population.generation), &checkpoint)
+            .unwrap();
+
+        let err = run(
+            &cfg,
+            &RunOptions {
+                threads: 1,
+                quiet: true,
+                resume: Some(first.dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("written by evoforge"), "{err}");
+
+        let forced = run(
+            &cfg,
+            &RunOptions {
+                threads: 1,
+                quiet: true,
+                resume: Some(first.dir.clone()),
+                force_resume: true,
+            },
+        );
+        assert!(forced.is_ok(), "{forced:?}");
     }
 }

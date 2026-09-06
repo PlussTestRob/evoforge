@@ -109,8 +109,8 @@ pub fn evaluate_with(
     for step in 0..total_steps {
         let t = step as Real * dt;
 
-        if step % control_interval == 0 {
-            let measured_t = (step.saturating_sub(settle_steps)) as Real * dt;
+        if should_apply_control(step, settle_steps, control_interval) {
+            let measured_t = (step - settle_steps) as Real * dt;
             apply_control(&mut pheno, &layout, &genome.weights, ws, measured_t);
         }
 
@@ -250,6 +250,13 @@ fn steps_per(hz: Real, dt: Real) -> u32 {
     (interval.round() as u32).max(1)
 }
 
+/// The controller stays off while the organism drops onto the terrain, so
+/// settle is a passive fall rather than a powered twitch that measurement
+/// then treats as the starting pose.
+fn should_apply_control(step: u32, settle_steps: u32, control_interval: u32) -> bool {
+    step >= settle_steps && step % control_interval == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +389,50 @@ mod tests {
         assert_eq!(steps_per(30.0, 1.0 / 120.0), 4);
         // Faster than the physics rate still means every step, never zero.
         assert_eq!(steps_per(1000.0, 1.0 / 120.0), 1);
+    }
+
+    #[test]
+    fn control_stays_off_during_settle() {
+        let interval = 6;
+        for step in 0..60 {
+            assert!(!should_apply_control(step, 60, interval), "step {step}");
+        }
+        assert!(should_apply_control(60, 60, interval));
+        assert!(!should_apply_control(61, 60, interval));
+        assert!(should_apply_control(66, 60, interval));
+    }
+
+    #[test]
+    fn a_live_controller_is_silent_during_settle() {
+        // Long drop, one control tick of measurement. An active network and a
+        // zeroed one should spend almost the same impulse: both sit at motor
+        // target 0 for the settle, then the active one gets a single tick.
+        let mut cfg = quick_config();
+        cfg.simulation.settle_time = 1.0;
+        cfg.simulation.duration = 0.05;
+
+        let mut g = random_genome(&cfg, 11);
+        if g.hinge_count() == 0 {
+            return;
+        }
+        let active = evaluate(&g, &cfg, false).metrics;
+        for w in g.weights.iter_mut() {
+            *w = 0.0;
+        }
+        let still = evaluate(&g, &cfg, false).metrics;
+        if active.diverged || still.diverged {
+            return;
+        }
+        let ratio = if still.actuation > 0.0 {
+            active.actuation / still.actuation
+        } else {
+            1.0
+        };
+        assert!(
+            ratio < 2.5,
+            "active settle actuation {} vs still {} (ratio {ratio})",
+            active.actuation,
+            still.actuation
+        );
     }
 }

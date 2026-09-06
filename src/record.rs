@@ -42,6 +42,14 @@ use crate::stats::GenerationStats;
 
 const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 
+/// On-disk schema version for manifest, checkpoint, replay and stored-genome
+/// records. Bump when a field is added, removed or reinterpreted.
+pub const ARTIFACT_FORMAT: u32 = 1;
+
+fn legacy_format() -> u32 {
+    0
+}
+
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const CONFIG_FILE: &str = "config.toml";
 pub const STATS_FILE: &str = "stats.csv";
@@ -53,6 +61,8 @@ pub const REPLAY_DIR: &str = "replays";
 /// Identifies a run and the exact inputs that produced it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
+    #[serde(default = "legacy_format")]
+    pub format: u32,
     pub experiment_id: String,
     pub experiment_name: String,
     /// Version of the simulator that produced the run. Results are only
@@ -88,6 +98,8 @@ impl From<&Individual> for OrganismRecord {
 /// One line of `genomes.jsonl`: enough to re-simulate an organism exactly.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredGenome {
+    #[serde(default = "legacy_format")]
+    pub format: u32,
     pub id: u64,
     pub generation: u32,
     pub parents: [u64; 2],
@@ -98,6 +110,8 @@ pub struct StoredGenome {
 /// A full-population snapshot, sufficient to resume a run.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
+    #[serde(default = "legacy_format")]
+    pub format: u32,
     pub evoforge_version: String,
     pub config_digest: u64,
     pub population: Population,
@@ -106,6 +120,8 @@ pub struct Checkpoint {
 /// A recorded trajectory plus everything needed to interpret it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Replay {
+    #[serde(default = "legacy_format")]
+    pub format: u32,
     pub experiment_id: String,
     pub organism_id: u64,
     pub generation: u32,
@@ -140,6 +156,7 @@ impl Run {
         fs::create_dir_all(dir.join(REPLAY_DIR))?;
 
         let manifest = Manifest {
+            format: ARTIFACT_FORMAT,
             experiment_id,
             experiment_name: cfg.experiment.name.clone(),
             evoforge_version: crate::VERSION.to_string(),
@@ -185,6 +202,7 @@ impl Run {
 
     pub fn append_genome(&self, individual: &Individual) -> std::io::Result<()> {
         let stored = StoredGenome {
+            format: ARTIFACT_FORMAT,
             id: individual.id,
             generation: individual.generation,
             parents: individual.parents,
@@ -206,7 +224,9 @@ impl Run {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let stored: StoredGenome = serde_json::from_str(&line)?;
+                let Some(stored) = parse_jsonl_line::<StoredGenome>(&line)? else {
+                    continue;
+                };
                 if stored.id == id {
                     return Ok(Some(stored));
                 }
@@ -217,6 +237,7 @@ impl Run {
             let checkpoint: Checkpoint = read_json(&path)?;
             if let Some(individual) = checkpoint.population.find(id) {
                 return Ok(Some(StoredGenome {
+                    format: ARTIFACT_FORMAT,
                     id: individual.id,
                     generation: individual.generation,
                     parents: individual.parents,
@@ -252,6 +273,7 @@ impl Run {
 
     pub fn write_checkpoint(&self, pop: &Population, cfg: &Config) -> std::io::Result<PathBuf> {
         let checkpoint = Checkpoint {
+            format: ARTIFACT_FORMAT,
             evoforge_version: crate::VERSION.to_string(),
             config_digest: cfg.evolution_digest(),
             population: pop.clone(),
@@ -281,6 +303,7 @@ impl Run {
         cfg: &Config,
     ) -> std::io::Result<PathBuf> {
         let replay = Replay {
+            format: ARTIFACT_FORMAT,
             experiment_id: self.manifest.experiment_id.clone(),
             organism_id: individual.id,
             generation: individual.generation,
@@ -382,11 +405,47 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer(&mut writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
+    let tmp = {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, value)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+    replace_file(&tmp, path)
+}
+
+/// Replace `to` with `from`. `rename` over an existing file is atomic on
+/// Unix and fails on Windows, so Windows removes the destination first.
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) if to.exists() => {
+            fs::remove_file(to)?;
+            fs::rename(from, to)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Parse one JSON Lines record. Empty lines and a truncated final line
+/// (typical of a kill mid-append) are skipped rather than failing the run.
+fn parse_jsonl_line<T: for<'de> Deserialize<'de>>(line: &str) -> std::io::Result<Option<T>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str(line) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.is_eof() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<T> {
@@ -472,7 +531,37 @@ mod tests {
 
         let reopened = Run::open(&run.dir).unwrap();
         assert_eq!(reopened.manifest, run.manifest);
+        assert_eq!(reopened.manifest.format, ARTIFACT_FORMAT);
         assert_eq!(reopened.config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn write_json_replaces_an_existing_file() {
+        let tmp = TempDir::new("atomic");
+        let path = tmp.0.join("value.json");
+        write_json(&path, &1u32).unwrap();
+        write_json(&path, &2u32).unwrap();
+        let loaded: u32 = read_json(&path).unwrap();
+        assert_eq!(loaded, 2);
+        assert!(!path.with_extension("json.tmp").exists());
+        // The sibling temp name is `value.json.tmp`, not `value.tmp`.
+        assert!(!tmp.0.join("value.json.tmp").exists());
+    }
+
+    #[test]
+    fn truncated_jsonl_lines_are_skipped() {
+        let tmp = TempDir::new("truncated");
+        let cfg = test_config(&tmp);
+        let run = Run::create(&cfg).unwrap();
+        let pop = evaluated(&cfg);
+        run.append_genome(&pop.individuals[0]).unwrap();
+        {
+            let mut f = append_file(&run.dir.join(GENOMES_FILE)).unwrap();
+            write!(f, "{{\"format\":1,\"id\":").unwrap();
+        }
+        let found = run.find_genome(pop.individuals[0].id).unwrap().unwrap();
+        assert_eq!(found.format, ARTIFACT_FORMAT);
+        assert_eq!(found.genome, pop.individuals[0].genome);
     }
 
     #[test]
@@ -532,6 +621,7 @@ mod tests {
         let paths = run.checkpoint_paths().unwrap();
         assert_eq!(paths.len(), 2);
         let latest = run.latest_checkpoint().unwrap().unwrap();
+        assert_eq!(latest.format, ARTIFACT_FORMAT);
         assert_eq!(latest.population.generation, 12);
         assert_eq!(latest.population, pop);
         assert_eq!(latest.config_digest, cfg.evolution_digest());
@@ -594,6 +684,7 @@ mod tests {
 
         let path = run.write_replay(individual, trace.clone(), &cfg).unwrap();
         let loaded: Replay = read_json(&path).unwrap();
+        assert_eq!(loaded.format, ARTIFACT_FORMAT);
         assert_eq!(loaded.organism_id, individual.id);
         assert_eq!(loaded.genome, individual.genome);
         assert_eq!(loaded.trace, trace);

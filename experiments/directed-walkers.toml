@@ -1,16 +1,11 @@
-# The first milestone experiment.
+# A stricter locomotion experiment than first-walkers.
 #
-# The goal is not an impressive creature. It is to demonstrate that the whole
-# pipeline works end to end and that fitness genuinely improves:
-#
-#   generate -> construct -> simulate -> score -> select -> breed -> mutate
-#
-# Roughly a minute of CPU time on a laptop. Watch the `mean` and `median`
-# columns, not just `best`: with elitism the best score can only go up, so it is
-# the middle of the distribution moving that shows the population is learning.
+# first-walkers uses omnidirectional distance, which a tumbling body can
+# satisfy. This one requires signed progress along +X and pays a bonus for
+# keeping the root block upright, so a gait has to beat a fall.
 
 [experiment]
-name = "first-walkers"
+name = "directed-walkers"
 seed = 20260905
 output_dir = "runs"
 
@@ -57,8 +52,6 @@ add_part_rate = 0.06
 remove_part_rate = 0.05
 
 [simulation]
-# Timestep defaults to 1/120 s. Do not write a rounded decimal here: that
-# is not exactly 1/120 and would change the step count.
 duration = 8.0
 control_hz = 20.0
 solver_iterations = 10
@@ -73,11 +66,9 @@ linear_damping = 0.02
 angular_damping = 0.05
 
 [fitness]
-# Horizontal distance from the starting point, in any direction. The easiest
-# objective that still requires locomotion rather than twitching.
-objective = "distance"
+objective = "distance_x"
 energy_penalty = 0.0
-upright_bonus = 0.0
+upright_bonus = 0.15
 
 [recording]
 top_n = 3

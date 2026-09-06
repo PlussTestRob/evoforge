@@ -63,7 +63,7 @@ impl Config {
 
     /// Fingerprint of the whole configuration, recorded in a run's manifest.
     pub fn digest(&self) -> u64 {
-        fnv1a(self.to_toml_string().as_bytes())
+        fingerprint(self, true)
     }
 
     /// Fingerprint of only those settings that change what evolution *does*.
@@ -73,18 +73,24 @@ impl Config {
     /// lets a finished run be extended — resume with a larger `generations` and
     /// the checkpoint still matches — while still refusing to resume a run whose
     /// physics, mutation rates or seed have changed underneath it.
+    ///
+    /// Built from a versioned, field-by-field byte stream rather than pretty
+    /// TOML, so a serializer upgrade or a comment cannot silently invalidate
+    /// resume.
     pub fn evolution_digest(&self) -> u64 {
-        let mut c = self.clone();
-        c.experiment.name = String::new();
-        c.experiment.output_dir = PathBuf::new();
-        c.evolution.generations = 0;
-        c.recording = RecordingCfg::default();
-        c.checkpoint = CheckpointCfg::default();
-        fnv1a(c.to_toml_string().as_bytes())
+        fingerprint(self, false)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |m: &str| -> Result<(), ConfigError> { Err(ConfigError::Invalid(m.into())) };
+        let rate = |v: Real, name: &str| -> Result<(), ConfigError> {
+            if (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                bad(&format!("{name} must be within [0, 1]"))
+            }
+        };
+
         if self.evolution.population_size < 2 {
             bad("evolution.population_size must be at least 2")?;
         }
@@ -94,6 +100,8 @@ impl Config {
         if self.evolution.tournament_size < 1 {
             bad("evolution.tournament_size must be at least 1")?;
         }
+        rate(self.evolution.crossover_rate, "evolution.crossover_rate")?;
+        rate(self.evolution.immigrant_rate, "evolution.immigrant_rate")?;
         if self.body.min_parts < 1 || self.body.max_parts < self.body.min_parts {
             bad("body part limits must satisfy 1 <= min_parts <= max_parts")?;
         }
@@ -104,8 +112,24 @@ impl Config {
         {
             bad("body half-extent limits must satisfy 0 < min <= max")?;
         }
+        if self.body.min_joint_limit <= 0.0
+            || self.body.max_joint_limit < self.body.min_joint_limit
+            || self.body.max_joint_limit >= crate::math::FRAC_PI_2
+        {
+            bad("body joint limits must satisfy 0 < min <= max < pi/2 (cosine limit test)")?;
+        }
+        if self.body.max_motor_speed < 0.0 || self.body.max_motor_torque < 0.0 {
+            bad("body motor limits must be non-negative")?;
+        }
+        rate(self.body.hinge_probability, "body.hinge_probability")?;
+        if self.body.density <= 0.0 {
+            bad("body.density must be positive")?;
+        }
         if self.brain.hidden == 0 {
             bad("brain.hidden must be at least 1")?;
+        }
+        if self.brain.init_sigma < 0.0 || self.brain.weight_limit <= 0.0 {
+            bad("brain.init_sigma must be non-negative and weight_limit positive")?;
         }
         if self.simulation.timestep <= 0.0 {
             bad("simulation.timestep must be positive")?;
@@ -119,11 +143,56 @@ impl Config {
         if self.simulation.solver_iterations == 0 {
             bad("simulation.solver_iterations must be at least 1")?;
         }
+        if self.simulation.settle_time < 0.0 {
+            bad("simulation.settle_time must be non-negative")?;
+        }
+        if !(0.0..=1.0).contains(&self.simulation.baumgarte) {
+            bad("simulation.baumgarte must be within [0, 1]")?;
+        }
+        if self.simulation.slop < 0.0 {
+            bad("simulation.slop must be non-negative")?;
+        }
+        if self.simulation.max_correction_speed <= 0.0
+            || self.simulation.max_linear_speed <= 0.0
+            || self.simulation.max_angular_speed <= 0.0
+        {
+            bad("simulation speed clamps must be positive")?;
+        }
         if !(0.0..=2.0).contains(&self.environment.friction) {
             bad("environment.friction must be within [0, 2]")?;
         }
+        if self.environment.restitution < 0.0 || self.environment.restitution > 1.0 {
+            bad("environment.restitution must be within [0, 1]")?;
+        }
+        if self.environment.linear_damping < 0.0 || self.environment.angular_damping < 0.0 {
+            bad("environment damping must be non-negative")?;
+        }
+        if self.environment.gravity < 0.0 {
+            bad("environment.gravity must be non-negative")?;
+        }
         if self.recording.record_hz <= 0.0 {
             bad("recording.record_hz must be positive")?;
+        }
+        rate(self.mutation.weight_rate, "mutation.weight_rate")?;
+        rate(self.mutation.weight_reset_rate, "mutation.weight_reset_rate")?;
+        rate(self.mutation.size_rate, "mutation.size_rate")?;
+        rate(self.mutation.attach_rate, "mutation.attach_rate")?;
+        rate(self.mutation.joint_limit_rate, "mutation.joint_limit_rate")?;
+        rate(self.mutation.joint_kind_rate, "mutation.joint_kind_rate")?;
+        rate(self.mutation.joint_axis_rate, "mutation.joint_axis_rate")?;
+        rate(self.mutation.motor_rate, "mutation.motor_rate")?;
+        rate(self.mutation.add_part_rate, "mutation.add_part_rate")?;
+        rate(self.mutation.remove_part_rate, "mutation.remove_part_rate")?;
+        if self.mutation.weight_sigma < 0.0
+            || self.mutation.size_sigma < 0.0
+            || self.mutation.attach_sigma < 0.0
+            || self.mutation.joint_limit_sigma < 0.0
+            || self.mutation.motor_sigma < 0.0
+        {
+            bad("mutation step sizes must be non-negative")?;
+        }
+        if self.fitness.energy_penalty < 0.0 || self.fitness.upright_bonus < 0.0 {
+            bad("fitness energy_penalty and upright_bonus must be non-negative")?;
         }
         Ok(())
     }
@@ -303,8 +372,19 @@ pub struct SimulationCfg {
     pub control_hz: Real,
     pub solver_iterations: u32,
     /// Time the organism falls and settles before measurement begins, so that
-    /// the initial drop does not count as locomotion.
+    /// the initial drop does not count as locomotion. The controller is held
+    /// off during this window.
     pub settle_time: Real,
+    /// Fraction of positional error corrected per step (Baumgarte).
+    pub baumgarte: Real,
+    /// Penetration tolerated before positional correction kicks in.
+    pub slop: Real,
+    /// Ceiling on Baumgarte-injected velocity.
+    pub max_correction_speed: Real,
+    /// Hard linear velocity clamp, m/s. Keeps a pathological body finite.
+    pub max_linear_speed: Real,
+    /// Hard angular velocity clamp, rad/s.
+    pub max_angular_speed: Real,
 }
 
 impl Default for SimulationCfg {
@@ -315,6 +395,11 @@ impl Default for SimulationCfg {
             control_hz: 20.0,
             solver_iterations: 10,
             settle_time: 0.5,
+            baumgarte: 0.2,
+            slop: 0.002,
+            max_correction_speed: 2.0,
+            max_linear_speed: 60.0,
+            max_angular_speed: 40.0,
         }
     }
 }
@@ -449,6 +534,164 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Version of the dynamics fingerprint layout. Bump when a field is added,
+/// removed or reinterpreted — existing checkpoints will then correctly refuse
+/// to resume rather than silently continue under a different hash.
+const FINGERPRINT_VERSION: u32 = 1;
+
+/// Canonical, serializer-independent fingerprint.
+///
+/// New dynamics fields must be appended here. Pretty-printed TOML is not used:
+/// field order, comments and crate upgrades must not change the digest.
+fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
+    let mut f = Fingerprint::new();
+    f.u32(FINGERPRINT_VERSION);
+    f.bool(include_bookkeeping);
+
+    f.tag(b"experiment");
+    f.u64(cfg.experiment.seed);
+    if include_bookkeeping {
+        f.str(&cfg.experiment.name);
+        f.str(&cfg.experiment.output_dir.to_string_lossy());
+    }
+
+    f.tag(b"evolution");
+    f.usize(cfg.evolution.population_size);
+    f.usize(cfg.evolution.elite_count);
+    f.usize(cfg.evolution.tournament_size);
+    f.real(cfg.evolution.crossover_rate);
+    f.real(cfg.evolution.immigrant_rate);
+    if include_bookkeeping {
+        f.u32(cfg.evolution.generations);
+    }
+
+    f.tag(b"mutation");
+    f.real(cfg.mutation.weight_rate);
+    f.real(cfg.mutation.weight_sigma);
+    f.real(cfg.mutation.weight_reset_rate);
+    f.real(cfg.mutation.size_rate);
+    f.real(cfg.mutation.size_sigma);
+    f.real(cfg.mutation.attach_rate);
+    f.real(cfg.mutation.attach_sigma);
+    f.real(cfg.mutation.joint_limit_rate);
+    f.real(cfg.mutation.joint_limit_sigma);
+    f.real(cfg.mutation.joint_kind_rate);
+    f.real(cfg.mutation.joint_axis_rate);
+    f.real(cfg.mutation.motor_rate);
+    f.real(cfg.mutation.motor_sigma);
+    f.real(cfg.mutation.add_part_rate);
+    f.real(cfg.mutation.remove_part_rate);
+
+    f.tag(b"body");
+    f.usize(cfg.body.min_parts);
+    f.usize(cfg.body.max_parts);
+    f.real(cfg.body.min_half_extent);
+    f.real(cfg.body.max_half_extent);
+    f.real(cfg.body.density);
+    f.real(cfg.body.min_joint_limit);
+    f.real(cfg.body.max_joint_limit);
+    f.real(cfg.body.max_motor_speed);
+    f.real(cfg.body.max_motor_torque);
+    f.real(cfg.body.hinge_probability);
+
+    f.tag(b"brain");
+    f.usize(cfg.brain.hidden);
+    f.real(cfg.brain.init_sigma);
+    f.real(cfg.brain.weight_limit);
+
+    f.tag(b"simulation");
+    f.real(cfg.simulation.timestep);
+    f.real(cfg.simulation.duration);
+    f.real(cfg.simulation.control_hz);
+    f.u32(cfg.simulation.solver_iterations);
+    f.real(cfg.simulation.settle_time);
+    f.real(cfg.simulation.baumgarte);
+    f.real(cfg.simulation.slop);
+    f.real(cfg.simulation.max_correction_speed);
+    f.real(cfg.simulation.max_linear_speed);
+    f.real(cfg.simulation.max_angular_speed);
+
+    f.tag(b"environment");
+    f.u8(match cfg.environment.terrain {
+        Terrain::Flat => 0,
+    });
+    f.real(cfg.environment.gravity);
+    f.real(cfg.environment.friction);
+    f.real(cfg.environment.restitution);
+    f.real(cfg.environment.linear_damping);
+    f.real(cfg.environment.angular_damping);
+
+    f.tag(b"fitness");
+    f.u8(match cfg.fitness.objective {
+        Objective::Distance => 0,
+        Objective::DistanceX => 1,
+        Objective::Speed => 2,
+    });
+    f.real(cfg.fitness.energy_penalty);
+    f.real(cfg.fitness.upright_bonus);
+
+    if include_bookkeeping {
+        f.tag(b"recording");
+        f.usize(cfg.recording.top_n);
+        f.usize(cfg.recording.random_samples);
+        f.real(cfg.recording.record_hz);
+        f.u32(cfg.recording.every_generations);
+        f.bool(cfg.recording.store_genomes);
+
+        f.tag(b"checkpoint");
+        f.u32(cfg.checkpoint.every_generations);
+        f.bool(cfg.checkpoint.on_finish);
+    }
+
+    f.finish()
+}
+
+struct Fingerprint(Vec<u8>);
+
+impl Fingerprint {
+    fn new() -> Fingerprint {
+        Fingerprint(Vec::with_capacity(512))
+    }
+
+    fn tag(&mut self, bytes: &[u8]) {
+        self.u32(bytes.len() as u32);
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn usize(&mut self, v: usize) {
+        self.u64(v as u64);
+    }
+
+    fn real(&mut self, v: Real) {
+        self.0.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+
+    fn bool(&mut self, v: bool) {
+        self.0.push(u8::from(v));
+    }
+
+    fn str(&mut self, s: &str) {
+        self.u64(s.len() as u64);
+        self.0.extend_from_slice(s.as_bytes());
+    }
+
+    fn finish(&self) -> u64 {
+        fnv1a(&self.0)
+    }
+}
+
 /// FNV-1a, used for configuration and structure fingerprints.
 ///
 /// Not cryptographic; it only needs to be fast, stable across versions and
@@ -465,6 +708,16 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_experiments_validate() {
+        for name in ["first-walkers.toml", "directed-walkers.toml"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments")
+                .join(name);
+            Config::load(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
 
     #[test]
     fn empty_config_is_the_default() {
@@ -563,12 +816,56 @@ mod tests {
             |c: &mut Config| c.evolution.tournament_size = 9,
             |c: &mut Config| c.mutation.weight_sigma = 0.9,
             |c: &mut Config| c.simulation.timestep = 0.01,
+            |c: &mut Config| c.simulation.baumgarte = 0.35,
             |c: &mut Config| c.environment.gravity = 3.7,
+            |c: &mut Config| c.fitness.objective = Objective::DistanceX,
         ] {
             let mut b = Config::default();
             tweak(&mut b);
             assert_ne!(a.evolution_digest(), b.evolution_digest());
         }
+    }
+
+    #[test]
+    fn evolution_digest_is_independent_of_toml_formatting() {
+        let compact = Config::from_toml_str("[experiment]\nseed = 99\n").unwrap();
+        let padded = Config::from_toml_str(
+            "# comment\n\n[experiment]\nseed = 99\n\n[evolution]\ngenerations = 100\n",
+        )
+        .unwrap();
+        assert_eq!(compact.evolution_digest(), padded.evolution_digest());
+        assert_eq!(compact.digest(), Config::from_toml_str("[experiment]\nseed = 99\n").unwrap().digest());
+    }
+
+    #[test]
+    fn validation_rejects_rates_outside_unit_interval() {
+        let err = Config::from_toml_str(
+            r#"
+            [evolution]
+            crossover_rate = 1.5
+            "#,
+        );
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
+
+        let err = Config::from_toml_str(
+            r#"
+            [mutation]
+            weight_rate = -0.1
+            "#,
+        );
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn validation_rejects_hinge_limits_outside_the_cosine_range() {
+        let err = Config::from_toml_str(
+            r#"
+            [body]
+            min_joint_limit = 0.3
+            max_joint_limit = 2.0
+            "#,
+        );
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
     }
 
     #[test]

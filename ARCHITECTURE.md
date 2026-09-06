@@ -73,6 +73,10 @@ organisms rather than a flag threaded through the hot loop. Because evaluation i
 pure this costs a few evaluations per recorded generation and keeps the common
 path free of frame buffers it would throw away.
 
+The controller is held off during `settle_time`. Motors stay at target zero
+while the organism drops, so the measured window does not start from a pose
+the network already shoved.
+
 ## Key data structures
 
 | Type | Notes |
@@ -111,6 +115,10 @@ that, and each is closed:
 
 `Real` is `f32`. Bodies are few, so throughput and cache behaviour matter more
 than precision. It is a type alias; changing it is one line.
+
+Config digests are a versioned, field-by-field byte stream, not pretty-printed
+TOML. A serializer upgrade or a comment in the experiment file cannot change
+whether a checkpoint is considered the same experiment.
 
 ## Physics: what and why
 
@@ -182,7 +190,9 @@ The pieces that matter are in place, and nothing else has been built:
 - headless, no graphics dependencies, Linux-friendly;
 - checkpoint and restart, with a config-digest check that refuses to resume a run
   whose dynamics changed (while still allowing `generations` to be raised, so a
-  finished run can be extended);
+  finished run can be extended). A version mismatch is refused unless
+  `--force-resume` is given. Checkpoints and replays are written to a temp file
+  and renamed into place;
 - pure evaluation, so work can be distributed and re-done freely after a
   preemption;
 - `evo bench` reports scaling efficiency and cost per million evaluations,

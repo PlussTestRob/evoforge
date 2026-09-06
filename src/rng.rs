@@ -27,10 +27,11 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 
 /// Derive a stream seed from a list of identifying values.
 ///
-/// This is how an organism's evaluation seed is produced from
-/// `(experiment_seed, generation, organism_id)`. Because it is a pure function of
-/// identity, evaluation order and thread scheduling cannot affect results, and a
-/// single organism can be re-simulated in isolation years later.
+/// Evaluation itself uses no RNG — it is a pure function of genome and config.
+/// This is how the founding population, reproduction, and recording samples
+/// get independent streams from `(experiment_seed, identity...)`. Because it
+/// is a pure function of identity, evaluation order and thread scheduling
+/// cannot affect results.
 pub fn derive_seed(parts: &[u64]) -> u64 {
     let mut acc = 0x243F_6A88_85A3_08D3;
     for &p in parts {

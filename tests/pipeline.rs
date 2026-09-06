@@ -159,7 +159,7 @@ fn a_different_seed_gives_a_different_experiment() {
 fn a_recorded_champion_re_simulates_to_the_same_fitness() {
     let tmp = TempDir::new("champion");
     let cfg = base_config(&tmp, "champion");
-    let summary = runner::run(&cfg, &RunOptions { threads: 4, quiet: true, resume: None }).unwrap();
+    let summary = runner::run(&cfg, &RunOptions { threads: 4, quiet: true, ..Default::default() }).unwrap();
 
     let run = Run::open(&summary.dir).unwrap();
     let stored_text = fs::read_to_string(summary.dir.join(record::GENOMES_FILE)).unwrap();
@@ -219,7 +219,7 @@ fn replaying_at_higher_fidelity_does_not_change_the_outcome() {
 fn a_run_directory_is_self_describing() {
     let tmp = TempDir::new("artefacts");
     let cfg = base_config(&tmp, "artefacts");
-    let summary = runner::run(&cfg, &RunOptions { threads: 2, quiet: true, resume: None }).unwrap();
+    let summary = runner::run(&cfg, &RunOptions { threads: 2, quiet: true, ..Default::default() }).unwrap();
 
     // Everything needed to understand or continue the run is in one directory.
     let run = Run::open(&summary.dir).unwrap();

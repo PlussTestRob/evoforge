@@ -73,6 +73,9 @@ struct RunArgs {
     /// Suppress the per-generation table.
     #[arg(long)]
     quiet: bool,
+    /// Resume a checkpoint written by a different evoforge version.
+    #[arg(long)]
+    force_resume: bool,
 }
 
 #[derive(Args)]
@@ -161,7 +164,12 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     let summary = runner::run(
         &cfg,
-        &RunOptions { threads: args.threads, quiet: args.quiet, resume: args.resume },
+        &RunOptions {
+            threads: args.threads,
+            quiet: args.quiet,
+            resume: args.resume,
+            force_resume: args.force_resume,
+        },
     )?;
 
     println!();
@@ -393,6 +401,7 @@ fn cmd_replay(args: ReplayArgs) -> Result<()> {
     let path = match args.out {
         Some(p) => {
             let replay = record::Replay {
+                format: record::ARTIFACT_FORMAT,
                 experiment_id: run.manifest.experiment_id.clone(),
                 organism_id: stored.id,
                 generation: stored.generation,

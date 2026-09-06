@@ -249,14 +249,6 @@ impl World {
         self.check_finite();
     }
 
-    /// True once the whole body has come to rest on the terrain, used to cut the
-    /// settling phase short.
-    pub fn is_resting(&self, lin_tol: Real, ang_tol: Real) -> bool {
-        self.bodies
-            .iter()
-            .all(|b| b.lin_vel.length_sq() < lin_tol * lin_tol && b.ang_vel.length_sq() < ang_tol * ang_tol)
-    }
-
     /// Centre of mass of the whole organism.
     pub fn centre_of_mass(&self) -> Vec3 {
         let mut total = 0.0;

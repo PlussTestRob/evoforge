@@ -22,7 +22,7 @@ pub type Real = f32;
 
 pub const PI: Real = std::f32::consts::PI;
 pub const TAU: Real = std::f32::consts::TAU;
-const FRAC_PI_2: Real = std::f32::consts::FRAC_PI_2;
+pub const FRAC_PI_2: Real = std::f32::consts::FRAC_PI_2;
 const LN_2: Real = std::f32::consts::LN_2;
 
 // ---------------------------------------------------------------------------

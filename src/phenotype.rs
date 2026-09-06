@@ -178,7 +178,11 @@ pub fn world_params(cfg: &Config) -> WorldParams {
         iterations: cfg.simulation.solver_iterations,
         linear_damping: cfg.environment.linear_damping,
         angular_damping: cfg.environment.angular_damping,
-        ..WorldParams::default()
+        baumgarte: cfg.simulation.baumgarte,
+        slop: cfg.simulation.slop,
+        max_correction_speed: cfg.simulation.max_correction_speed,
+        max_linear_speed: cfg.simulation.max_linear_speed,
+        max_angular_speed: cfg.simulation.max_angular_speed,
     }
 }
 
@@ -285,6 +289,19 @@ mod tests {
             assert_eq!(x.half_extents, y.half_extents);
         }
         assert_eq!(a.total_mass, b.total_mass);
+    }
+
+    #[test]
+    fn world_params_carry_solver_knobs_from_config() {
+        let mut cfg = cfg();
+        cfg.simulation.baumgarte = 0.4;
+        cfg.simulation.slop = 0.01;
+        cfg.simulation.max_linear_speed = 12.0;
+        let p = world_params(&cfg);
+        assert!((p.baumgarte - 0.4).abs() < 1e-6);
+        assert!((p.slop - 0.01).abs() < 1e-6);
+        assert!((p.max_linear_speed - 12.0).abs() < 1e-6);
+        assert_eq!(p.iterations, cfg.simulation.solver_iterations);
     }
 
     #[test]

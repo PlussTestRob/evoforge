@@ -339,7 +339,11 @@ Build the smallest, fastest, clearest artificial-life laboratory capable of demo
 cargo build --release
 
 # Evolve. ~15 seconds for 100 generations of 100 organisms on a laptop.
+# On Windows: target\release\evo.exe
 ./target/release/evo run experiments/first-walkers.toml
+
+# Stricter locomotion: signed +X progress and an upright bonus.
+./target/release/evo run experiments/directed-walkers.toml
 
 # Measure throughput and its scaling across cores.
 ./target/release/evo bench experiments/first-walkers.toml
@@ -377,12 +381,14 @@ that affects the dynamics is refused rather than silently accepted.
 **Milestone 1 complete: the pipeline works end to end and evolution demonstrably
 occurs.**
 
-A first run of `experiments/first-walkers.toml` — 100 organisms, 40 generations,
-seven seconds of wall clock — took best fitness from 0.79 m to 3.86 m and the
-*median* from 0.08 m to 2.78 m, with no divergent simulations and 82 of 100
+A first run of `experiments/first-walkers.toml` — 100 organisms, 100 generations,
+seventeen seconds of wall clock — took best fitness from 0.79 m to 4.76 m and the
+*median* from 0.08 m to 3.20 m, with no divergent simulations and 77 of 100
 morphologies still distinct. The rising median is the part that matters: with
 elitism the best score cannot fall, so only the middle of the distribution moving
-shows the population as a whole is improving.
+shows the population as a whole is improving. Omnidirectional `distance` can be
+satisfied by tumbling; `experiments/directed-walkers.toml` asks for signed +X
+progress and an upright bonus.
 
 Implemented:
 
