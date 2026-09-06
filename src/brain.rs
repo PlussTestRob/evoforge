@@ -24,6 +24,14 @@ use crate::math::{tanh_approx, Real};
 /// than an individual slot.
 pub const GLOBAL_INPUTS: usize = 9;
 
+/// Global inputs when the experiment tells organisms where to go: the nine above
+/// plus the commanded direction, as a horizontal unit vector.
+///
+/// Conditional for the same reason the health input is: the input count sets the
+/// weight-vector length, and an experiment that does not steer has to keep the
+/// one it always had.
+pub const GLOBAL_INPUTS_WITH_COMMAND: usize = 11;
+
 /// Inputs contributed by each slot when joints cannot be damaged: joint angle as
 /// a (cos, sin) pair plus a ground-contact flag.
 pub const INPUTS_PER_SLOT: usize = 3;
@@ -50,6 +58,8 @@ pub struct BrainLayout {
     /// Inputs each slot contributes: [`INPUTS_PER_SLOT`], or
     /// [`INPUTS_PER_SLOT_WITH_HEALTH`] when the experiment lets joints break.
     pub slot_inputs: usize,
+    /// Inputs describing the organism as a whole.
+    pub global_inputs: usize,
 }
 
 impl BrainLayout {
@@ -58,9 +68,20 @@ impl BrainLayout {
     }
 
     pub fn with_health(max_slots: usize, hidden: usize, health: bool) -> BrainLayout {
+        BrainLayout::new_with(max_slots, hidden, health, false)
+    }
+
+    pub fn new_with(max_slots: usize, hidden: usize, health: bool, steer: bool) -> BrainLayout {
         assert!(max_slots > 0 && hidden > 0);
         let slot_inputs = if health { INPUTS_PER_SLOT_WITH_HEALTH } else { INPUTS_PER_SLOT };
-        BrainLayout { max_slots, hidden, slot_inputs }
+        let global_inputs = if steer { GLOBAL_INPUTS_WITH_COMMAND } else { GLOBAL_INPUTS };
+        BrainLayout { max_slots, hidden, slot_inputs, global_inputs }
+    }
+
+    /// Whether this layout carries a commanded direction of travel.
+    #[inline]
+    pub fn is_steered(&self) -> bool {
+        self.global_inputs >= GLOBAL_INPUTS_WITH_COMMAND
     }
 
     /// Whether this layout carries a health input for each slot.
@@ -71,7 +92,7 @@ impl BrainLayout {
 
     #[inline]
     pub fn inputs(&self) -> usize {
-        GLOBAL_INPUTS + self.slot_inputs * self.max_slots
+        self.global_inputs + self.slot_inputs * self.max_slots
     }
 
     #[inline]
@@ -90,7 +111,7 @@ impl BrainLayout {
     /// Index of the first slot-local input for `slot`.
     #[inline]
     pub fn slot_input_base(&self, slot: usize) -> usize {
-        GLOBAL_INPUTS + slot * self.slot_inputs
+        self.global_inputs + slot * self.slot_inputs
     }
 }
 
@@ -105,6 +126,10 @@ pub mod input {
     pub const VEL_Y: usize = 6;
     pub const VEL_Z: usize = 7;
     pub const HEIGHT: usize = 8;
+    /// Commanded direction of travel, a horizontal unit vector. Present only in
+    /// a steered experiment.
+    pub const COMMAND_X: usize = 9;
+    pub const COMMAND_Z: usize = 10;
 }
 
 /// Reusable scratch space for evaluation, so the hot loop never allocates.

@@ -108,6 +108,28 @@ pub struct PartGene {
     /// recorded before shapes existed load unchanged.
     #[serde(default)]
     pub shape: ShapeKind,
+    /// Whether this part appears twice, mirrored across the sagittal plane.
+    ///
+    /// Bilateral symmetry is the most animal-defining property a body has, and a
+    /// free tree of parts makes it no cheaper to express than any of the vastly
+    /// more numerous lopsided arrangements. One bit here makes a matched pair as
+    /// easy to say as a single limb — and, because both copies share a
+    /// controller slot, as easy to *control* as one.
+    #[serde(default)]
+    pub paired: bool,
+    /// For a mirrored pair, whether the two halves are driven in opposition.
+    ///
+    /// A reflected limb given the same command moves as its reflection, which
+    /// for a fore-and-aft hinge means the two halves alternate — a walk.
+    /// Negating one gives a bound. Both are real gaits, so evolution chooses.
+    #[serde(default)]
+    pub antiphase: bool,
+    /// How many copies of this part are chained end to end. 1 is a single part.
+    ///
+    /// Repetition is where spines, tails and segmented limbs come from. Children
+    /// attach to the last segment, so a chain extends rather than branching.
+    #[serde(default = "one")]
+    pub repeat: u8,
     /// Which face of the parent this part attaches to (0..6, see
     /// [`crate::phenotype::FACES`]). Meaningless for part 0.
     pub attach_face: u8,
@@ -136,8 +158,19 @@ impl PartGene {
         if !limits.shapes.is_empty() && !limits.shapes.contains(&self.shape) {
             self.shape = limits.shapes[0];
         }
+        if limits.pair_probability <= 0.0 {
+            self.paired = false;
+            self.antiphase = false;
+        }
+        self.repeat = clamp_u8(self.repeat.max(1), 1, limits.max_repeat.max(1));
         self.joint.clamp_to(limits);
     }
+}
+
+/// Default segment count for a part in a genome recorded before repetition
+/// existed: exactly one, which is what it meant.
+fn one() -> u8 {
+    1
 }
 
 /// The complete heritable description of an organism.
@@ -179,6 +212,9 @@ impl Genome {
                 parent,
                 half_extents: random_extents(rng, limits),
                 shape: random_shape(rng, limits),
+                paired: random_paired(rng, limits),
+                antiphase: random_antiphase(rng, limits),
+                repeat: random_repeat(rng, limits),
                 attach_face: rng.below(6) as u8,
                 attach_u: rng.range(-0.7, 0.7),
                 attach_v: rng.range(-0.7, 0.7),
@@ -317,12 +353,37 @@ fn random_caution(rng: &mut Rng, limits: &BodyLimits) -> Real {
     }
 }
 
+/// Draw whether a part is a mirrored pair. Spends nothing when bilateral
+/// symmetry is switched off, on the same discipline as every other opt-in gene.
+fn random_paired(rng: &mut Rng, limits: &BodyLimits) -> bool {
+    limits.pair_probability > 0.0 && rng.chance(limits.pair_probability)
+}
+
+/// Which way the halves of a pair are driven. Only meaningful for a pair, but
+/// drawn whenever pairing is on so the gene is available to mutation.
+fn random_antiphase(rng: &mut Rng, limits: &BodyLimits) -> bool {
+    limits.pair_probability > 0.0 && rng.chance(0.5)
+}
+
+/// Draw a segment count. One segment unless segmentation is enabled.
+fn random_repeat(rng: &mut Rng, limits: &BodyLimits) -> u8 {
+    if limits.max_repeat > 1 {
+        1 + rng.below(limits.max_repeat as u32) as u8
+    } else {
+        1
+    }
+}
+
 fn random_shape(rng: &mut Rng, limits: &BodyLimits) -> ShapeKind {
     match limits.shapes.len() {
         0 => ShapeKind::Box,
         1 => limits.shapes[0],
         n => limits.shapes[rng.pick(n)],
     }
+}
+
+fn clamp_u8(v: u8, lo: u8, hi: u8) -> u8 {
+    v.max(lo).min(hi)
 }
 
 fn random_extents(rng: &mut Rng, limits: &BodyLimits) -> Vec3 {
@@ -387,6 +448,19 @@ pub fn mutate(
             p.shape = random_shape(rng, limits);
         }
 
+        if limits.pair_probability > 0.0 && rng.chance(params.pair_rate) {
+            // One operator flips both halves of the body-plan decision: whether
+            // the part is a pair at all, and how a pair is driven.
+            if rng.chance(0.5) {
+                p.paired = !p.paired;
+            } else {
+                p.antiphase = !p.antiphase;
+            }
+        }
+        if limits.max_repeat > 1 && rng.chance(params.repeat_rate) {
+            p.repeat = random_repeat(rng, limits);
+        }
+
         if !is_root {
             if rng.chance(params.attach_rate) {
                 p.attach_u += rng.normal_scaled(params.attach_sigma);
@@ -438,6 +512,9 @@ fn add_random_part(genome: &mut Genome, rng: &mut Rng, limits: &BodyLimits, layo
         parent,
         half_extents: random_extents(rng, limits),
         shape: random_shape(rng, limits),
+        paired: random_paired(rng, limits),
+        antiphase: random_antiphase(rng, limits),
+        repeat: random_repeat(rng, limits),
         attach_face: rng.below(6) as u8,
         attach_u: rng.range(-0.7, 0.7),
         attach_v: rng.range(-0.7, 0.7),
@@ -500,6 +577,9 @@ pub fn crossover(primary: &Genome, secondary: &Genome, rng: &mut Rng) -> Genome 
             // recombination of two things that only mean anything together. It
             // also costs no extra draw, so the stream is unchanged.
             part.shape = other.shape;
+            part.paired = other.paired;
+            part.antiphase = other.antiphase;
+            part.repeat = other.repeat;
         }
         // Attachment and joint genes only mean anything for non-root parts, and
         // only if the other genome's part is also non-root.

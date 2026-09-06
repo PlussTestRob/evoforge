@@ -59,6 +59,14 @@ pub struct Metrics {
     /// bounce away does not read as flight.
     #[serde(default)]
     pub airborne_seconds: Real,
+    /// Displacement along the direction the organism was told to travel.
+    ///
+    /// Identical to `displacement_x` in an experiment that never steers, because
+    /// the standing command there is +X. In one that does, this is the only
+    /// distance measure that means anything: an organism sent left and rewarded
+    /// for going right has learned nothing worth having.
+    #[serde(default)]
+    pub heading_progress: Real,
     /// Joints that wore out and let a limb detach during the run.
     ///
     /// An outcome, not a rendering detail: this is recorded for *every*
@@ -97,6 +105,7 @@ pub fn score(cfg: &FitnessCfg, m: &Metrics) -> Real {
         Objective::Distance => m.displacement,
         Objective::DistanceX => m.displacement_x,
         Objective::Speed => m.mean_speed(),
+        Objective::Heading => m.heading_progress,
     };
     // Height is measured from where the organism started rather than from the
     // ground, so simply being tall is worth nothing — only *gaining* height is.
@@ -124,6 +133,7 @@ mod tests {
             actuation: 100.0,
             duration: 10.0,
             steps: 1200,
+            heading_progress: 3.0,
             peak_height: 0.0,
             airborne_seconds: 0.0,
             joints_lost: 0,

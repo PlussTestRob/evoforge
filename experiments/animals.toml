@@ -1,0 +1,144 @@
+# Animals: every constraint at once, and no fitness term that mentions a leg.
+#
+# The premise is that animal-like bodies are not something to reward, but
+# something that falls out of three pressures. Score an organism for looking
+# like a quadruped and you get something shaped like a quadruped that does not
+# work like one; constrain what a genome can say, what a body can physically be,
+# and what the world demands, and the shape is a consequence.
+#
+# What a genome can say
+#   Parts can be *paired*, appearing twice as mirror images across the midline
+#   and sharing one controller slot, so two legs are driven by one leg
+#   controller and move as a pair. Parts can also *repeat* into a chain, which
+#   is where spines, tails and segmented limbs come from. Neither is rewarded;
+#   both are simply made cheap to express.
+#
+# What a body can be
+#   `muscle_stress` caps a joint's torque at what its own girth could host, so a
+#   matchstick cannot be as strong as a thigh and proportions have to be
+#   allometric. `self_collision` stops parts passing through each other, which
+#   is what makes limbs be outside the torso rather than inside it. Tendons give
+#   joints passive spring and damping, which is most of why real running and
+#   hopping are efficient. Density is that of flesh rather than a quarter of it.
+#
+# What the world demands
+#   The ground rolls, so wheels and sliders stop being optimal and legs stop
+#   being strictly worse. Each organism is evaluated over several trials from
+#   varied starts, so a single well-timed lunge no longer scores like a gait.
+#   And each trial commands a direction, given to the controller as an input and
+#   scored along that heading, so an organism has to be steerable rather than
+#   committed to one launch.
+#
+# Every one of these is justifiable without reference to the shape it produces,
+# which is the test that keeps this from being fitness shaping wearing a hat.
+
+[experiment]
+name = "animals"
+seed = 20260906
+output_dir = "runs"
+
+[evolution]
+population_size = 100
+generations = 100
+elite_count = 2
+tournament_size = 4
+crossover_rate = 0.7
+immigrant_rate = 0.02
+
+[body]
+min_parts = 2
+max_parts = 8
+# Smaller than earlier experiments, because density is now that of flesh: a part
+# at the old 0.35 would weigh a third of a tonne.
+min_half_extent = 0.05
+max_half_extent = 0.20
+density = 1000.0
+min_joint_limit = 0.3
+max_joint_limit = 1.4
+max_motor_speed = 6.0
+max_motor_torque = 200.0
+hinge_probability = 0.85
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+taper_top_scale = 0.45
+# Durable joints: breaking one should be a failure, not a strategy.
+joint_endurance = 150.0
+min_drive = 0.2
+# Torque a joint can host per unit of its own cross-section, as stress * area^1.5.
+muscle_stress = 12000.0
+# Tendon: a passive spring across every hinge, as a natural frequency so it
+# means the same thing on a heavy limb and a light one.
+tendon_frequency = 6.0
+tendon_damping = 0.5
+# Bilateral symmetry and segmentation.
+pair_probability = 0.45
+max_repeat = 3
+
+[brain]
+hidden = 12
+init_sigma = 0.8
+weight_limit = 8.0
+
+[mutation]
+weight_rate = 0.08
+weight_sigma = 0.25
+weight_reset_rate = 0.05
+size_rate = 0.05
+size_sigma = 0.03
+attach_rate = 0.05
+attach_sigma = 0.15
+joint_limit_rate = 0.05
+joint_limit_sigma = 0.2
+joint_kind_rate = 0.02
+joint_axis_rate = 0.03
+motor_rate = 0.05
+motor_sigma = 0.15
+caution_rate = 0.08
+caution_sigma = 0.12
+pair_rate = 0.05
+repeat_rate = 0.04
+shape_rate = 0.04
+add_part_rate = 0.06
+remove_part_rate = 0.05
+
+[simulation]
+duration = 8.0
+control_hz = 20.0
+solver_iterations = 12
+settle_time = 0.5
+# Three trials from varied starts, scored on the average. A strategy that works
+# once is not a gait.
+trials = 3
+start_jitter = 0.5
+aggregate = "mean"
+# Each trial commands a direction to travel, within this many radians of +X.
+steer = true
+steer_spread = 0.9
+
+[environment]
+terrain = "rough"
+terrain_amplitude = 0.05
+terrain_wavelength = 1.6
+self_collision = true
+gravity = 9.81
+friction = 0.9
+restitution = 0.0
+linear_damping = 0.02
+angular_damping = 0.05
+
+[fitness]
+objective = "heading"
+energy_penalty = 0.0
+upright_bonus = 0.2
+air_bonus = 0.0
+height_bonus = 0.0
+
+[recording]
+top_n = 4
+random_samples = 3
+record_hz = 30.0
+every_generations = 10
+store_genomes = true
+
+[checkpoint]
+every_generations = 25
+on_finish = true

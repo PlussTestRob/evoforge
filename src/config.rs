@@ -47,7 +47,12 @@ impl Config {
 
     /// The controller shape implied by this configuration.
     pub fn brain_layout(&self) -> BrainLayout {
-        BrainLayout::with_health(self.body.max_parts, self.brain.hidden, self.joints_can_break())
+        BrainLayout::new_with(
+            self.body.max_parts,
+            self.brain.hidden,
+            self.joints_can_break(),
+            self.simulation.steer,
+        )
     }
 
     /// Whether this experiment lets joints wear out and limbs detach.
@@ -138,6 +143,26 @@ impl Config {
         if !(0.0..=1.0).contains(&self.body.taper_top_scale) {
             bad("body.taper_top_scale must be within [0, 1]")?;
         }
+        if self.simulation.trials < 1 {
+            bad("simulation.trials must be at least 1")?;
+        }
+        rate(self.simulation.start_jitter, "simulation.start_jitter")?;
+        if self.environment.terrain_amplitude < 0.0 {
+            bad("environment.terrain_amplitude must not be negative")?;
+        }
+        if self.environment.terrain_wavelength <= 0.0 {
+            bad("environment.terrain_wavelength must be positive")?;
+        }
+        if self.body.tendon_frequency < 0.0 || self.body.tendon_damping < 0.0 {
+            bad("body.tendon_frequency and body.tendon_damping must not be negative")?;
+        }
+        // Beyond this the explicit spring stops being stable within one step.
+        if self.body.tendon_frequency * self.simulation.timestep > 0.5 {
+            bad("body.tendon_frequency is too high for this timestep")?;
+        }
+        if self.body.muscle_stress < 0.0 {
+            bad("body.muscle_stress must not be negative (0 disables the cap)")?;
+        }
         if self.body.joint_endurance < 0.0 {
             bad("body.joint_endurance must not be negative (0 disables joint damage)")?;
         }
@@ -200,6 +225,12 @@ impl Config {
         rate(self.mutation.size_rate, "mutation.size_rate")?;
         rate(self.mutation.shape_rate, "mutation.shape_rate")?;
         rate(self.mutation.caution_rate, "mutation.caution_rate")?;
+        rate(self.mutation.pair_rate, "mutation.pair_rate")?;
+        rate(self.mutation.repeat_rate, "mutation.repeat_rate")?;
+        rate(self.body.pair_probability, "body.pair_probability")?;
+        if self.body.max_repeat < 1 {
+            bad("body.max_repeat must be at least 1")?;
+        }
         rate(self.mutation.attach_rate, "mutation.attach_rate")?;
         rate(self.mutation.joint_limit_rate, "mutation.joint_limit_rate")?;
         rate(self.mutation.joint_kind_rate, "mutation.joint_kind_rate")?;
@@ -297,6 +328,13 @@ pub struct MutationParams {
     /// that perturbation. Only consulted when `body.joint_endurance` is positive.
     pub caution_rate: Real,
     pub caution_sigma: Real,
+    /// Probability per part of flipping whether it is a mirrored pair, or which
+    /// way its halves are driven. Only consulted when `body.pair_probability`
+    /// is positive.
+    pub pair_rate: Real,
+    /// Probability per part of redrawing its segment count. Only consulted when
+    /// `body.max_repeat` exceeds one.
+    pub repeat_rate: Real,
     /// Probability per part of redrawing its shape. Only consulted when
     /// `body.shapes` offers more than one, so a box-only experiment never spends
     /// a draw on it.
@@ -325,6 +363,8 @@ impl Default for MutationParams {
             motor_sigma: 0.15,
             caution_rate: 0.08,
             caution_sigma: 0.12,
+            pair_rate: 0.04,
+            repeat_rate: 0.03,
             shape_rate: 0.04,
             add_part_rate: 0.06,
             remove_part_rate: 0.05,
@@ -375,6 +415,34 @@ pub struct BodyLimits {
     /// Floor on how far the caution gene may throttle motor demand, so a maximally
     /// cautious organism is still able to move.
     pub min_drive: Real,
+    /// Muscle strength per unit of joint cross-section. `0` disables the cap and
+    /// leaves `motor_torque` as a free gene, which is how every experiment
+    /// before this behaved.
+    ///
+    /// In an animal, the force a muscle can produce scales with its
+    /// cross-sectional area, and the torque it exerts with that force times a
+    /// moment arm that scales with the limb's width. So the ceiling here goes as
+    /// `stress * area^1.5`, and a limb cannot be stronger than its own girth
+    /// allows. Without it, `motor_torque` is drawn independently of size and a
+    /// matchstick can be as strong as a thigh — which is a large part of why
+    /// evolved bodies here look nothing like animals.
+    pub muscle_stress: Real,
+    /// Natural frequency of every hinge's passive spring, rad/s — a tendon.
+    /// Zero leaves joints purely servo-driven, as before.
+    ///
+    /// A frequency rather than a stiffness so that the spring means the same
+    /// thing on a thigh and on a toe. Tendon elasticity is most of why animal
+    /// running and hopping are efficient: energy stored on landing comes back on
+    /// push-off instead of being paid for again by the muscle.
+    pub tendon_frequency: Real,
+    /// Damping ratio of that spring. 1 is critically damped.
+    pub tendon_damping: Real,
+    /// Probability that a newly drawn part is a mirrored pair. `0` disables
+    /// bilateral symmetry entirely and spends no randomness on it.
+    pub pair_probability: Real,
+    /// Longest chain of repeated segments a part may become. `1` disables
+    /// segmentation and spends no randomness on it.
+    pub max_repeat: u8,
 }
 
 impl Default for BodyLimits {
@@ -394,6 +462,11 @@ impl Default for BodyLimits {
             taper_top_scale: 0.45,
             joint_endurance: 0.0,
             min_drive: 0.2,
+            muscle_stress: 0.0,
+            tendon_frequency: 0.0,
+            tendon_damping: 0.5,
+            pair_probability: 0.0,
+            max_repeat: 1,
         }
     }
 }
@@ -442,6 +515,37 @@ pub struct SimulationCfg {
     pub max_linear_speed: Real,
     /// Hard angular velocity clamp, rad/s.
     pub max_angular_speed: Real,
+    /// How many times each organism is evaluated. `1` is a single trial, which
+    /// is what every experiment did before this.
+    ///
+    /// One trial from one pose rewards a stunt as readily as a gait: a single
+    /// well-timed lunge scores like walking, and a strategy that works exactly
+    /// once cannot be told from one that works. Repeating the trial from varied
+    /// starts is the cheapest pressure there is toward behaviour that is
+    /// actually repeatable.
+    pub trials: usize,
+    /// How much the start pose varies between trials, `0` to `1`. Zero means
+    /// every trial is identical, which makes repeating them pointless.
+    pub start_jitter: Real,
+    /// How trials combine into one score.
+    pub aggregate: Aggregate,
+    /// Whether each trial commands a direction of travel, given to the
+    /// controller as an input and scored by `objective = "heading"`.
+    pub steer: bool,
+    /// Widest angle, radians, that a commanded heading may stray from +X.
+    pub steer_spread: Real,
+}
+
+/// How an organism's trials combine into the number it is selected on.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Aggregate {
+    /// Average. Rewards being good on balance.
+    #[default]
+    Mean,
+    /// The worst trial. Rewards having no bad day at all, which is a much
+    /// stronger demand and the one that most favours a robust gait.
+    Worst,
 }
 
 impl Default for SimulationCfg {
@@ -457,6 +561,11 @@ impl Default for SimulationCfg {
             max_correction_speed: 2.0,
             max_linear_speed: 60.0,
             max_angular_speed: 40.0,
+            trials: 1,
+            start_jitter: 0.0,
+            aggregate: Aggregate::Mean,
+            steer: false,
+            steer_spread: 1.0,
         }
     }
 }
@@ -465,12 +574,26 @@ impl Default for SimulationCfg {
 #[serde(rename_all = "snake_case")]
 pub enum Terrain {
     Flat,
+    /// Rolling ground. See [`crate::physics::TerrainModel::Rough`].
+    Rough,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentCfg {
     pub terrain: Terrain,
+    /// Whether an organism's own parts collide with each other.
+    ///
+    /// Off by default, which is how every experiment before this behaved and the
+    /// usual choice in this class of work. Turning it on is what stops a body
+    /// being a cloud of overlapping blocks: limbs have to be somewhere the torso
+    /// is not, which is the most basic thing that makes an animal an animal.
+    pub self_collision: bool,
+    /// Height of the rolling ground's crests above its troughs, metres. Only
+    /// consulted when `terrain = "rough"`.
+    pub terrain_amplitude: Real,
+    /// Distance between crests, metres.
+    pub terrain_wavelength: Real,
     /// Downward acceleration magnitude, m/s^2.
     pub gravity: Real,
     pub friction: Real,
@@ -483,6 +606,9 @@ impl Default for EnvironmentCfg {
     fn default() -> Self {
         EnvironmentCfg {
             terrain: Terrain::Flat,
+            self_collision: false,
+            terrain_amplitude: 0.06,
+            terrain_wavelength: 1.5,
             gravity: 9.81,
             friction: 0.8,
             restitution: 0.0,
@@ -502,6 +628,13 @@ pub enum Objective {
     DistanceX,
     /// Mean horizontal speed over the measured window.
     Speed,
+    /// Displacement along the direction the organism was told to go.
+    ///
+    /// With `simulation.steer` on, that direction changes between trials, so an
+    /// organism cannot succeed by committing to one heading and hoping. It has
+    /// to be steerable, which is a far stronger demand than being fast — and it
+    /// is what forces a controllable body rather than a one-shot launcher.
+    Heading,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -671,6 +804,22 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     // which is what lets a run started before this feature still be resumed.
     // As with shapes: folded in only when the feature is enabled, so an
     // experiment that cannot break joints keeps the digest it always had.
+    if cfg.body.muscle_stress > 0.0 {
+        f.tag(b"muscle");
+        f.real(cfg.body.muscle_stress);
+    }
+    if cfg.body.pair_probability > 0.0 || cfg.body.max_repeat > 1 {
+        f.tag(b"bodyplan");
+        f.real(cfg.body.pair_probability);
+        f.u32(cfg.body.max_repeat as u32);
+        f.real(cfg.mutation.pair_rate);
+        f.real(cfg.mutation.repeat_rate);
+    }
+    if cfg.body.tendon_frequency > 0.0 {
+        f.tag(b"tendon");
+        f.real(cfg.body.tendon_frequency);
+        f.real(cfg.body.tendon_damping);
+    }
     if cfg.joints_can_break() {
         f.tag(b"joint_health");
         f.real(cfg.body.joint_endurance);
@@ -704,21 +853,48 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     f.real(cfg.simulation.max_linear_speed);
     f.real(cfg.simulation.max_angular_speed);
 
+    // Folded in only when the experiment repeats trials, so a single-trial
+    // experiment keeps the digest it always had.
+    if cfg.simulation.trials > 1 || cfg.simulation.start_jitter > 0.0 {
+        f.tag(b"trials");
+        f.usize(cfg.simulation.trials);
+        f.real(cfg.simulation.start_jitter);
+        f.u8(match cfg.simulation.aggregate {
+            Aggregate::Mean => 0,
+            Aggregate::Worst => 1,
+        });
+    }
+    if cfg.simulation.steer {
+        f.tag(b"steer");
+        f.real(cfg.simulation.steer_spread);
+    }
+
     f.tag(b"environment");
     f.u8(match cfg.environment.terrain {
         Terrain::Flat => 0,
+        Terrain::Rough => 1,
     });
+    // Folded in only for the terrain that uses them, so a flat experiment keeps
+    // the digest it had before rolling ground existed.
+    if cfg.environment.terrain == Terrain::Rough {
+        f.real(cfg.environment.terrain_amplitude);
+        f.real(cfg.environment.terrain_wavelength);
+    }
     f.real(cfg.environment.gravity);
     f.real(cfg.environment.friction);
     f.real(cfg.environment.restitution);
     f.real(cfg.environment.linear_damping);
     f.real(cfg.environment.angular_damping);
+    if cfg.environment.self_collision {
+        f.tag(b"selfcollide");
+    }
 
     f.tag(b"fitness");
     f.u8(match cfg.fitness.objective {
         Objective::Distance => 0,
         Objective::DistanceX => 1,
         Objective::Speed => 2,
+        Objective::Heading => 3,
     });
     f.real(cfg.fitness.energy_penalty);
     // Guarded like every other opt-in term: an experiment that does not reward

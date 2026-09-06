@@ -40,32 +40,66 @@
 //! newly-mutated limbs would otherwise cause.
 
 use crate::genome::JointKind;
-use crate::math::{clamp, vec3, Mat3, Real, Vec3};
+use crate::math::{clamp, dcos, dsin, vec3, Mat3, Real, Vec3, TAU};
 
 use super::body::RigidBody;
 
 /// Ground model.
 ///
-/// An enum rather than a trait object: there is one variant today, dispatch is
-/// in the innermost loop, and a heightfield variant will be a second variant
-/// rather than a new abstraction.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// An enum rather than a trait object: dispatch is in the innermost loop, and a
+/// second variant is cheaper than an abstraction.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TerrainModel {
-    Flat { height: Real },
+    Flat {
+        height: Real,
+    },
+    /// Smooth rolling ground: two octaves of a separable sine field.
+    ///
+    /// Analytic rather than sampled, so the surface and its gradient are exact
+    /// everywhere and there is no grid to store, interpolate or get wrong at the
+    /// seams. Built from the deterministic [`dsincos`] rather than the standard
+    /// library's, because the whole reproducibility argument rests on every
+    /// transcendental in the pipeline being ours.
+    ///
+    /// Why it matters: on flat ground, rolling is optimal and legs are strictly
+    /// worse, which is why evolution here keeps rediscovering the wheel. Broken
+    /// ground is what makes legs the good answer, without a fitness function
+    /// ever mentioning them.
+    Rough {
+        amplitude: Real,
+        /// Distance between crests, metres.
+        wavelength: Real,
+    },
 }
 
 impl TerrainModel {
     #[inline]
-    pub fn height_at(&self, _x: Real, _z: Real) -> Real {
-        match self {
-            TerrainModel::Flat { height } => *height,
+    pub fn height_at(&self, x: Real, z: Real) -> Real {
+        match *self {
+            TerrainModel::Flat { height } => height,
+            TerrainModel::Rough { amplitude, wavelength } => {
+                let k = TAU / wavelength.max(1e-3);
+                amplitude * (dsin(k * x) * dcos(k * z))
+                    + 0.5 * amplitude * (dsin(2.0 * k * x + 1.7) * dcos(2.0 * k * z + 0.9))
+            }
         }
     }
 
     #[inline]
-    pub fn normal_at(&self, _x: Real, _z: Real) -> Vec3 {
-        match self {
+    pub fn normal_at(&self, x: Real, z: Real) -> Vec3 {
+        match *self {
             TerrainModel::Flat { .. } => Vec3::Y,
+            TerrainModel::Rough { amplitude, wavelength } => {
+                // Exact gradient of `height_at`, so contacts on a slope get the
+                // slope's own normal rather than a finite-difference guess.
+                let k = TAU / wavelength.max(1e-3);
+                let dhdx = amplitude * k * dcos(k * x) * dcos(k * z)
+                    + amplitude * k * dcos(2.0 * k * x + 1.7) * dcos(2.0 * k * z + 0.9);
+                let dhdz = -amplitude * k * dsin(k * x) * dsin(k * z)
+                    - amplitude * k * dsin(2.0 * k * x + 1.7) * dsin(2.0 * k * z + 0.9);
+                vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y)
+            }
         }
     }
 }
@@ -92,6 +126,8 @@ pub struct WorldParams {
     /// it produce infinities that poison fitness statistics.
     pub max_linear_speed: Real,
     pub max_angular_speed: Real,
+    /// Whether an organism's own parts collide with each other.
+    pub self_collision: bool,
 }
 
 impl Default for WorldParams {
@@ -109,6 +145,7 @@ impl Default for WorldParams {
             max_correction_speed: 2.0,
             max_linear_speed: 60.0,
             max_angular_speed: 40.0,
+            self_collision: false,
         }
     }
 }
@@ -139,6 +176,18 @@ pub struct Joint {
     pub motor_torque_max: Real,
     /// Target angular velocity about the hinge axis, written by the controller.
     pub motor_target: Real,
+    /// Natural frequency of the joint's passive spring, rad/s. Zero for a joint
+    /// with no tendon.
+    ///
+    /// A frequency rather than a torque, because a torque has to be matched to
+    /// the limb it acts on: the same N m/rad that gently returns a thigh will
+    /// fling a toe. Expressed this way the spring is scale-free — every joint
+    /// oscillates at the same rate whatever its inertia — and it is stable for
+    /// any `frequency * dt` below about one, which no plausible setting reaches.
+    pub tendon_frequency: Real,
+    /// Damping ratio of that spring. 1 is critically damped; 0 is a spring that
+    /// rings forever.
+    pub tendon_damping: Real,
     /// Radians of undelivered rotation this joint can absorb before it fails.
     /// Zero means the joint is indestructible, which is the behaviour every
     /// experiment had before joints could break.
@@ -166,6 +215,8 @@ impl Joint {
             motor_speed_max: 0.0,
             motor_torque_max: 0.0,
             motor_target: 0.0,
+            tendon_frequency: 0.0,
+            tendon_damping: 0.0,
             endurance: 0.0,
             health: 0.0,
             broken: false,
@@ -200,6 +251,21 @@ struct JointPrep {
     motor_impulse: Real,
 }
 
+/// A contact between two of the organism's own parts.
+#[derive(Clone, Copy, Debug)]
+struct PairContact {
+    a: u16,
+    b: u16,
+    /// Offsets from each body's centre of mass to the shared contact point.
+    r_a: Vec3,
+    r_b: Vec3,
+    /// Points from `a` toward `b`.
+    normal: Vec3,
+    depth: Real,
+    k_n: Real,
+    pn: Real,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Contact {
     body: u16,
@@ -231,6 +297,10 @@ pub struct World {
     inv_inertia: Vec<Mat3>,
     prep: Vec<JointPrep>,
     contacts: Vec<Contact>,
+    pair_contacts: Vec<PairContact>,
+    /// Row-major `n x n` table of which body pairs are joined by a joint, and so
+    /// are meant to touch. Built once, because it never changes.
+    jointed: Vec<bool>,
     /// Whether each body has been cut loose from the root by a broken joint.
     /// Detached bodies still fall, tumble and collide with the ground — they are
     /// debris, not deletions — but they stop counting as part of the organism.
@@ -255,6 +325,14 @@ impl World {
     pub fn new(bodies: Vec<RigidBody>, joints: Vec<Joint>, params: WorldParams) -> World {
         let n = bodies.len();
         let j = joints.len();
+        // Parts joined by a joint are supposed to be in contact; only parts with
+        // no joint between them are colliding when they overlap.
+        let mut jointed = vec![false; n * n];
+        for joint in &joints {
+            let (a, b) = (joint.body_a as usize, joint.body_b as usize);
+            jointed[a * n + b] = true;
+            jointed[b * n + a] = true;
+        }
         World {
             bodies,
             joints,
@@ -262,6 +340,8 @@ impl World {
             inv_inertia: vec![Mat3::ZERO; n],
             prep: vec![JointPrep::default(); j],
             contacts: Vec::with_capacity(n * 8),
+            pair_contacts: Vec::new(),
+            jointed,
             detached: vec![false; n],
             breaks: Vec::new(),
             actuation_impulse: 0.0,
@@ -278,12 +358,20 @@ impl World {
         }
         self.integrate_velocities(dt);
         self.refresh_inertia();
+        // Tendons are a *force*, not a constraint, so they are applied once per
+        // step alongside gravity rather than inside the solver's iteration loop.
+        // Applied per iteration they would fire a dozen times a step and pump
+        // energy into the organism — which, tried once, produced bodies
+        // travelling thirty metres a second.
         self.build_contacts();
+        self.build_pair_contacts();
         self.prepare_joints(dt);
+        self.apply_tendons(dt);
 
         for _ in 0..self.params.iterations {
             self.solve_joints(dt);
             self.solve_contacts(dt);
+            self.solve_pair_contacts(dt);
         }
 
         self.integrate_positions(dt);
@@ -491,6 +579,131 @@ impl World {
                 self.diverged = true;
                 return;
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-collision
+    // -----------------------------------------------------------------------
+
+    /// Find places where two of the organism's own parts have run into each
+    /// other.
+    ///
+    /// # Why this exists
+    ///
+    /// Without it, parts pass straight through one another, and a body has no
+    /// reason to be a body: limbs can occupy the torso, two legs can share a
+    /// space, and a coherent shape with its limbs on the outside has no
+    /// advantage over a cloud of overlapping blocks. Occupying a volume is the
+    /// most basic thing an animal does, and it is a *constraint*, not a reward.
+    ///
+    /// # What it costs
+    ///
+    /// The solver was built on the assumption that this would never exist (see
+    /// the module header), so the cheapest honest version is used: parts are
+    /// approximated by capsules, pairs joined by a joint are skipped because
+    /// they are meant to touch, and only a normal impulse is solved — no
+    /// friction between an organism's own parts. Bodies are few, so the pairing
+    /// is quadratic and unapologetic, behind a bounding-sphere reject.
+    fn build_pair_contacts(&mut self) {
+        self.pair_contacts.clear();
+        if !self.params.self_collision {
+            return;
+        }
+        let n = self.bodies.len();
+        for a in 0..n {
+            for b in (a + 1)..n {
+                if self.jointed[a * n + b] {
+                    continue;
+                }
+                let (a0, a1, ra) = self.bodies[a].collision_segment();
+                let (b0, b1, rb) = self.bodies[b].collision_segment();
+
+                // Cheap reject before the closest-point work.
+                let gap = self.bodies[a].pos - self.bodies[b].pos;
+                let reach = self.bodies[a].bounding_radius() + self.bodies[b].bounding_radius();
+                if gap.length_sq() > reach * reach {
+                    continue;
+                }
+
+                let (pa, pb) = closest_points_on_segments(a0, a1, b0, b1);
+                let delta = pb - pa;
+                let distance = delta.length();
+                let touching = ra + rb;
+                if distance >= touching {
+                    continue;
+                }
+                // Coincident centres give no direction to push apart along;
+                // any consistent one will do, and the position correction will
+                // separate them over the next few steps.
+                let normal = if distance > 1e-6 { delta * (1.0 / distance) } else { Vec3::Y };
+                let depth = touching - distance;
+
+                let contact_a = pa + normal * ra;
+                let contact_b = pb - normal * rb;
+                let midpoint = (contact_a + contact_b) * 0.5;
+                let r_a = midpoint - self.bodies[a].pos;
+                let r_b = midpoint - self.bodies[b].pos;
+
+                let k = pair_effective_mass(
+                    &self.bodies[a],
+                    &self.bodies[b],
+                    &self.inv_inertia[a],
+                    &self.inv_inertia[b],
+                    r_a,
+                    r_b,
+                    normal,
+                );
+                if k <= 0.0 {
+                    continue;
+                }
+                self.pair_contacts.push(PairContact {
+                    a: a as u16,
+                    b: b as u16,
+                    r_a,
+                    r_b,
+                    normal,
+                    depth,
+                    k_n: k,
+                    pn: 0.0,
+                });
+            }
+        }
+    }
+
+    /// Push interpenetrating parts apart. Normal impulse only: friction between
+    /// an organism's own limbs would be a second-order effect on top of a
+    /// first-order approximation.
+    fn solve_pair_contacts(&mut self, dt: Real) {
+        let inv_dt = 1.0 / dt;
+        let beta = self.params.baumgarte;
+        let slop = self.params.slop;
+        let max_corr = self.params.max_correction_speed;
+
+        for i in 0..self.pair_contacts.len() {
+            let c = self.pair_contacts[i];
+            let ia = c.a as usize;
+            let ib = c.b as usize;
+            let inv_ia = self.inv_inertia[ia];
+            let inv_ib = self.inv_inertia[ib];
+
+            let relative =
+                self.bodies[ib].point_velocity(c.r_b) - self.bodies[ia].point_velocity(c.r_a);
+            let vn = relative.dot(c.normal);
+            let bias = clamp((c.depth - slop).max(0.0) * beta * inv_dt, 0.0, max_corr);
+
+            // The normal points from a to b, so separating means vn > 0.
+            let mut lambda = (bias - vn) / c.k_n;
+            let old = c.pn;
+            let new = (old + lambda).max(0.0);
+            lambda = new - old;
+            self.pair_contacts[i].pn = new;
+            if lambda == 0.0 {
+                continue;
+            }
+            let impulse = c.normal * lambda;
+            self.bodies[ia].apply_impulse(c.r_a, -impulse, &inv_ia);
+            self.bodies[ib].apply_impulse(c.r_b, impulse, &inv_ib);
         }
     }
 
@@ -749,6 +962,56 @@ impl World {
         self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
     }
 
+    /// A passive spring and damper across the hinge: a tendon.
+    ///
+    /// Animals do not move by servo. A great deal of what makes running and
+    /// hopping efficient is elastic: tendons store energy on landing and return
+    /// it on push-off, so the muscle does not have to pay for the whole stride.
+    /// Without any passive element, every joule of a gait has to come out of the
+    /// motor, which is why evolved gaits here look so unlike animal ones.
+    ///
+    /// The restoring torque uses `sin(angle)` rather than the angle itself. It
+    /// is monotone over the whole legal range — [`crate::config`] refuses a
+    /// joint limit at or beyond a quarter turn — costs no `atan2`, and is
+    /// already computed for the controller's benefit.
+    fn apply_tendons(&mut self, dt: Real) {
+        for i in 0..self.joints.len() {
+            let j = self.joints[i];
+            if j.broken || j.kind != JointKind::Hinge || j.tendon_frequency <= 0.0 {
+                continue;
+            }
+            let k = self.prep[i].k_axis;
+            if k <= 0.0 {
+                continue;
+            }
+            let axis = self.prep[i].axis_w;
+            let (_, sin_a) = self.hinge_angle_cos_sin(i);
+            let ia = j.body_a as usize;
+            let ib = j.body_b as usize;
+            let rate = (self.bodies[ib].ang_vel - self.bodies[ia].ang_vel).dot(axis);
+
+            // The change in relative rate a spring of this frequency asks for
+            // over one step. Working in rate rather than torque is what makes it
+            // independent of the limb's inertia, and therefore stable.
+            let w = j.tendon_frequency;
+            let spring = -w * w * sin_a * dt;
+            // The damper may remove the joint's motion but never reverse it,
+            // which is the difference between damping and driving.
+            let bleed = clamp(2.0 * j.tendon_damping * w * dt, 0.0, 1.0);
+            let delta_rate = spring - bleed * rate;
+
+            let lambda = delta_rate / k;
+            if lambda == 0.0 {
+                continue;
+            }
+            let inv_ia = self.inv_inertia[ia];
+            let inv_ib = self.inv_inertia[ib];
+            let imp = axis * lambda;
+            self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);
+            self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
+        }
+    }
+
     fn solve_hinge_motor(&mut self, i: usize, dt: Real) {
         let j = self.joints[i];
         let p = self.prep[i];
@@ -798,6 +1061,65 @@ fn clamp_speed(v: &mut Vec3, max: Real) {
 /// Scalar effective mass for a single dynamic body constrained along `dir` at
 /// world offset `r`: `1 / (m^-1 + dir . ((I^-1 (r x dir)) x r))`.
 #[inline]
+/// Effective mass of a contact between two moving bodies along `dir`.
+fn pair_effective_mass(
+    a: &RigidBody,
+    b: &RigidBody,
+    inv_ia: &Mat3,
+    inv_ib: &Mat3,
+    ra: Vec3,
+    rb: Vec3,
+    dir: Vec3,
+) -> Real {
+    let ta = ra.cross(dir);
+    let tb = rb.cross(dir);
+    a.inv_mass + b.inv_mass + ta.dot(inv_ia.mul_vec(ta)) + tb.dot(inv_ib.mul_vec(tb))
+}
+
+/// Closest points on two segments, one on each.
+///
+/// The standard clamped-parameter solution: solve the unconstrained least
+/// squares for the two line parameters, then clamp each to its segment and
+/// re-solve the other against the clamped value. Degenerate segments — a sphere
+/// stands in as a zero-length one — fall out of the same arithmetic.
+fn closest_points_on_segments(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) {
+    let da = a1 - a0;
+    let db = b1 - b0;
+    let r = a0 - b0;
+    let aa = da.dot(da);
+    let bb = db.dot(db);
+    let f = db.dot(r);
+
+    const EPS: Real = 1e-12;
+    let (mut s, mut t);
+    if aa <= EPS && bb <= EPS {
+        return (a0, b0);
+    }
+    if aa <= EPS {
+        s = 0.0;
+        t = clamp(f / bb, 0.0, 1.0);
+    } else {
+        let c = da.dot(r);
+        if bb <= EPS {
+            t = 0.0;
+            s = clamp(-c / aa, 0.0, 1.0);
+        } else {
+            let d = da.dot(db);
+            let denom = aa * bb - d * d;
+            s = if denom > EPS { clamp((d * f - c * bb) / denom, 0.0, 1.0) } else { 0.0 };
+            t = (d * s + f) / bb;
+            if t < 0.0 {
+                t = 0.0;
+                s = clamp(-c / aa, 0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = clamp((d - c) / aa, 0.0, 1.0);
+            }
+        }
+    }
+    (a0 + da * s, b0 + db * t)
+}
+
 fn effective_mass(inv_mass: Real, inv_inertia: &Mat3, r: Vec3, dir: Vec3) -> Real {
     let rn = r.cross(dir);
     let term = inv_inertia.mul_vec(rn).cross(r).dot(dir);
@@ -916,6 +1238,8 @@ mod tests {
             motor_speed_max: 4.0,
             motor_torque_max: torque,
             motor_target: 0.0,
+            tendon_frequency: 0.0,
+            tendon_damping: 0.0,
             endurance: 0.0,
             health: 0.0,
             broken: false,
@@ -1120,6 +1444,169 @@ mod tests {
         assert!(!rebuilt.is_attached(1), "the limb is still attached");
         assert!(!rebuilt.is_attached(2), "the limb's own child is still attached");
         assert!(rebuilt.is_attached(0), "the root can never detach");
+    }
+
+    /// Two unjointed parts placed on top of each other must push apart.
+    #[test]
+    fn overlapping_parts_separate_when_self_collision_is_on() {
+        let mut p = flat_params();
+        p.gravity = Vec3::ZERO;
+        p.self_collision = true;
+        let a = RigidBody::box_body(vec3(0.0, 3.0, 0.0), vec3(0.2, 0.2, 0.2), 250.0);
+        // Deliberately overlapping, and with no joint between them.
+        let b = RigidBody::box_body(vec3(0.12, 3.0, 0.0), vec3(0.2, 0.2, 0.2), 250.0);
+        let mut w = World::new(vec![a, b], vec![], p);
+
+        let before = (w.bodies[0].pos - w.bodies[1].pos).length();
+        for _ in 0..240 {
+            w.step(1.0 / 240.0);
+        }
+        assert!(!w.diverged);
+        let after = (w.bodies[0].pos - w.bodies[1].pos).length();
+        assert!(after > before + 0.05, "parts did not separate: {before} -> {after}");
+    }
+
+    /// With it off they pass straight through, which is the behaviour every
+    /// experiment before this relied on.
+    #[test]
+    fn overlapping_parts_are_ignored_when_self_collision_is_off() {
+        let mut p = flat_params();
+        p.gravity = Vec3::ZERO;
+        let a = RigidBody::box_body(vec3(0.0, 3.0, 0.0), vec3(0.2, 0.2, 0.2), 250.0);
+        let b = RigidBody::box_body(vec3(0.12, 3.0, 0.0), vec3(0.2, 0.2, 0.2), 250.0);
+        let mut w = World::new(vec![a, b], vec![], p);
+        let before = (w.bodies[0].pos - w.bodies[1].pos).length();
+        for _ in 0..240 {
+            w.step(1.0 / 240.0);
+        }
+        let after = (w.bodies[0].pos - w.bodies[1].pos).length();
+        assert!((after - before).abs() < 1e-4, "parts moved: {before} -> {after}");
+    }
+
+    /// Parts joined by a joint are *meant* to touch. If self-collision fought
+    /// the joint holding them together, every organism would tear itself apart.
+    #[test]
+    fn jointed_parts_do_not_collide_with_each_other() {
+        let mut w = hinge_pair(-1.0, 0.0);
+        w.params.self_collision = true;
+        let dt = 1.0 / 240.0;
+        for _ in 0..240 {
+            w.step(dt);
+        }
+        assert!(!w.diverged);
+        // The anchors must still coincide: nothing pushed them apart.
+        let anchor_a = w.bodies[0].pos + w.bodies[0].orient.rotate(vec3(0.2, 0.0, 0.0));
+        let anchor_b = w.bodies[1].pos + w.bodies[1].orient.rotate(vec3(-0.2, 0.0, 0.0));
+        assert!(
+            (anchor_a - anchor_b).length() < 0.02,
+            "self-collision pulled a joint apart by {}",
+            (anchor_a - anchor_b).length()
+        );
+    }
+
+    /// The closest-point routine underpins every self-collision test above, and
+    /// its clamping is exactly the part that is easy to get wrong.
+    #[test]
+    fn closest_points_handles_parallel_crossing_and_degenerate_segments() {
+        // Parallel, overlapping in their shared direction.
+        let (a, b) = closest_points_on_segments(
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.25, 1.0, 0.0),
+            vec3(0.75, 1.0, 0.0),
+        );
+        assert!((a.y - b.y).abs() > 0.9 && (a - b).length() - 1.0 < 1e-5);
+
+        // Crossing at right angles: the closest points are where they cross.
+        let (a, b) = closest_points_on_segments(
+            vec3(-1.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 0.5, -1.0),
+            vec3(0.0, 0.5, 1.0),
+        );
+        assert!(a.length() < 1e-5, "{a:?}");
+        assert!((b - vec3(0.0, 0.5, 0.0)).length() < 1e-5, "{b:?}");
+
+        // A point against a segment, and two points: a sphere is a segment of
+        // zero length, so both have to work.
+        let (a, b) = closest_points_on_segments(
+            vec3(0.4, 2.0, 0.0),
+            vec3(0.4, 2.0, 0.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 0.0, 0.0),
+        );
+        assert!((a - vec3(0.4, 2.0, 0.0)).length() < 1e-5);
+        assert!((b - vec3(0.4, 0.0, 0.0)).length() < 1e-5, "{b:?}");
+
+        let (a, b) = closest_points_on_segments(
+            vec3(1.0, 1.0, 1.0),
+            vec3(1.0, 1.0, 1.0),
+            vec3(-2.0, 0.0, 0.0),
+            vec3(-2.0, 0.0, 0.0),
+        );
+        assert!((a - vec3(1.0, 1.0, 1.0)).length() < 1e-6);
+        assert!((b - vec3(-2.0, 0.0, 0.0)).length() < 1e-6);
+    }
+
+    /// A tendon is passive: it may store and return energy, and it may lose it,
+    /// but it must never create any.
+    ///
+    /// This exists because the first version did. Applied as an explicit torque
+    /// impulse, the damping term inverted for light limbs — `damping * dt /
+    /// inertia` above 2 amplifies instead of damping — and evolution found it
+    /// within a dozen generations, producing organisms crossing a hundred metres
+    /// in eight seconds. Expressing the spring as a frequency rather than a
+    /// stiffness is what makes it independent of the limb it acts on.
+    #[test]
+    fn a_tendon_never_adds_energy() {
+        for freq in [2.0, 6.0, 20.0, 55.0] {
+            for damping in [0.0, 0.5, 1.0] {
+                let mut w = hinge_pair(-1.0, 0.0); // no motor at all
+                w.joints[0].tendon_frequency = freq;
+                w.joints[0].tendon_damping = damping;
+                // Set it swinging, then leave it alone.
+                w.bodies[1].ang_vel = Vec3::Z * 3.0;
+
+                let dt = 1.0 / 120.0;
+                let energy = |w: &World| -> Real {
+                    w.bodies
+                        .iter()
+                        .map(|b| {
+                            let i = 1.0 / b.inv_inertia_local.z;
+                            0.5 * b.mass() * b.lin_vel.length_sq() + 0.5 * i * b.ang_vel.length_sq()
+                        })
+                        .sum()
+                };
+                let start = energy(&w);
+                let mut peak: Real = start;
+                for _ in 0..600 {
+                    w.step(dt);
+                    peak = peak.max(energy(&w));
+                }
+                assert!(!w.diverged, "freq {freq} damping {damping}: diverged");
+                // A spring converts kinetic energy to potential and back, so the
+                // kinetic peak may exceed the start a little; it may not run away.
+                assert!(
+                    peak < start * 3.0,
+                    "freq {freq} damping {damping}: energy grew from {start} to {peak}"
+                );
+            }
+        }
+    }
+
+    /// And a damped tendon actually settles the joint rather than leaving it
+    /// ringing, which is the half of the behaviour that makes it useful.
+    #[test]
+    fn a_damped_tendon_brings_a_joint_to_rest() {
+        let mut w = hinge_pair(-1.0, 0.0);
+        w.joints[0].tendon_frequency = 8.0;
+        w.joints[0].tendon_damping = 1.0;
+        w.bodies[1].ang_vel = Vec3::Z * 3.0;
+        for _ in 0..1200 {
+            w.step(1.0 / 120.0);
+        }
+        let rate = (w.bodies[1].ang_vel - w.bodies[0].ang_vel).length();
+        assert!(rate < 0.3, "joint still swinging at {rate} rad/s");
     }
 
     #[test]

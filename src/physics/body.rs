@@ -104,6 +104,22 @@ impl RigidBody {
         self.shape.ground_points(self.pos, self.orient, normal)
     }
 
+    /// The body's stand-in capsule in world space: the two ends of its core
+    /// segment, and its radius. See [`Shape::collision_capsule`].
+    pub fn collision_segment(&self) -> (Vec3, Vec3, Real) {
+        let (half, radius) = self.shape.collision_capsule();
+        let centre = self.pos - self.orient.rotate(self.shape.com_offset());
+        let arm = self.orient.rotate(half);
+        (centre - arm, centre + arm, radius)
+    }
+
+    /// Radius of a sphere about `pos` that contains the whole body. Used to
+    /// reject pairs that cannot possibly touch before doing any real work.
+    pub fn bounding_radius(&self) -> Real {
+        let (half, radius) = self.shape.collision_capsule();
+        half.length() + radius + self.shape.com_offset().length()
+    }
+
     /// Lowest world-space point of the body. Used to place an organism on the
     /// ground at spawn.
     pub fn lowest_point_y(&self) -> Real {

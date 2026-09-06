@@ -48,12 +48,20 @@ pub enum Shape {
     Box {
         half_extents: Vec3,
     },
-    /// Rectangular frustum: the cross-section at `+axis` is `top_scale` times
-    /// the cross-section at `-axis`, which is the one `half_extents` describes.
+    /// Rectangular frustum: the cross-section at one end is `top_scale` times
+    /// the cross-section at the other, which is the one `half_extents`
+    /// describes.
+    ///
+    /// `flip` puts the wide end at `+axis` instead of `-axis`. It exists so a
+    /// taper can be reflected: a wedge mirrored across the body's midline has to
+    /// point the other way, or a bilaterally symmetric organism is not actually
+    /// symmetric.
     Taper {
         half_extents: Vec3,
         axis: u8,
         top_scale: Real,
+        #[serde(default)]
+        flip: bool,
     },
     Sphere {
         radius: Real,
@@ -93,7 +101,7 @@ impl Shape {
     /// Zero for everything symmetric, which is everything but a taper.
     pub fn com_offset(&self) -> Vec3 {
         match *self {
-            Shape::Taper { half_extents, axis, top_scale } => {
+            Shape::Taper { half_extents, axis, top_scale, flip } => {
                 // With k(u) = 1 + a*u the linear cross-section scale along the
                 // axis, the first moment integrates to this. At top_scale = 1 it
                 // is zero, and at top_scale = 0 it is -h/2 — a quarter of the
@@ -101,7 +109,7 @@ impl Shape {
                 let a = top_scale - 1.0;
                 let h = component(half_extents, axis);
                 let offset = h * (a * (2.0 + a)) / (2.0 * (a * a + 3.0 * a + 3.0));
-                axis_vec(axis) * offset
+                axis_vec(axis) * if flip { -offset } else { offset }
             }
             _ => Vec3::ZERO,
         }
@@ -125,7 +133,7 @@ impl Shape {
                 (mass, i)
             }
 
-            Shape::Taper { half_extents, axis, top_scale } => {
+            Shape::Taper { half_extents, axis, top_scale, .. } => {
                 let s = top_scale;
                 let ha = component(half_extents, axis);
                 let (b_axis, c_axis) = cross_axes(axis);
@@ -223,14 +231,15 @@ impl Shape {
                 (out, n)
             }
 
-            Shape::Taper { half_extents, axis, top_scale } => {
+            Shape::Taper { half_extents, axis, top_scale, flip } => {
                 let ha = component(half_extents, axis);
                 let (b_axis, c_axis) = cross_axes(axis);
                 let hb = component(half_extents, b_axis);
                 let hc = component(half_extents, c_axis);
                 let mut n = 0;
-                // Base ring at -axis is full width; the ring at +axis is scaled.
-                for (along, scale) in [(-ha, 1.0), (ha, top_scale)] {
+                // The full-width ring sits at -axis, or at +axis when flipped.
+                let wide = if flip { ha } else { -ha };
+                for (along, scale) in [(wide, 1.0), (-wide, top_scale)] {
                     for sb in [-1.0, 1.0] {
                         for sc in [-1.0, 1.0] {
                             let mut local = Vec3::ZERO;
@@ -277,6 +286,37 @@ impl Shape {
         }
     }
 
+    /// A capsule standing in for this shape when parts are tested against each
+    /// other: a segment from `-half` to `+half` along `axis`, thickened by
+    /// `radius`, about the geometric centre.
+    ///
+    /// Self-collision exists to stop a body being a cloud of overlapping blocks,
+    /// not to model contact between limbs precisely, and a capsule is the
+    /// cheapest hull that is roughly right for all five shapes. It is inscribed
+    /// rather than circumscribed, so it errs toward letting parts approach each
+    /// other rather than toward pushing apart things that never touched.
+    pub fn collision_capsule(&self) -> (Vec3, Real) {
+        match *self {
+            Shape::Sphere { radius } => (Vec3::ZERO, radius),
+            Shape::Capsule { radius, half_length, axis } => (axis_vec(axis) * half_length, radius),
+            Shape::Cylinder { radius, half_length, axis } => (axis_vec(axis) * half_length, radius),
+            Shape::Box { half_extents } | Shape::Taper { half_extents, .. } => {
+                let h = half_extents;
+                let axis = if h.x >= h.y && h.x >= h.z {
+                    0
+                } else if h.y >= h.z {
+                    1
+                } else {
+                    2
+                };
+                let (b, c) = cross_axes(axis);
+                let radius = component(h, b).min(component(h, c));
+                let half = (component(h, axis) - radius).max(0.0);
+                (axis_vec(axis) * half, radius)
+            }
+        }
+    }
+
     /// Whether a point given in the body frame, about the geometric centre, is
     /// inside the shape. Used by the tests that check the closed-form mass
     /// properties above against numerical integration.
@@ -286,10 +326,10 @@ impl Shape {
             Shape::Box { half_extents: h } => {
                 p.x.abs() <= h.x && p.y.abs() <= h.y && p.z.abs() <= h.z
             }
-            Shape::Taper { half_extents, axis, top_scale } => {
+            Shape::Taper { half_extents, axis, top_scale, flip } => {
                 let ha = component(half_extents, axis);
                 let (b_axis, c_axis) = cross_axes(axis);
-                let along = component(p, axis);
+                let along = if flip { -component(p, axis) } else { component(p, axis) };
                 if along.abs() > ha {
                     return false;
                 }
@@ -482,7 +522,12 @@ mod tests {
         for axis in 0..3 {
             for top_scale in [0.2, 0.45, 0.8] {
                 check_against_integration(
-                    Shape::Taper { half_extents: vec3(0.3, 0.2, 0.25), axis, top_scale },
+                    Shape::Taper {
+                        half_extents: vec3(0.3, 0.2, 0.25),
+                        axis,
+                        top_scale,
+                        flip: false,
+                    },
                     0.03,
                 );
             }
@@ -497,7 +542,7 @@ mod tests {
         let h = vec3(0.31, 0.17, 0.23);
         let (bm, bi) = Shape::Box { half_extents: h }.mass_properties(DENSITY);
         for axis in 0..3 {
-            let taper = Shape::Taper { half_extents: h, axis, top_scale: 1.0 };
+            let taper = Shape::Taper { half_extents: h, axis, top_scale: 1.0, flip: false };
             let (tm, ti) = taper.mass_properties(DENSITY);
             assert!((tm - bm).abs() < 1e-3, "mass on axis {axis}: {tm} vs {bm}");
             assert!(taper.com_offset().length() < 1e-6);
@@ -511,7 +556,7 @@ mod tests {
     #[test]
     fn a_full_taper_has_a_pyramids_centre_of_mass() {
         let h = vec3(0.2, 0.3, 0.2);
-        let s = Shape::Taper { half_extents: h, axis: 1, top_scale: 0.0 };
+        let s = Shape::Taper { half_extents: h, axis: 1, top_scale: 0.0, flip: false };
         assert!((s.com_offset().y + 0.15).abs() < 1e-5, "{:?}", s.com_offset());
     }
 

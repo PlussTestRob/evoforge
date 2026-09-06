@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::genome::{Genome, JointKind, ShapeKind};
-use crate::math::{dcos, vec3, Real, Vec3};
+use crate::math::{dcos, vec3, Quat, Real, Vec3};
 use crate::physics::{Joint, RigidBody, Shape, TerrainModel, World, WorldParams};
 
 /// Height above the terrain at which an organism is spawned. Small but nonzero,
@@ -67,8 +67,64 @@ pub struct Phenotype {
     /// the slot of its *child* part, so a limb's motor output and its angle
     /// sensor share an index.
     pub joint_slots: Vec<u8>,
+    /// Sign applied to each joint's motor command, parallel to `world.joints`.
+    /// Negative for the mirrored half of an antiphase pair.
+    pub joint_drive: Vec<Real>,
+    /// How many bodies answer to each slot, indexed by slot.
+    pub slot_bodies: Vec<u8>,
+    /// How many joints answer to each slot, indexed by slot.
+    pub slot_joints: Vec<u8>,
     pub total_mass: Real,
 }
+
+/// Where a copy of a part sits, and which side of the midline it is on.
+#[derive(Clone, Copy, Debug)]
+struct Mount {
+    body: usize,
+    /// `+1` right, `-1` left, `0` on the midline.
+    side: Real,
+}
+
+/// Reflection across the sagittal plane.
+#[inline]
+fn mirror_z(v: Vec3) -> Vec3 {
+    vec3(v.x, v.y, -v.z)
+}
+
+/// Force a shape that sits *on* the midline to be symmetric about it.
+///
+/// A skull, a spine, a ribcage: the structures an animal carries on its
+/// centreline are all mirror-symmetric about that line, and they have to be —
+/// anything else makes the whole organism lopsided no matter how carefully its
+/// limbs are paired. Only a taper running left-to-right offends, and it is
+/// turned to run along its longest other axis instead.
+fn midline_symmetric(shape: Shape) -> Shape {
+    match shape {
+        Shape::Taper { half_extents: h, axis: 2, top_scale, flip } => {
+            let axis = if h.x >= h.y { 0 } else { 1 };
+            Shape::Taper { half_extents: h, axis, top_scale, flip }
+        }
+        other => other,
+    }
+}
+
+/// A shape as seen in the sagittal mirror.
+///
+/// Boxes, spheres, capsules and cylinders are all symmetric about the plane, so
+/// they reflect onto themselves. A taper is not: it is wide at one end, and
+/// reflecting one that runs along Z has to swap which end that is.
+fn reflect_shape(shape: Shape) -> Shape {
+    match shape {
+        Shape::Taper { half_extents, axis, top_scale, flip } if axis == 2 => {
+            Shape::Taper { half_extents, axis, top_scale, flip: !flip }
+        }
+        other => other,
+    }
+}
+
+/// How far off the midline the first of a pair is pushed when its gene would
+/// have anchored it on the centreline, as a fraction of the parent's half-width.
+const MIN_PAIR_SEPARATION: Real = 0.35;
 
 impl Phenotype {
     pub fn body_specs(&self) -> Vec<BodySpec> {
@@ -97,9 +153,12 @@ pub fn carve(kind: ShapeKind, half_extents: Vec3, taper_top_scale: Real) -> Shap
     let h = half_extents;
     match kind {
         ShapeKind::Box => Shape::Box { half_extents: h },
-        ShapeKind::Taper => {
-            Shape::Taper { half_extents: h, axis: longest_axis(h), top_scale: taper_top_scale }
-        }
+        ShapeKind::Taper => Shape::Taper {
+            half_extents: h,
+            axis: longest_axis(h),
+            top_scale: taper_top_scale,
+            flip: false,
+        },
         ShapeKind::Sphere => Shape::Sphere { radius: h.x.min(h.y).min(h.z) },
         ShapeKind::Capsule => {
             let axis = longest_axis(h);
@@ -150,115 +209,275 @@ fn shortest_cross_extent(h: Vec3, axis: u8) -> Real {
     }
 }
 
+/// Cap a joint's torque at what its own girth could physically host.
+///
+/// Muscle force scales with cross-sectional area, and the torque that force
+/// exerts scales with a moment arm that itself grows with the limb's width — so
+/// the ceiling goes as `stress * area^1.5`. The narrower of the two parts sets
+/// it, because a joint is only as strong as the thinner side of it.
+///
+/// A `stress` of zero leaves the gene alone, which is the pre-existing
+/// behaviour. Otherwise the gene may still ask for *less* than the ceiling: it
+/// stays a real choice about how much muscle to invest, rather than being
+/// replaced by geometry outright.
+fn muscle_limited(requested: Real, child: Vec3, parent: Vec3, axis: Vec3, stress: Real) -> Real {
+    if stress <= 0.0 {
+        return requested;
+    }
+    let ceiling = stress * cross_section(child, axis).min(cross_section(parent, axis)).powf(1.5);
+    requested.min(ceiling)
+}
+
+/// Area of the bounding box's cross-section perpendicular to `axis`.
+fn cross_section(half_extents: Vec3, axis: Vec3) -> Real {
+    // Perpendicular to the axis, the two remaining half-extents span the section.
+    let a = half_extents.abs();
+    let n = axis.abs();
+    // Pick out the two components the axis is not aligned with.
+    let along = a.dot(n);
+    let volume_section = 8.0 * a.x * a.y * a.z;
+    if along > 1e-9 {
+        // (2x)(2y)(2z) / (2 * along) = the section perpendicular to the axis.
+        volume_section / (2.0 * along)
+    } else {
+        4.0 * a.x * a.z
+    }
+}
+
 /// Express `genome` into a world according to `cfg`.
 ///
 /// Deterministic and allocation-light: this runs once per evaluation, so it sits
 /// on the hot path of the whole experiment.
 pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
+    build_with_start(genome, cfg, None)
+}
+
+/// How an organism is set down at the start of a trial.
+///
+/// An organism evaluated once, from an identical pose, on identical ground, is
+/// being asked for a stunt rather than a gait: a single well-timed lunge scores
+/// as well as walking. Varying the start across trials is what makes the
+/// difference between a strategy that works and one that merely worked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartPerturbation {
+    /// Rotation about the vertical, radians. The organism must still travel
+    /// along +X, so this asks it to cope with not being aimed there.
+    pub yaw: Real,
+    /// Rotation about the forward axis, radians: set down slightly off balance.
+    pub tilt: Real,
+    /// Horizontal displacement of the whole body, metres. On rolling ground this
+    /// also changes the terrain underneath it.
+    pub offset: Vec3,
+}
+
+/// Express `genome`, optionally setting it down perturbed.
+pub fn build_with_start(
+    genome: &Genome,
+    cfg: &Config,
+    start: Option<StartPerturbation>,
+) -> Phenotype {
     let n = genome.parts.len();
     debug_assert!(n >= 1);
 
     let density = cfg.body.density;
     let top_scale = cfg.body.taper_top_scale;
+    let paired_allowed = cfg.body.pair_probability > 0.0;
+
     // Geometric centres, not centres of mass: the attachment rules below are
     // written about the box a part is inscribed in, and for a taper the two
     // differ. The conversion happens once, where each body is constructed.
-    let mut centres: Vec<Vec3> = Vec::with_capacity(n);
-    let mut shapes: Vec<Shape> = Vec::with_capacity(n);
-    let mut bodies: Vec<RigidBody> = Vec::with_capacity(n);
-    let mut joints: Vec<Joint> = Vec::with_capacity(n.saturating_sub(1));
-    let mut body_slots: Vec<u8> = Vec::with_capacity(n);
-    let mut joint_slots: Vec<u8> = Vec::with_capacity(n.saturating_sub(1));
+    let mut centres: Vec<Vec3> = Vec::new();
+    let mut shapes: Vec<Shape> = Vec::new();
+    let mut bodies: Vec<RigidBody> = Vec::new();
+    let mut joints: Vec<Joint> = Vec::new();
+    let mut body_slots: Vec<u8> = Vec::new();
+    let mut joint_slots: Vec<u8> = Vec::new();
+    let mut joint_drive: Vec<Real> = Vec::new();
 
-    // Root at the origin; the whole organism is translated onto the terrain once
-    // every part has been placed.
-    let root = carve(genome.parts[0].shape, genome.parts[0].half_extents, top_scale);
+    // A part no longer maps to one body. A paired part appears twice, mirrored;
+    // a repeated part appears as a chain. `mounts[i]` records where part i's
+    // children attach — one entry per copy, carrying the body index and which
+    // side of the midline that copy sits on.
+    let mut mounts: Vec<Vec<Mount>> = vec![Vec::new(); n];
+
+    let mut root = carve(genome.parts[0].shape, genome.parts[0].half_extents, top_scale);
+    if paired_allowed {
+        root = midline_symmetric(root);
+    }
     centres.push(Vec3::ZERO);
     shapes.push(root);
     bodies.push(RigidBody::new(root.com_offset(), root, density));
     body_slots.push(genome.parts[0].slot);
+    // The root straddles the midline, so it has no side of its own.
+    mounts[0].push(Mount { body: 0, side: 0.0 });
 
     for i in 1..n {
         let part = &genome.parts[i];
         let parent_index = part.parent as usize;
-        let shape = carve(part.shape, part.half_extents, top_scale);
-        // Attachment works in bounding boxes, so a sphere's child sits on the
-        // sphere's own bound rather than on the box it was carved from and every
-        // shape presents the same six faces to the rules below.
-        let extents = shape.bounds();
-        let parent_extents = shapes[parent_index].bounds();
-        let face = &FACES[(part.attach_face % 6) as usize];
+        let parent_mounts = mounts[parent_index].clone();
 
-        // Point on the parent's face, in the parent's local frame.
-        let n_abs = face.normal.abs();
-        let t0_abs = face.tangents[0].abs();
-        let t1_abs = face.tangents[1].abs();
-        let anchor_in_parent = face.normal * parent_extents.dot(n_abs)
-            + face.tangents[0] * (part.attach_u * parent_extents.dot(t0_abs))
-            + face.tangents[1] * (part.attach_v * parent_extents.dot(t1_abs));
+        // Which copies of this part exist, and on which side each sits.
+        //
+        // A part hanging off an already-paired parent inherits its parent's side
+        // rather than pairing again — that is what makes a segment part of *a*
+        // limb rather than the start of four of them.
+        let sides: Vec<(Mount, Real)> = if parent_mounts.len() > 1 {
+            parent_mounts.iter().map(|m| (*m, m.side)).collect()
+        } else if paired_allowed && part.paired {
+            vec![(parent_mounts[0], 1.0), (parent_mounts[0], -1.0)]
+        } else {
+            vec![(parent_mounts[0], parent_mounts[0].side)]
+        };
 
-        // The child sits just outside that face, touching it.
-        let child_offset = face.normal * extents.dot(n_abs);
-        let centre = centres[parent_index] + anchor_in_parent + child_offset;
-        centres.push(centre);
-        shapes.push(shape);
-        // Parts are spawned axis-aligned, so the centre-of-mass offset needs no
-        // rotation here; it does once the body starts moving, which is why
-        // `Shape::ground_points` rotates it.
-        bodies.push(RigidBody::new(centre + shape.com_offset(), shape, density));
-        body_slots.push(part.slot);
+        for (parent_mount, side) in sides {
+            let mut attach_to = parent_mount.body;
+            let segments = if cfg.body.max_repeat > 1 { part.repeat.max(1) } else { 1 };
 
-        // All parts are spawned axis-aligned, so local and world frames coincide
-        // at construction and the joint frames are the same vectors in both
-        // bodies. This is also why the fixed-joint rest pose is the identity.
-        let axis_index = (part.joint.axis & 1) as usize;
-        let axis = face.tangents[axis_index];
-        let reference = face.tangents[1 - axis_index];
+            for segment in 0..segments {
+                let mut shape = carve(part.shape, part.half_extents, top_scale);
+                // A wedge that points outward on one side has to point outward
+                // on the other too. Only a taper along the mirrored axis is
+                // affected; every other shape is its own reflection.
+                if side < 0.0 {
+                    shape = reflect_shape(shape);
+                } else if paired_allowed && side == 0.0 {
+                    shape = midline_symmetric(shape);
+                }
+                let extents = shape.bounds();
+                let parent_extents = shapes[attach_to].bounds();
+                let face = &FACES[(part.attach_face % 6) as usize];
 
-        joints.push(Joint {
-            body_a: parent_index as u16,
-            body_b: i as u16,
-            kind: part.joint.kind,
-            anchor_a: anchor_in_parent - shapes[parent_index].com_offset(),
-            anchor_b: -child_offset - shape.com_offset(),
-            axis_a: axis,
-            axis_b: axis,
-            ref_a: reference,
-            ref_b: reference,
-            cos_limit: match part.joint.kind {
-                JointKind::Hinge => dcos(part.joint.limit),
-                // A fixed joint's angular constraint is handled separately; the
-                // limit is never consulted.
-                JointKind::Fixed => -1.0,
-            },
-            motor_speed_max: part.joint.motor_speed,
-            motor_torque_max: match part.joint.kind {
-                JointKind::Hinge => part.joint.motor_torque,
-                JointKind::Fixed => 0.0,
-            },
-            motor_target: 0.0,
-            // A fixed weld has no motor, so nothing can overwork it and it never
-            // wears out. Only driven joints can be asked for more than they have.
-            endurance: match part.joint.kind {
-                JointKind::Hinge => cfg.body.joint_endurance,
-                JointKind::Fixed => 0.0,
-            },
-            health: match part.joint.kind {
-                JointKind::Hinge => cfg.body.joint_endurance,
-                JointKind::Fixed => 0.0,
-            },
-            broken: false,
-        });
-        joint_slots.push(part.slot);
+                let n_abs = face.normal.abs();
+                let t0_abs = face.tangents[0].abs();
+                let t1_abs = face.tangents[1].abs();
+                // Later segments sit squarely on the one before, so a repeated
+                // part grows into a straight run — a spine, a tail, a limb —
+                // rather than a staircase.
+                let (u, v) = if segment == 0 { (part.attach_u, part.attach_v) } else { (0.0, 0.0) };
+                let mut anchor_in_parent = face.normal * parent_extents.dot(n_abs)
+                    + face.tangents[0] * (u * parent_extents.dot(t0_abs))
+                    + face.tangents[1] * (v * parent_extents.dot(t1_abs));
+                let mut child_offset = face.normal * extents.dot(n_abs);
+
+                let axis_index = (part.joint.axis & 1) as usize;
+                let mut axis = face.tangents[axis_index];
+                let mut reference = face.tangents[1 - axis_index];
+
+                // A pair anchored on the midline would be two limbs in the
+                // same place, so push it off-centre first. This has to happen
+                // *before* the reflection below and on both sides alike:
+                // nudging only the right-hand copy would leave the two halves
+                // no longer mirror images of each other.
+                if part.paired && paired_allowed && segment == 0 {
+                    let least = MIN_PAIR_SEPARATION * parent_extents.z;
+                    if anchor_in_parent.z.abs() < least {
+                        anchor_in_parent.z = least;
+                    }
+                }
+
+                if side < 0.0 {
+                    // Mirror across the sagittal plane. Anatomy, not convention:
+                    // +X is the direction fitness measures and +Y is up, so left
+                    // and right are +/-Z, and reflecting Z is what turns a limb
+                    // into its opposite number.
+                    anchor_in_parent = mirror_z(anchor_in_parent);
+                    child_offset = mirror_z(child_offset);
+                    axis = mirror_z(axis);
+                    reference = mirror_z(reference);
+                }
+
+                let centre = centres[attach_to] + anchor_in_parent + child_offset;
+                let body = bodies.len();
+                centres.push(centre);
+                shapes.push(shape);
+                // Parts are spawned axis-aligned, so the centre-of-mass offset
+                // needs no rotation here; it does once the body starts moving,
+                // which is why `Shape::ground_points` rotates it.
+                bodies.push(RigidBody::new(centre + shape.com_offset(), shape, density));
+                body_slots.push(part.slot);
+
+                joints.push(Joint {
+                    body_a: attach_to as u16,
+                    body_b: body as u16,
+                    kind: part.joint.kind,
+                    anchor_a: anchor_in_parent - shapes[attach_to].com_offset(),
+                    anchor_b: -child_offset - shape.com_offset(),
+                    axis_a: axis,
+                    axis_b: axis,
+                    ref_a: reference,
+                    ref_b: reference,
+                    cos_limit: match part.joint.kind {
+                        JointKind::Hinge => dcos(part.joint.limit),
+                        // A fixed joint's angular constraint is handled
+                        // separately; the limit is never consulted.
+                        JointKind::Fixed => -1.0,
+                    },
+                    motor_speed_max: part.joint.motor_speed,
+                    motor_torque_max: match part.joint.kind {
+                        JointKind::Hinge => muscle_limited(
+                            part.joint.motor_torque,
+                            extents,
+                            parent_extents,
+                            axis,
+                            cfg.body.muscle_stress,
+                        ),
+                        JointKind::Fixed => 0.0,
+                    },
+                    motor_target: 0.0,
+                    // Tendons act only across joints that can actually flex.
+                    tendon_frequency: match part.joint.kind {
+                        JointKind::Hinge => cfg.body.tendon_frequency,
+                        JointKind::Fixed => 0.0,
+                    },
+                    tendon_damping: cfg.body.tendon_damping,
+                    // A fixed weld has no motor, so nothing can overwork it and
+                    // it never wears out. Only driven joints can be asked for
+                    // more than they have.
+                    endurance: match part.joint.kind {
+                        JointKind::Hinge => cfg.body.joint_endurance,
+                        JointKind::Fixed => 0.0,
+                    },
+                    health: match part.joint.kind {
+                        JointKind::Hinge => cfg.body.joint_endurance,
+                        JointKind::Fixed => 0.0,
+                    },
+                    broken: false,
+                });
+                joint_slots.push(part.slot);
+                // A mirrored limb driven by the same signal moves as its
+                // reflection, because its axis is reflected too. For a hinge
+                // that swings fore and aft that gives an alternating gait;
+                // negating it gives a bounding one. Which is better is not
+                // obvious, so it is a gene.
+                joint_drive.push(if side < 0.0 && part.antiphase { -1.0 } else { 1.0 });
+
+                attach_to = body;
+            }
+
+            mounts[i].push(Mount { body: attach_to, side });
+        }
     }
 
     // Drop the organism onto the terrain: translate straight up until no corner
     // is below the ground beneath *that corner*, plus a little clearance.
     //
-    // Sampling the terrain per corner rather than once under the root costs one
-    // pass over eight corners per body and is what keeps this correct when
-    // `TerrainModel` grows a non-flat variant. For `Flat` it reduces to exactly
-    // the same arithmetic.
+    // Sampling the terrain per corner rather than once under the root is what
+    // keeps this correct on the non-flat `TerrainModel`. For `Flat` it reduces
+    // to exactly the same arithmetic.
+    // Perturb before the drop, so a body set down at an angle still lands on the
+    // ground rather than through it.
+    if let Some(start) = start {
+        let (sy, cy) = crate::math::dsincos(start.yaw * 0.5);
+        let (st, ct) = crate::math::dsincos(start.tilt * 0.5);
+        let spin = Quat { x: 0.0, y: sy, z: 0.0, w: cy }
+            .mul(Quat { x: st, y: 0.0, z: 0.0, w: ct })
+            .normalize();
+        for b in bodies.iter_mut() {
+            b.pos = spin.rotate(b.pos) + start.offset;
+            b.orient = spin.mul(b.orient).normalize();
+        }
+    }
+
     let terrain = cfg_terrain(cfg);
     let mut deepest = Real::NEG_INFINITY;
     for body in &bodies {
@@ -273,11 +492,27 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
     }
 
     let total_mass = bodies.iter().map(|b| b.mass()).sum();
+    // How many bodies and joints answer to each controller slot. A paired or
+    // repeated part has several, and they share one set of weights — which is
+    // the point: two legs controlled by one leg controller move as a pair, and
+    // that is what a gait is.
+    let max_slots = cfg.brain_layout().max_slots;
+    let mut slot_bodies = vec![0u8; max_slots];
+    let mut slot_joints = vec![0u8; max_slots];
+    for &s in &body_slots {
+        slot_bodies[s as usize] = slot_bodies[s as usize].saturating_add(1);
+    }
+    for &s in &joint_slots {
+        slot_joints[s as usize] = slot_joints[s as usize].saturating_add(1);
+    }
 
     Phenotype {
         world: World::new(bodies, joints, world_params(cfg)),
         body_slots,
         joint_slots,
+        joint_drive,
+        slot_bodies,
+        slot_joints,
         total_mass,
     }
 }
@@ -285,6 +520,10 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
 fn cfg_terrain(cfg: &Config) -> TerrainModel {
     match cfg.environment.terrain {
         crate::config::Terrain::Flat => TerrainModel::Flat { height: 0.0 },
+        crate::config::Terrain::Rough => TerrainModel::Rough {
+            amplitude: cfg.environment.terrain_amplitude,
+            wavelength: cfg.environment.terrain_wavelength,
+        },
     }
 }
 
@@ -302,6 +541,7 @@ pub fn world_params(cfg: &Config) -> WorldParams {
         max_correction_speed: cfg.simulation.max_correction_speed,
         max_linear_speed: cfg.simulation.max_linear_speed,
         max_angular_speed: cfg.simulation.max_angular_speed,
+        self_collision: cfg.environment.self_collision,
     }
 }
 
@@ -406,6 +646,119 @@ mod tests {
             let centre = body.pos - shape.com_offset();
             assert!((body.lowest_point_y() - (centre.y - shape.bounds().y)).abs() < 1e-5);
         }
+    }
+
+    fn symmetric_cfg() -> Config {
+        let mut cfg = shaped_cfg();
+        cfg.body.pair_probability = 1.0; // every part a pair
+        cfg
+    }
+
+    /// A body built from paired parts must be its own mirror image.
+    ///
+    /// This is the whole claim of bilateral symmetry: for every body off the
+    /// midline there is a twin at the same place on the other side, of the same
+    /// shape and mass. If the mirroring is wrong anywhere — the anchor, the
+    /// child offset, the chain of a repeated segment — the two halves drift
+    /// apart and this fails.
+    #[test]
+    fn a_paired_body_is_its_own_mirror_image() {
+        let cfg = symmetric_cfg();
+        let layout = cfg.brain_layout();
+        for seed in 0..60 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            let p = build(&g, &cfg);
+
+            for (i, body) in p.world.bodies.iter().enumerate() {
+                if body.pos.z.abs() < 1e-6 {
+                    continue; // on the midline; it is its own reflection
+                }
+                let twin = p.world.bodies.iter().enumerate().find(|(k, other)| {
+                    *k != i
+                        && (other.pos.x - body.pos.x).abs() < 1e-4
+                        && (other.pos.y - body.pos.y).abs() < 1e-4
+                        && (other.pos.z + body.pos.z).abs() < 1e-4
+                });
+                let (_, twin) = twin.unwrap_or_else(|| {
+                    panic!("seed {seed}: body {i} at {:?} has no mirror twin", body.pos)
+                });
+                // The twin's shape is the *reflection* of this one, which for
+                // everything but a taper along Z is the same shape.
+                assert_eq!(
+                    twin.shape,
+                    reflect_shape(body.shape),
+                    "seed {seed}: twins are not reflections"
+                );
+                assert!((twin.mass() - body.mass()).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// Pairing must not put both halves in the same place.
+    #[test]
+    fn a_pair_is_actually_separated() {
+        let cfg = symmetric_cfg();
+        let layout = cfg.brain_layout();
+        for seed in 0..60 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            let p = build(&g, &cfg);
+            for (i, a) in p.world.bodies.iter().enumerate() {
+                for (k, b) in p.world.bodies.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        (a.pos - b.pos).length() > 1e-4,
+                        "seed {seed}: bodies {i} and {k} occupy the same point"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both halves of a pair answer to one controller slot, and a chain of
+    /// segments likewise. That sharing is what turns two limbs into a gait.
+    #[test]
+    fn mirrored_and_repeated_parts_share_a_controller_slot() {
+        let mut cfg = symmetric_cfg();
+        cfg.body.max_repeat = 3;
+        let layout = cfg.brain_layout();
+        let mut shared = 0;
+        for seed in 0..40 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            let p = build(&g, &cfg);
+            assert_eq!(p.joint_drive.len(), p.world.joints.len());
+            assert_eq!(p.body_slots.len(), p.world.bodies.len());
+            for slot in 0..layout.max_slots {
+                let n = p.body_slots.iter().filter(|&&s| s as usize == slot).count();
+                assert_eq!(n, p.slot_bodies[slot] as usize, "slot {slot} miscounted");
+                if n > 1 {
+                    shared += 1;
+                }
+            }
+        }
+        assert!(shared > 0, "no slot ever owned more than one body");
+    }
+
+    /// Segmentation extends a part into a chain, and children hang off its end
+    /// rather than sprouting from every segment.
+    #[test]
+    fn repetition_lengthens_the_body_without_branching() {
+        let mut cfg = cfg();
+        cfg.body.max_repeat = 4;
+        let layout = cfg.brain_layout();
+        let mut grew = false;
+        for seed in 0..40 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            let want: usize = g.parts.iter().map(|p| p.repeat.max(1) as usize).sum();
+            let p = build(&g, &cfg);
+            // The root is never repeated, so it contributes exactly one body.
+            let expect = want - (g.parts[0].repeat.max(1) as usize) + 1;
+            assert_eq!(p.world.bodies.len(), expect, "seed {seed}");
+            grew |= p.world.bodies.len() > g.parts.len();
+        }
+        assert!(grew, "repetition never produced a longer body");
     }
 
     #[test]

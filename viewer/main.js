@@ -62,13 +62,54 @@ scene.add(sun, sun.target);
 
 // Terrain for these experiments is a plane at y = 0 (environment.terrain = "flat").
 const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(200, 200),
+  new THREE.PlaneGeometry(200, 200), // reshaped per replay by `shapeGround`
   new THREE.MeshStandardMaterial({ color: 0x343a45, roughness: 0.95, metalness: 0.0 }),
 );
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
+// The rolling-ground height field, mirroring TerrainModel::Rough in
+// src/physics/world.rs. Kept in step with it by eye; if a replay ever looks like
+// it is floating or sunk, this is the first thing to check.
+function terrainHeight(terrain, x, z) {
+  if (!terrain || terrain.kind !== 'rough') return terrain?.height ?? 0;
+  const k = (Math.PI * 2) / Math.max(terrain.wavelength, 1e-3);
+  const a = terrain.amplitude;
+  return (
+    a * Math.sin(k * x) * Math.cos(k * z) +
+    0.5 * a * Math.sin(2 * k * x + 1.7) * Math.cos(2 * k * z + 0.9)
+  );
+}
+
+/** Reshape the ground to match the terrain a replay actually ran on. */
+function shapeGround(terrain) {
+  const rough = terrain && terrain.kind === 'rough';
+  // Rolling ground needs several segments per wavelength or the relief is
+  // aliased away; a smaller sheet at much higher resolution beats a huge flat
+  // one, and organisms never travel far enough to reach its edge.
+  const span = rough ? ROUGH_SPAN : GROUND_SPAN;
+  const segments = rough
+    ? Math.min(700, Math.ceil((span / Math.max(terrain.wavelength, 0.1)) * 12))
+    : 1;
+  const next = new THREE.PlaneGeometry(span, span, segments, segments);
+  if (rough) {
+    // PlaneGeometry lies in XY until it is rotated, so its local y is world -z.
+    const pos = next.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const z = -pos.getY(i);
+      pos.setZ(i, terrainHeight(terrain, x, z));
+    }
+    next.computeVertexNormals();
+  }
+  ground.geometry.dispose();
+  ground.geometry = next;
+  grid.visible = !rough; // a flat grid over rolling ground reads as a mistake
+}
+
+const GROUND_SPAN = 200;
+const ROUGH_SPAN = 90;
 const grid = new THREE.GridHelper(80, 80, 0x8b96a8, 0x5b6474); // 1 m cells
 grid.position.y = 0.002;
 grid.material.transparent = true;
@@ -186,9 +227,12 @@ function buildGeometry(body) {
       // a turn; at that angle the circumradius sqrt(2) gives unit half-sides.
       const e = size(s.half_extents);
       const [b, c] = CROSS_AXES[s.axis];
+      // `flip` puts the wide end at +axis instead of -axis; a reflected limb
+      // has to point the other way or a symmetric organism is not symmetric.
+      const wideAtTop = !!s.flip;
       const geo = new THREE.CylinderGeometry(
-        Math.SQRT2 * s.top_scale,
-        Math.SQRT2,
+        Math.SQRT2 * (wideAtTop ? 1 : s.top_scale),
+        Math.SQRT2 * (wideAtTop ? s.top_scale : 1),
         2,
         4,
       );
@@ -200,7 +244,8 @@ function buildGeometry(body) {
       // in src/physics/shape.rs; at top_scale 1 it is zero and at 0 it is half
       // the half-height, which is a pyramid's quarter-height from the base.
       const a = s.top_scale - 1;
-      const off = (e[s.axis] * (a * (2 + a))) / (2 * (a * a + 3 * a + 3));
+      let off = (e[s.axis] * (a * (2 + a))) / (2 * (a * a + 3 * a + 3));
+      if (wideAtTop) off = -off;
       const shift = [0, 0, 0];
       shift[s.axis] = -off;
       geo.translate(shift[0], shift[1], shift[2]);
@@ -262,6 +307,7 @@ function fillHud(r) {
   const breaks = (r.trace.breaks || []).length;
   el('h-breaks').textContent = breaks ? `${breaks}` : 'none';
   el('h-breaks').className = breaks ? 'warn' : '';
+  el('h-terrain').textContent = (r.trace.terrain && r.trace.terrain.kind) || 'flat';
   el('h-diverged').hidden = !m.diverged;
   ui.hud.hidden = false;
 }
@@ -280,6 +326,7 @@ function load(json, sourceName) {
   t0 = frames[0].t;
   t1 = frames[frames.length - 1].t;
 
+  shapeGround(json.trace.terrain);
   buildMeshes(json.trace.bodies);
   fillHud(json);
 

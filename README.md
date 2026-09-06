@@ -348,6 +348,10 @@ cargo build --release
 # The same experiment with all five part shapes enabled.
 ./target/release/evo run experiments/shaped-walkers.toml
 
+# Every animal-oriented constraint at once: symmetry, muscle-limited torque,
+# tendons, self-collision, rough ground, repeated trials, commanded headings.
+./target/release/evo run experiments/animals.toml
+
 # Measure throughput and its scaling across cores.
 ./target/release/evo bench experiments/first-walkers.toml
 
@@ -423,6 +427,94 @@ the identical random stream it drew before shapes existed and reproduces earlier
 results bit for bit. That is what lets `tests/golden.rs` keep the constants it
 was born with. Replays and stored genomes gain a `shape` field that defaults to
 `box` on read, so v2 artefacts still load and still mean what they meant.
+
+### Toward animals
+
+Animals are not the product of being scored on looking like animals. They are
+what falls out of three pressures at once, and each is a lever here — none of
+them a fitness term that mentions a leg.
+
+The test applied to every rule below is whether it is justifiable *without
+reference to the shape it produces*. Symmetry from developmental axes, torque
+from muscle physiology, rough ground from ecology: all pass. "Must have four
+legs" would not, and neither would a bonus for having them.
+
+Every one is off by default, and off is exact rather than approximate: a
+configuration that does not enable them draws the identical random stream, keeps
+the identical controller layout, and reproduces every earlier result bit for bit.
+
+**What a genome can say.** A `PartGene` can be `paired`, in which case it appears
+twice as mirror images across the sagittal plane — and both copies share one
+controller slot, so two legs are driven by one leg controller and move as a
+pair, which is what a gait is. `antiphase` chooses whether the halves alternate
+(a walk) or move together (a bound). A part can also `repeat` into a chain of
+segments, which is where spines, tails and segmented limbs come from; children
+hang off the end rather than sprouting from every segment. Structures on the
+midline are forced to be symmetric about it, because a lopsided spine makes the
+whole organism lopsided however carefully its limbs are paired.
+
+```toml
+[body]
+pair_probability = 0.45   # 0 disables bilateral symmetry entirely
+max_repeat = 3            # 1 disables segmentation
+```
+
+**What a body can be.** `muscle_stress` caps a joint's torque at what its own
+girth could physically host — muscle force scales with cross-section, and the
+torque it exerts with a moment arm that grows with the limb's width, so the
+ceiling goes as `stress * area^1.5`. Without it `motor_torque` is drawn
+independently of size and a matchstick can be as strong as a thigh.
+`self_collision` stops an organism's parts passing through each other, which is
+what makes limbs be outside the torso rather than inside it; parts are
+approximated by capsules and jointed pairs are exempt, because they are meant to
+touch. `tendon_frequency` gives every hinge a passive spring, expressed as a
+natural frequency rather than a stiffness so that it means the same thing on a
+thigh and on a toe — tendon elasticity is most of why animal running and hopping
+are efficient.
+
+```toml
+[body]
+muscle_stress = 12000.0   # 0 leaves motor_torque a free gene
+tendon_frequency = 6.0    # rad/s; 0 for no tendon
+tendon_damping = 0.5      # damping ratio
+
+[environment]
+self_collision = true
+```
+
+**What the world demands.** Rolling ground makes wheels and sliders stop being
+optimal, so legs stop being strictly worse — the elegant version of asking for
+legs without ever mentioning them. Repeating each evaluation from varied starts
+means a single well-timed lunge no longer scores like a gait; every organism
+faces the same set of starts, drawn from the experiment seed and the trial index,
+so a score difference is a difference between organisms rather than between the
+worlds they drew. And a commanded heading, given to the controller as an input
+and scored along that direction, means an organism has to be steerable rather
+than committed to one launch.
+
+```toml
+[simulation]
+trials = 3                # 1 is a single trial, as before
+start_jitter = 0.5        # how much the start pose varies
+aggregate = "mean"        # or "worst", which asks for no bad day at all
+steer = true              # each trial commands a direction
+steer_spread = 0.9        # radians either side of +X
+
+[environment]
+terrain = "rough"
+terrain_amplitude = 0.05
+terrain_wavelength = 1.6
+
+[fitness]
+objective = "heading"     # distance along the commanded direction
+```
+
+`experiments/animals.toml` turns on all of it at once. It is slow — three trials,
+self-collision and twelve solver iterations cost roughly an order of magnitude
+against `directed-walkers` — and it does not yet produce quadrupeds: sixty
+generations reached 22 m of commanded travel with an organism that is still
+mostly rolling, upright for under two seconds of eight. The machinery is there;
+what it needs is compute and tuning, not more rules.
 
 ### Rewarding a jump
 

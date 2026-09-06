@@ -59,7 +59,10 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 /// * `4` — joints can wear out and limbs can detach. A `Genome` gained
 ///   `caution`, a `Trace` gained the breakages it saw, and both default to
 ///   "nothing breaks" on read, so v3 artefacts still load unchanged.
-pub const ARTIFACT_FORMAT: u32 = 4;
+/// * `5` — a trace records the terrain it ran on, and parts can be mirrored,
+///   repeated and reflected. All of it defaults on read to what a v4 artefact
+///   meant: flat ground and one unmirrored copy of each part.
+pub const ARTIFACT_FORMAT: u32 = 5;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;
