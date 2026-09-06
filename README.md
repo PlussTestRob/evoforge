@@ -333,29 +333,82 @@ In particular, EvoForge should **not become a generic game engine or generic AI 
 
 Build the smallest, fastest, clearest artificial-life laboratory capable of demonstrating genuine evolution.
 
+## Quick Start
+
+```bash
+cargo build --release
+
+# Evolve. ~15 seconds for 100 generations of 100 organisms on a laptop.
+./target/release/evo run experiments/first-walkers.toml
+
+# Measure throughput and its scaling across cores.
+./target/release/evo bench experiments/first-walkers.toml
+
+# Summarise a run.
+./target/release/evo inspect runs/first-walkers-<timestamp>
+
+# Re-simulate the best recorded organism, at higher recording fidelity.
+./target/release/evo replay runs/first-walkers-<timestamp> --best --hz 60
+
+# Prove the reproducibility claim: same results on 1 core and on N.
+./target/release/evo verify experiments/first-walkers.toml
+```
+
+`run` prints a table per generation and writes everything to a self-describing
+run directory:
+
+```text
+runs/first-walkers-1788654317/
+  manifest.json        experiment id, seed, version, config digest
+  config.toml          the fully resolved configuration
+  stats.csv            per-generation statistics, ready to plot
+  organisms.jsonl      every organism: id, generation, parents, fitness, metrics
+  genomes.jsonl        genomes of recorded organisms
+  checkpoints/         full-population snapshots for resume
+  replays/             recorded trajectories
+```
+
+Resume an interrupted run, or extend a finished one, with
+`--resume runs/<dir>`; raising `generations` is allowed, but changing anything
+that affects the dynamics is refused rather than silently accepted.
+
 ## Project Status
 
-**Early development.**
+**Milestone 1 complete: the pipeline works end to end and evolution demonstrably
+occurs.**
 
-The initial milestone is a minimal end-to-end evolutionary experiment:
+A first run of `experiments/first-walkers.toml` — 100 organisms, 40 generations,
+seven seconds of wall clock — took best fitness from 0.79 m to 3.86 m and the
+*median* from 0.08 m to 2.78 m, with no divergent simulations and 82 of 100
+morphologies still distinct. The rising median is the part that matters: with
+elitism the best score cannot fall, so only the middle of the distribution moving
+shows the population as a whole is improving.
 
-* Small population
-* Block-based organisms
-* Basic joints
-* Simple neural controllers
-* Basic physics
-* Flat terrain
-* Simple locomotion objective
-* Selection
-* Crossover
-* Mutation
-* Deterministic random seeds
-* Multi-core evaluation
-* Basic experiment configuration
-* Basic performance benchmarks
+Implemented:
 
-The architecture will be allowed to evolve as experiments reveal what is actually useful.
+* block-based organisms with fixed and hinged joints, limits and motors
+* a small hand-written feed-forward controller, evolved rather than trained
+* a purpose-built impulse-based rigid-body solver — gravity, ground contact,
+  friction, joints, joint limits, joint motors
+* flat terrain behind a height-function interface
+* genome and phenotype as distinct concepts, with stable controller slots that
+  survive morphological mutation
+* tournament selection, elitism, slot-aligned crossover, per-gene mutation,
+  random immigration
+* bitwise determinism, including hand-written transcendentals so results do not
+  depend on the platform libm
+* multi-core evaluation whose results are independent of thread count
+* checkpoint, resume and run extension
+* selective recording, and exact re-simulation of any stored genome
+* `evo bench`, reporting organisms/second, scaling efficiency, and cost per
+  million evaluations
+
+Not built, deliberately: self-collision, a renderer, evolved network topology,
+non-flat terrain, and any cloud infrastructure. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning behind each of those, the
+assumptions that would affect scaling, and where the implementation is meant to
+be replaced.
 
 ## License
 
-License TBD.
+[MIT](LICENSE).

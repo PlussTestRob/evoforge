@@ -1,0 +1,29 @@
+[package]
+name = "evoforge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A headless evolutionary artificial-life simulator"
+license = "MIT"
+
+[lib]
+name = "evoforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evo"
+path = "src/bin/evo.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
