@@ -376,6 +376,35 @@ Resume an interrupted run, or extend a finished one, with
 `--resume runs/<dir>`; raising `generations` is allowed, but changing anything
 that affects the dynamics is refused rather than silently accepted.
 
+### Viewer
+
+`viewer/` is a standalone browser player for one recorded replay. It is plain
+HTML and JavaScript with Three.js from a CDN — no build step, no package
+manager, and no dependency on the simulator. It reads poses off disk and never
+simulates; the genome in a replay file is metadata, not something it re-expresses.
+
+Serve the directory and open it (a `file://` URL will not work — browsers block
+ES module imports and `fetch` from it):
+
+```bash
+# Unix
+python3 -m http.server 8000 --directory viewer
+
+# Windows (PowerShell)
+python -m http.server 8000 --directory viewer
+```
+
+Then open <http://localhost:8000>. Click **Load sample** for the checked-in
+two-block generation-0 replay, or use the file picker — or drag and drop — to
+open any file from `runs/<run>/replays/`, such as a champion produced by
+`evo replay <run> --best --hz 60`.
+
+Orbit with the left mouse button, pan with the right, zoom with the wheel.
+Play/pause is the button or the space bar; the scrubber seeks by simulation
+time, interpolating between recorded frames. The dark part of the timeline is
+the settling drop before `measure_start_t`, where the controller is held off;
+the lit part is the measured window that fitness is computed over.
+
 ## Project Status
 
 **Milestone 1 complete: the pipeline works end to end and evolution demonstrably

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EvoForge replay viewer</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1d2027;
+    --panel-2: #262a33;
+    --line: #343945;
+    --fg: #e6e8ec;
+    --dim: #9aa1ad;
+    --accent: #6fb2ff;
+    --settle: #4a4f5c;
+    --measured: #2f6fb0;
+    --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  button, select, input[type=file] { font: inherit; }
+  button {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; border-color: var(--line); }
+  select {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 4px 6px;
+  }
+  label.check { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); cursor: pointer; }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header .title { font-weight: 600; letter-spacing: .2px; }
+  header .title span { color: var(--dim); font-weight: 400; }
+  header .spacer { flex: 1; }
+  #file { max-width: 230px; color: var(--dim); }
+
+  #stage { position: relative; flex: 1; min-height: 0; }
+  #canvas-host { position: absolute; inset: 0; }
+  #canvas-host canvas { display: block; }
+
+  #hud {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    background: rgba(29, 32, 39, .88);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 10px 12px;
+    min-width: 232px;
+    backdrop-filter: blur(3px);
+  }
+  #hud h2 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: var(--dim);
+    font-weight: 600;
+  }
+  #hud dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; }
+  #hud dt { color: var(--dim); }
+  #hud dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  #hud .warn { color: var(--bad); }
+
+  #error {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 70%;
+    background: #3a1e22;
+    border: 1px solid var(--bad);
+    color: #ffd9d9;
+    border-radius: 7px;
+    padding: 9px 14px;
+  }
+  #error[hidden] { display: none; }
+
+  #empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--dim);
+    text-align: center;
+    pointer-events: none;
+  }
+  #empty[hidden] { display: none; }
+
+  footer {
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    padding: 8px 12px 10px;
+  }
+  #track { position: relative; height: 6px; border-radius: 3px; overflow: hidden; background: var(--settle); margin-bottom: 4px; }
+  #track .measured { position: absolute; top: 0; bottom: 0; right: 0; background: var(--measured); }
+  #scrub { width: 100%; accent-color: var(--accent); margin: 0; }
+  #transport { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+  #readout { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #readout b { color: var(--fg); font-weight: 600; }
+  .legend { display: flex; align-items: center; gap: 10px; color: var(--dim); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title">EvoForge <span>replay viewer</span></div>
+  <input type="file" id="file" accept=".json,application/json">
+  <button id="load-sample">Load sample</button>
+  <div class="spacer"></div>
+  <label class="check"><input type="checkbox" id="follow"> follow root</label>
+  <label class="check"><input type="checkbox" id="loop"> loop</label>
+</header>
+
+<div id="stage">
+  <div id="canvas-host"></div>
+
+  <div id="hud" hidden>
+    <h2>Replay</h2>
+    <dl>
+      <dt>organism</dt><dd id="h-org">—</dd>
+      <dt>generation</dt><dd id="h-gen">—</dd>
+      <dt>fitness</dt><dd id="h-fit">—</dd>
+      <dt>displacement x</dt><dd id="h-dx">—</dd>
+      <dt>upright</dt><dd id="h-up">—</dd>
+      <dt>bodies</dt><dd id="h-bodies">—</dd>
+      <dt>record hz</dt><dd id="h-hz">—</dd>
+    </dl>
+    <div id="h-diverged" class="warn" hidden>solver diverged — metrics meaningless</div>
+  </div>
+
+  <div id="error" hidden></div>
+
+  <div id="empty">Load a replay JSON — file picker above, drag a file here,<br>or click <b>Load sample</b>.</div>
+</div>
+
+<footer>
+  <div id="track"><div class="measured" id="track-measured"></div></div>
+  <input type="range" id="scrub" min="0" max="1" step="0.001" value="0" disabled>
+  <div id="transport">
+    <button id="play" disabled>Play</button>
+    <button id="restart" disabled>Restart</button>
+    <select id="speed" disabled>
+      <option value="0.25">0.25×</option>
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select>
+    <div id="readout">no replay loaded</div>
+    <div class="spacer" style="flex:1"></div>
+    <div class="legend">
+      <span><i style="background:var(--settle)"></i>settle</span>
+      <span><i style="background:var(--measured)"></i>measured</span>
+    </div>
+  </div>
+</footer>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
