@@ -56,7 +56,10 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 /// * `3` — parts carry a shape. A `PartGene` gained `shape` and a `BodySpec`
 ///   gained the geometry itself; both default to a box on read, so v2 genomes
 ///   and replays still load and still mean what they meant.
-pub const ARTIFACT_FORMAT: u32 = 3;
+/// * `4` — joints can wear out and limbs can detach. A `Genome` gained
+///   `caution`, a `Trace` gained the breakages it saw, and both default to
+///   "nothing breaks" on read, so v3 artefacts still load unchanged.
+pub const ARTIFACT_FORMAT: u32 = 4;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

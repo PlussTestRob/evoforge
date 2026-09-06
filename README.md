@@ -424,6 +424,88 @@ results bit for bit. That is what lets `tests/golden.rs` keep the constants it
 was born with. Replays and stored genomes gain a `shape` field that defaults to
 `box` on read, so v2 artefacts still load and still mean what they meant.
 
+### Rewarding a jump
+
+Distance objectives have no opinion about the ground, and the cheapest way to
+travel is to stay on it. Two optional fitness terms ask for something else:
+
+* `air_bonus` — per second with **every attached part** clear of the ground.
+* `height_bonus` — per metre the centre of mass rises above where it started,
+  so being tall is worth nothing and only *gaining* height counts.
+
+Neither works alone. Hang time by itself rewards a long low skim; height by
+itself rewards rearing up without ever taking off. Together, with distance still
+the base objective, they ask for locomotion that leaves the ground.
+
+"Clear of the ground" means a real margin — `AIRBORNE_CLEARANCE`, two
+centimetres — not merely "no contact". A contact exists only once a point is
+*below* the terrain, so on the naive definition a body hovering a millimetre
+above it counts as flying. Asked for hang time that way, evolution needed forty
+generations to produce organisms spending half the trial "airborne" while never
+rising above the grass.
+
+```toml
+[fitness]
+objective = "distance_x"
+air_bonus = 3.0
+height_bonus = 8.0
+```
+
+`experiments/jumpers.toml` combines those with durable joints
+(`joint_endurance = 150`). A 430-generation run reached fitness 19.0 with a
+four-part organism that travels 9.5 m while making six distinct hops, 1.67 s of
+it airborne, peaking 17 cm off the ground. Both terms default to zero, so every
+experiment that predates them is unaffected.
+
+### Joints that wear out
+
+A joint's `motor_torque` has always been a gene: the most force that joint can
+deliver. With `body.joint_endurance` set, exceeding it finally costs something.
+
+While a motor is **saturated** — the controller asking for a speed the joint
+cannot reach at its torque — the joint loses health equal to the rotation it
+fell short by, in radians. A joint driven within its means is never harmed, so
+this is a charge for overreach rather than for being used. At zero health the
+joint fails: it stops constraining anything, and everything hanging below it
+falls away.
+
+Detached parts keep tumbling in the world but stop counting toward the centre of
+mass that fitness measures. Losing a limb costs you its usefulness, not a
+phantom position penalty from where the wreckage lands.
+
+The organism gets both halves of the trade-off:
+
+* **Sensing** — each slot gains a controller input carrying that joint's
+  remaining health, so a creature can feel a joint going and ease off it.
+* **Disposition** — a heritable `caution` gene in `[0, 1]` throttles how hard
+  every motor is driven. It is a standing bet, not a reaction: an organism
+  cannot know how long its trial will last, so whether to sprint and risk
+  tearing a joint or to pace itself has to be inherited rather than deduced.
+
+`Metrics` gains `joints_lost`, recorded for every organism, so breakage can be
+measured across a whole run without opening a replay.
+
+```toml
+[body]
+joint_endurance = 25.0   # radians of undelivered rotation a joint survives; 0 = off
+min_drive = 0.2          # however cautious it gets, it can still move this hard
+
+[mutation]
+caution_rate = 0.08
+caution_sigma = 0.12
+```
+
+`experiments/brittle-walkers.toml` is `shaped-walkers.toml` with exactly that
+added. Note that `joint_endurance = 25.0` is *aggressive*: a 120-generation run
+at that setting averaged 2.5 lost joints per organism, and only 3 of 48 recorded
+organisms finished intact. Raise it for a gentler world.
+
+The default is `joint_endurance = 0`, which disables wear entirely — and, as
+with shapes, disabling it is exact rather than approximate. No randomness is
+spent on the caution gene, and the controller keeps its original input count, so
+the weight vector stays the length it always was and every earlier result
+reproduces bit for bit.
+
 ### Viewer
 
 `viewer/` is a standalone browser player for one recorded replay. It is plain
@@ -446,6 +528,26 @@ Then open <http://localhost:8000>. Click **Load sample** for the checked-in
 two-block generation-0 replay, or use the file picker — or drag and drop — to
 open any file from `runs/<run>/replays/`, such as a champion produced by
 `evo replay <run> --best --hz 60`.
+
+**Browsing a whole run.** *Open run folder…* takes the run directory itself —
+the one holding `manifest.json` and `replays/` — and lists everything it
+recorded. Rows are sortable by fitness, distance, speed, path length, wander,
+seconds upright, mean height, actuation, distance-per-effort, joints lost,
+caution, part count, generation or id; groupable by generation, parent, shape
+mix, part count, or whether a joint failed; and there is a free-text filter that
+matches ids, generations, shapes, parents and `broke`. The preset chips — Best,
+Worst, Fastest, Most upright, Wanderers, Most efficient, Hardest working, Broke
+a joint, Most cautious, Latest — are shortcuts onto that same machinery, not a
+fixed menu: any combination of sort, grouping and filter is reachable directly.
+
+Only recorded organisms can be played. A run stores trajectories for the top few
+plus a random sample per recorded generation, so the worst organism overall
+usually has no replay — the list shows what is actually watchable.
+
+Opening a directory reads only each replay's header, stopping at the trajectory,
+so a few hundred replays cost a few megabytes of reads rather than tens. The
+poses are loaded only for the one being watched. Where a replay recorded a joint
+failing, the moment is marked in red on the timeline.
 
 Orbit with the left mouse button, pan with the right, zoom with the wheel.
 Play/pause is the button or the space bar; the scrubber seeks by simulation

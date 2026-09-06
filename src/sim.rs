@@ -24,6 +24,16 @@ use crate::phenotype::{self, BodySpec, Phenotype};
 /// Two out-of-phase triangle waves give the network a pacemaker to build a gait
 /// around, without having to evolve an oscillator from scratch first. Triangle
 /// rather than sine so it stays exact for arbitrarily long simulations.
+/// Clearance above the terrain, in metres, before an organism counts as
+/// airborne.
+///
+/// A contact only exists once a point is *below* the ground, so "touching
+/// nothing" also describes a body hovering imperceptibly above it. Asked for
+/// hang time on that basis, evolution produced organisms that spent half the
+/// trial airborne while never rising above the grass. A couple of centimetres
+/// of margin is the difference between leaving the ground and skimming it.
+const AIRBORNE_CLEARANCE: Real = 0.02;
+
 pub const CLOCK_HZ: Real = 1.0;
 
 /// One recorded instant: body poses at a point in time.
@@ -45,6 +55,21 @@ pub struct Trace {
     /// settling drop.
     pub measure_start_t: Real,
     pub frames: Vec<Frame>,
+    /// Joints that failed during the run, as `(body detached, time)`. Empty for
+    /// any experiment whose joints cannot break, and omitted from the JSON
+    /// entirely in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaks: Vec<JointBreak>,
+}
+
+/// A joint failing mid-run, recorded so a viewer can mark the moment a limb
+/// came off rather than leaving it to be inferred from the poses.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct JointBreak {
+    /// Index into `Trace::bodies` of the body that came loose.
+    pub body: u16,
+    /// Simulation time of the failure, on the same clock as `Frame::t`.
+    pub t: Real,
 }
 
 /// The outcome of one evaluation.
@@ -98,7 +123,16 @@ pub fn evaluate_with(
         measure_start_t: settle_steps as Real * dt,
         // Plus the closing frame and the measurement-boundary frame.
         frames: Vec::with_capacity((total_steps / record_interval) as usize + 2),
+        breaks: Vec::new(),
     });
+
+    // How hard this organism drives its motors. With joint damage off, caution is
+    // always 0 and drive is exactly 1, so nothing changes.
+    let drive = if cfg.joints_can_break() {
+        crate::math::clamp(1.0 - genome.caution, cfg.body.min_drive, 1.0)
+    } else {
+        1.0
+    };
 
     let mut metrics = Metrics::default();
     let mut previous_com = Vec3::ZERO;
@@ -127,7 +161,7 @@ pub fn evaluate_with(
 
         if should_apply_control(step, settle_steps, control_interval) {
             let measured_t = (step - settle_steps) as Real * dt;
-            apply_control(&mut pheno, &layout, &genome.weights, ws, measured_t);
+            apply_control(&mut pheno, &layout, &genome.weights, ws, measured_t, drive);
         }
 
         if let Some(tr) = trace.as_mut() {
@@ -160,13 +194,35 @@ pub fn evaluate_with(
             if up_y > 0.7 {
                 metrics.upright_seconds += dt;
             }
+
+            metrics.peak_height = metrics.peak_height.max(com.y);
+            // Airborne means the whole organism has cleared the ground by a real
+            // margin. Debris is excluded deliberately: a shed limb bouncing
+            // along is not the organism flying.
+            if pheno.world.ground_clearance() > AIRBORNE_CLEARANCE {
+                metrics.airborne_seconds += dt;
+            }
+
             measured_steps += 1;
         }
     }
 
+    metrics.joints_lost = pheno.world.breaks.len() as u32;
+
     if !metrics.diverged {
         if let Some(tr) = trace.as_mut() {
             tr.frames.push(capture_frame(&pheno, total_steps as Real * dt));
+            // The world reports breaks against joint indices; a viewer only knows
+            // bodies, and a joint's child body is what visibly comes off.
+            tr.breaks = pheno
+                .world
+                .breaks
+                .iter()
+                .map(|&(joint, t)| JointBreak {
+                    body: pheno.world.joints[joint as usize].body_b,
+                    t,
+                })
+                .collect();
         }
         // Guarded on measurement having begun at all: a configuration whose
         // `settle_time` rounds up to the whole evaluation never sets
@@ -198,6 +254,7 @@ fn apply_control(
     weights: &[Real],
     ws: &mut EvalWorkspace,
     t: Real,
+    drive: Real,
 ) {
     let s = &mut ws.scratch;
     s.clear_inputs();
@@ -226,12 +283,26 @@ fn apply_control(
         let base = layout.slot_input_base(slot as usize);
         s.inputs[base + 2] = if pheno.world.body_in_contact(b) { 1.0 } else { 0.0 };
     }
+    // The reactive half of the wear trade-off: an organism that can feel a joint
+    // failing can ease off it. Present only when the experiment lets joints
+    // break, because the input count sets the weight-vector length.
+    if layout.senses_health() {
+        for (j, &slot) in pheno.joint_slots.iter().enumerate() {
+            let base = layout.slot_input_base(slot as usize);
+            s.inputs[base + 3] = pheno.world.joints[j].health_fraction();
+        }
+    }
 
     brain::evaluate(layout, weights, s);
 
+    // `drive` is the standing half: how hard this organism is willing to push
+    // regardless of what it senses. Throttling the requested *speed* lowers the
+    // velocity error the motor has to close, so a cautious organism saturates
+    // its motors less often and wears its joints more slowly — at the cost of
+    // being slower.
     for (j, &slot) in pheno.joint_slots.iter().enumerate() {
         let joint = &mut pheno.world.joints[j];
-        joint.motor_target = s.outputs[slot as usize] * joint.motor_speed_max;
+        joint.motor_target = s.outputs[slot as usize] * joint.motor_speed_max * drive;
     }
 }
 

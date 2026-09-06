@@ -139,6 +139,15 @@ pub struct Joint {
     pub motor_torque_max: Real,
     /// Target angular velocity about the hinge axis, written by the controller.
     pub motor_target: Real,
+    /// Radians of undelivered rotation this joint can absorb before it fails.
+    /// Zero means the joint is indestructible, which is the behaviour every
+    /// experiment had before joints could break.
+    pub endurance: Real,
+    /// Remaining health, counting down from `endurance`.
+    pub health: Real,
+    /// Set once health reaches zero. A broken joint stops constraining anything,
+    /// so whatever hung from it falls away.
+    pub broken: bool,
 }
 
 impl Joint {
@@ -157,6 +166,20 @@ impl Joint {
             motor_speed_max: 0.0,
             motor_torque_max: 0.0,
             motor_target: 0.0,
+            endurance: 0.0,
+            health: 0.0,
+            broken: false,
+        }
+    }
+
+    /// Remaining health as a fraction of capacity: 1 is pristine, 0 is failed.
+    /// An indestructible joint always reports 1.
+    #[inline]
+    pub fn health_fraction(&self) -> Real {
+        if self.endurance > 0.0 {
+            clamp(self.health / self.endurance, 0.0, 1.0)
+        } else {
+            1.0
         }
     }
 }
@@ -208,9 +231,21 @@ pub struct World {
     inv_inertia: Vec<Mat3>,
     prep: Vec<JointPrep>,
     contacts: Vec<Contact>,
+    /// Whether each body has been cut loose from the root by a broken joint.
+    /// Detached bodies still fall, tumble and collide with the ground — they are
+    /// debris, not deletions — but they stop counting as part of the organism.
+    detached: Vec<bool>,
+    /// Joints that failed since the last time this was drained, with the time
+    /// each failed at, so a recording can note when a limb came off.
+    pub breaks: Vec<(u16, Real)>,
     /// Sum of `|motor angular impulse|` applied so far. A cheap, monotone proxy
     /// for actuation effort, used by energy-penalising fitness functions.
     pub actuation_impulse: Real,
+    /// Simulation time accumulated by `step`, used only to timestamp breakages.
+    elapsed: Real,
+    /// Accumulated bookkeeping shift to subtract from the reported centre of
+    /// mass. See [`World::centre_of_mass`].
+    com_correction: Vec3,
     /// Set once any body leaves the representable range; the evaluation is then
     /// abandoned rather than allowed to produce meaningless fitness.
     pub diverged: bool,
@@ -227,7 +262,11 @@ impl World {
             inv_inertia: vec![Mat3::ZERO; n],
             prep: vec![JointPrep::default(); j],
             contacts: Vec::with_capacity(n * 8),
+            detached: vec![false; n],
+            breaks: Vec::new(),
             actuation_impulse: 0.0,
+            elapsed: 0.0,
+            com_correction: Vec3::ZERO,
             diverged: false,
         }
     }
@@ -248,14 +287,113 @@ impl World {
         }
 
         self.integrate_positions(dt);
+        self.wear_joints(dt);
         self.check_finite();
     }
 
+    /// Charge each saturated motor for the rotation it failed to deliver.
+    ///
+    /// A joint is only harmed while its motor is at the torque ceiling its
+    /// genome set — that is exactly the state of being asked for more than it
+    /// can give. The damage is the shortfall in the rotation actually achieved,
+    /// in radians, which makes endurance a quantity with a physical meaning
+    /// rather than an arbitrary point score, and makes it independent of the
+    /// solver's iteration count.
+    fn wear_joints(&mut self, dt: Real) {
+        for i in 0..self.joints.len() {
+            let j = self.joints[i];
+            if j.broken || j.endurance <= 0.0 || j.motor_torque_max <= 0.0 {
+                continue;
+            }
+            // Saturated means the accumulated motor impulse hit its budget.
+            let budget = j.motor_torque_max * dt;
+            if self.prep[i].motor_impulse.abs() < budget * 0.999 {
+                continue;
+            }
+            let target = clamp(j.motor_target, -j.motor_speed_max, j.motor_speed_max);
+            let axis = self.prep[i].axis_w;
+            let achieved = (self.bodies[j.body_b as usize].ang_vel
+                - self.bodies[j.body_a as usize].ang_vel)
+                .dot(axis);
+            let shortfall = (target - achieved).abs();
+            if shortfall <= 0.0 {
+                continue;
+            }
+            let joint = &mut self.joints[i];
+            joint.health -= shortfall * dt;
+            if joint.health <= 0.0 {
+                joint.health = 0.0;
+                joint.broken = true;
+                self.breaks.push((i as u16, self.elapsed));
+                // Take the shift this detachment causes and cancel it, so
+                // shedding a limb neither teleports the organism forward nor
+                // drags it back.
+                let before = self.attached_centre_of_mass();
+                self.refresh_detached();
+                let after = self.attached_centre_of_mass();
+                self.com_correction += after - before;
+            }
+        }
+        self.elapsed += dt;
+    }
+
+    /// Recompute which bodies are still connected to the root.
+    ///
+    /// Relies on the invariant [`crate::phenotype::build`] maintains: joints are
+    /// stored parent-before-child, so one forward pass propagates a break down
+    /// the whole subtree hanging off it.
+    fn refresh_detached(&mut self) {
+        for d in self.detached.iter_mut() {
+            *d = false;
+        }
+        for j in &self.joints {
+            let cut = j.broken || self.detached[j.body_a as usize];
+            if cut {
+                self.detached[j.body_b as usize] = true;
+            }
+        }
+    }
+
+    /// Whether `body` is still part of the organism rather than debris.
+    #[inline]
+    pub fn is_attached(&self, body: usize) -> bool {
+        !self.detached[body]
+    }
+
     /// Centre of mass of the whole organism.
+    /// Centre of mass of the organism, counting only what is still attached.
+    ///
+    /// A shed limb keeps falling and tumbling in the world, but it stops being
+    /// part of *you*: fitness should charge an organism for losing a limb's
+    /// usefulness, not for where the wreckage happens to land.
+    ///
+    /// # Why the correction
+    ///
+    /// Dropping a body out of an average moves that average, instantly and for
+    /// free. Shed a limb that trails behind you and the mean of what is left
+    /// lurches forward — displacement the organism never travelled. Measured on
+    /// a real run, most organisms lost a little distance this way and a few
+    /// gained a great deal: one collected 3.34 m, a third of its recorded
+    /// distance, by discarding a part at the right moment.
+    ///
+    /// So the discontinuity is cancelled. At the instant a joint fails the shift
+    /// is measured and folded into `com_correction`, which every later reading
+    /// subtracts. The reported centre of mass is therefore continuous across a
+    /// breakage while still tracking only the attached parts afterwards — the
+    /// wreckage stops counting, but detaching it is worth exactly zero metres.
     pub fn centre_of_mass(&self) -> Vec3 {
+        self.attached_centre_of_mass() - self.com_correction
+    }
+
+    /// The raw mean position of everything still attached, before the
+    /// continuity correction. This is the quantity that jumps.
+    fn attached_centre_of_mass(&self) -> Vec3 {
         let mut total = 0.0;
         let mut acc = Vec3::ZERO;
-        for b in &self.bodies {
+        for (i, b) in self.bodies.iter().enumerate() {
+            if self.detached[i] {
+                continue;
+            }
             let m = b.mass();
             total += m;
             acc += b.pos * m;
@@ -280,6 +418,34 @@ impl World {
         let ra = project_out(a.orient.rotate(j.ref_a), axis).normalize_or(axis.any_perpendicular());
         let rb = project_out(b.orient.rotate(j.ref_b), axis).normalize_or(ra);
         (clamp(ra.dot(rb), -1.0, 1.0), ra.cross(rb).dot(axis))
+    }
+
+    /// Smallest gap between any still-attached part and the terrain below it.
+    ///
+    /// Negative while something is penetrating, zero while resting, positive
+    /// only when the whole organism is genuinely off the ground.
+    ///
+    /// This exists because "is anything in contact?" is not the same question.
+    /// A contact is only generated once a point is *below* the terrain, so a
+    /// body skimming a millimetre above it registers no contact at all. Asked
+    /// for hang time on that basis, evolution promptly produced organisms that
+    /// spent half the trial "airborne" while never rising above the grass.
+    pub fn ground_clearance(&self) -> Real {
+        let mut gap = Real::INFINITY;
+        for (i, body) in self.bodies.iter().enumerate() {
+            if self.detached[i] {
+                continue;
+            }
+            let (points, count) = body.ground_points(Vec3::Y);
+            for p in &points[..count] {
+                gap = gap.min(p.y - self.params.terrain.height_at(p.x, p.z));
+            }
+        }
+        if gap.is_finite() {
+            gap
+        } else {
+            0.0
+        }
     }
 
     /// Whether any corner of `body` is touching the terrain.
@@ -478,6 +644,9 @@ impl World {
 
         for i in 0..self.joints.len() {
             let j = self.joints[i];
+            if j.broken {
+                continue;
+            }
             let p = self.prep[i];
             let ia = j.body_a as usize;
             let ib = j.body_b as usize;
@@ -747,6 +916,9 @@ mod tests {
             motor_speed_max: 4.0,
             motor_torque_max: torque,
             motor_target: 0.0,
+            endurance: 0.0,
+            health: 0.0,
+            broken: false,
         };
         let mut p = flat_params();
         p.gravity = Vec3::ZERO; // isolate joint behaviour from falling
@@ -768,6 +940,186 @@ mod tests {
         let anchor_a = w.bodies[0].pos + w.bodies[0].orient.rotate(vec3(0.2, 0.0, 0.0));
         let anchor_b = w.bodies[1].pos + w.bodies[1].orient.rotate(vec3(-0.2, 0.0, 0.0));
         assert!((anchor_a - anchor_b).length() < 0.02);
+    }
+
+    /// A velocity-target motor has to brake as well as drive.
+    ///
+    /// This exists because an evolved organism was found riding a wheel that
+    /// turned at 9.8 rad/s across a joint whose motor was capped at 6.0 — which
+    /// is legitimate only if the *ground* is spinning the wheel and the motor is
+    /// merely losing the argument. If instead the motor were one-directional,
+    /// any joint could be spun up for free and every fast organism in the
+    /// repository would be an artefact. With no contacts and no gravity there is
+    /// nothing to sustain the overspeed, so the motor must pull it back to
+    /// target on its own.
+    #[test]
+    fn a_hinge_motor_brakes_a_joint_spun_past_its_target() {
+        let mut w = hinge_pair(-1.0, 200.0);
+        w.joints[0].motor_target = 2.0;
+
+        // Spin the child far beyond what the motor would ever drive.
+        let overspeed = 20.0;
+        w.bodies[1].ang_vel = Vec3::Z * overspeed;
+
+        let dt = 1.0 / 240.0;
+        for _ in 0..480 {
+            w.step(dt);
+        }
+        assert!(!w.diverged);
+
+        let rel = (w.bodies[1].ang_vel - w.bodies[0].ang_vel).dot(Vec3::Z);
+        assert!(
+            rel < 2.5,
+            "motor did not brake an overspeeding joint: {rel} rad/s against a target of 2.0"
+        );
+        // And it brakes *to* the target rather than through it to a standstill.
+        assert!(rel > 1.5, "motor overshot its target and stalled the joint: {rel} rad/s");
+    }
+
+    /// The other half: a motor may not drive a free joint past its own cap, so
+    /// the speed limit means something in the absence of outside help.
+    #[test]
+    fn a_hinge_motor_does_not_exceed_its_speed_cap() {
+        let mut w = hinge_pair(-1.0, 200.0);
+        // `motor_speed_max` is 4.0 in the fixture; ask for far more.
+        w.joints[0].motor_target = 50.0;
+        let dt = 1.0 / 240.0;
+        for _ in 0..480 {
+            w.step(dt);
+        }
+        assert!(!w.diverged);
+        let rel = (w.bodies[1].ang_vel - w.bodies[0].ang_vel).dot(Vec3::Z);
+        assert!(rel <= 4.5, "motor drove past its own speed cap: {rel} rad/s against 4.0");
+    }
+
+    /// A motor asked for more than its torque can deliver wears its joint out,
+    /// and when the joint fails the limb stops being part of the organism.
+    #[test]
+    fn an_overworked_joint_breaks_and_sheds_its_limb() {
+        let mut w = hinge_pair(-1.0, 0.5); // a very weak motor
+        w.joints[0].endurance = 1.0;
+        w.joints[0].health = 1.0;
+        w.joints[0].motor_target = 4.0; // far beyond what 0.5 N m can achieve
+        assert!(w.is_attached(1));
+
+        let dt = 1.0 / 240.0;
+        for _ in 0..240 {
+            w.step(dt);
+        }
+        assert!(!w.diverged);
+        assert!(w.joints[0].broken, "joint survived with health {}", w.joints[0].health);
+        assert!(!w.is_attached(1), "the limb is still counted as part of the organism");
+        assert_eq!(w.breaks.len(), 1);
+
+        // Fitness measures only what is still attached, so where the wreckage
+        // goes is no longer any of its business. (The reported centre of mass is
+        // not the root's raw position: the shift caused by dropping the limb out
+        // of the average is deliberately cancelled — see `centre_of_mass`.)
+        let before = w.centre_of_mass();
+        w.bodies[1].pos = vec3(500.0, -400.0, 300.0);
+        let after = w.centre_of_mass();
+        assert!(
+            (after - before).length() < 1e-5,
+            "debris still moves the organism's measured position: {before:?} -> {after:?}"
+        );
+    }
+
+    /// The same joint, driven just as hard, is indestructible when the
+    /// experiment has not enabled wear. This is the switch every other
+    /// experiment in the repository is sitting on.
+    #[test]
+    fn a_joint_with_no_endurance_never_wears_out() {
+        let mut w = hinge_pair(-1.0, 0.5);
+        w.joints[0].motor_target = 4.0;
+        let dt = 1.0 / 240.0;
+        for _ in 0..480 {
+            w.step(dt);
+        }
+        assert!(!w.joints[0].broken);
+        assert!(w.is_attached(1));
+        assert!(w.breaks.is_empty());
+    }
+
+    /// A motor working within its means costs its joint nothing, so wear is a
+    /// charge for overreach rather than for being used at all.
+    #[test]
+    fn a_joint_driven_within_its_torque_takes_no_damage() {
+        let mut w = hinge_pair(-1.0, 400.0); // plenty of torque
+        w.joints[0].endurance = 1.0;
+        w.joints[0].health = 1.0;
+        w.joints[0].motor_target = 1.0;
+        let dt = 1.0 / 240.0;
+        for _ in 0..480 {
+            w.step(dt);
+        }
+        assert!(!w.joints[0].broken);
+        assert!(
+            w.joints[0].health > 0.99,
+            "an unstressed joint lost health: {}",
+            w.joints[0].health
+        );
+    }
+
+    /// Shedding a limb must be worth exactly zero metres.
+    ///
+    /// Dropping a body out of an average moves that average for free, and
+    /// `distance_x` is measured from that average. Without the correction in
+    /// [`World::centre_of_mass`] an organism could collect real fitness by
+    /// discarding a trailing part — which is what a run measured before this
+    /// test existed actually did, to the tune of a third of one organism's
+    /// recorded distance.
+    #[test]
+    fn detaching_a_limb_does_not_move_the_measured_centre_of_mass() {
+        let mut w = hinge_pair(-1.0, 0.5);
+        // Put the limb well to one side, so dropping it would shift the mean a
+        // long way if the shift were not cancelled.
+        w.bodies[1].pos = vec3(4.0, 3.0, 0.0);
+        w.joints[0].endurance = 1.0;
+        w.joints[0].health = 1.0;
+        w.joints[0].motor_target = 4.0;
+
+        let dt = 1.0 / 240.0;
+        let mut previous = w.centre_of_mass();
+        let mut worst_step = 0.0;
+        let mut broke = false;
+        for _ in 0..240 {
+            w.step(dt);
+            let com = w.centre_of_mass();
+            worst_step = (com - previous).length().max(worst_step);
+            previous = com;
+            broke |= w.joints[0].broken;
+        }
+        assert!(broke, "the joint never failed, so nothing was tested");
+        // Bodies move a little each step under their own momentum; a teleport
+        // would be an order of magnitude larger than that.
+        assert!(
+            worst_step < 0.05,
+            "the centre of mass jumped {worst_step} m in one step when the limb came off"
+        );
+    }
+
+    /// Breaking one joint has to cut loose everything hanging below it, not just
+    /// the body immediately attached.
+    #[test]
+    fn breaking_a_joint_detaches_the_whole_subtree() {
+        let mut w = hinge_pair(-1.0, 0.5);
+        // Extend the chain: a third body welded to the second.
+        let c = RigidBody::box_body(vec3(0.8, 3.0, 0.0), vec3(0.2, 0.2, 0.2), 250.0);
+        w.bodies.push(c);
+        w.joints.push(Joint::fixed(1, 2, vec3(0.2, 0.0, 0.0), vec3(-0.2, 0.0, 0.0)));
+        let mut rebuilt = World::new(w.bodies.clone(), w.joints.clone(), w.params);
+        rebuilt.joints[0].endurance = 1.0;
+        rebuilt.joints[0].health = 1.0;
+        rebuilt.joints[0].motor_target = 4.0;
+
+        let dt = 1.0 / 240.0;
+        for _ in 0..240 {
+            rebuilt.step(dt);
+        }
+        assert!(rebuilt.joints[0].broken);
+        assert!(!rebuilt.is_attached(1), "the limb is still attached");
+        assert!(!rebuilt.is_attached(2), "the limb's own child is still attached");
+        assert!(rebuilt.is_attached(0), "the root can never detach");
     }
 
     #[test]

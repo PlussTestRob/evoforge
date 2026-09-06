@@ -1,0 +1,115 @@
+# Jumpers: shaped bodies with durable joints, rewarded for leaving the ground.
+#
+# Two changes from brittle-walkers.
+#
+# Joints are far tougher. At joint_endurance = 25 almost nothing survived a
+# trial intact and evolution drove `caution` to zero, because there was no
+# viable careful strategy on offer — breaking things was simply the price of
+# moving. Durable joints put the trade-off back in play.
+#
+# And leaving the ground is worth something. `air_bonus` pays per second with
+# no attached part touching the ground; `height_bonus` pays per metre the
+# centre of mass rises above where it started. Neither alone asks for a jump:
+# hang time by itself rewards a long low skim, and height by itself rewards
+# rearing up without ever taking off. Together, with distance still the base
+# objective, they ask for locomotion that leaves the ground.
+
+[experiment]
+name = "jumpers"
+seed = 20260905
+output_dir = "runs"
+
+[evolution]
+population_size = 100
+generations = 100
+elite_count = 2
+tournament_size = 4
+crossover_rate = 0.7
+immigrant_rate = 0.02
+
+[body]
+min_parts = 2
+max_parts = 6
+min_half_extent = 0.08
+max_half_extent = 0.35
+density = 250.0
+min_joint_limit = 0.3
+max_joint_limit = 1.4
+max_motor_speed = 6.0
+max_motor_torque = 120.0
+hinge_probability = 0.85
+# Anything but a single "box" entry opts the experiment into shapes, which
+# changes the random stream and so the results. A one-entry list spends no
+# randomness choosing, and reproduces a pre-shapes run exactly.
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+# Cross-section of a taper's far end, as a fraction of its base.
+taper_top_scale = 0.45
+# Radians of undelivered rotation a joint survives. 0 disables wear entirely,
+# which is the default and what every other experiment here uses.
+joint_endurance = 150.0
+# However cautious an organism becomes, it can still drive motors this hard.
+min_drive = 0.2
+
+[brain]
+hidden = 10
+init_sigma = 0.8
+weight_limit = 8.0
+
+[mutation]
+weight_rate = 0.08
+weight_sigma = 0.25
+weight_reset_rate = 0.05
+size_rate = 0.05
+size_sigma = 0.05
+attach_rate = 0.05
+attach_sigma = 0.15
+joint_limit_rate = 0.05
+joint_limit_sigma = 0.2
+joint_kind_rate = 0.02
+joint_axis_rate = 0.03
+motor_rate = 0.05
+motor_sigma = 0.15
+# Per part, per generation: how often a part is recarved as another shape.
+shape_rate = 0.04
+# Per genome: how often the caution disposition is nudged, and by how much.
+caution_rate = 0.08
+caution_sigma = 0.12
+add_part_rate = 0.06
+remove_part_rate = 0.05
+
+[simulation]
+duration = 8.0
+control_hz = 20.0
+solver_iterations = 10
+settle_time = 0.5
+
+[environment]
+terrain = "flat"
+gravity = 9.81
+friction = 0.8
+restitution = 0.0
+linear_damping = 0.02
+angular_damping = 0.05
+
+[fitness]
+objective = "distance_x"
+energy_penalty = 0.0
+upright_bonus = 0.15
+# Per second airborne, and per metre of height gained.
+air_bonus = 3.0
+height_bonus = 8.0
+
+[recording]
+# This experiment exists to be looked at, so it records a wider slice than the
+# others: three random samples per recorded generation rather than one, so the
+# browsable set spans the whole population rather than just its champions.
+# Recording settings do not affect the trajectory of evolution.
+top_n = 4
+random_samples = 3
+record_hz = 30.0
+every_generations = 10
+store_genomes = true
+
+[checkpoint]
+every_generations = 25
+on_finish = true

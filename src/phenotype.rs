@@ -237,6 +237,17 @@ pub fn build(genome: &Genome, cfg: &Config) -> Phenotype {
                 JointKind::Fixed => 0.0,
             },
             motor_target: 0.0,
+            // A fixed weld has no motor, so nothing can overwork it and it never
+            // wears out. Only driven joints can be asked for more than they have.
+            endurance: match part.joint.kind {
+                JointKind::Hinge => cfg.body.joint_endurance,
+                JointKind::Fixed => 0.0,
+            },
+            health: match part.joint.kind {
+                JointKind::Hinge => cfg.body.joint_endurance,
+                JointKind::Fixed => 0.0,
+            },
+            broken: false,
         });
         joint_slots.push(part.slot);
     }

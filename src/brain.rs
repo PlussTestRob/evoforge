@@ -24,9 +24,18 @@ use crate::math::{tanh_approx, Real};
 /// than an individual slot.
 pub const GLOBAL_INPUTS: usize = 9;
 
-/// Number of inputs contributed by each slot: joint angle as a (cos, sin) pair
-/// plus a ground-contact flag.
+/// Inputs contributed by each slot when joints cannot be damaged: joint angle as
+/// a (cos, sin) pair plus a ground-contact flag.
 pub const INPUTS_PER_SLOT: usize = 3;
+
+/// Inputs per slot when joint health is enabled: the three above plus the
+/// joint's remaining health.
+///
+/// This is a separate constant rather than an unconditional fourth input
+/// because the input count sets the weight-vector length, which sets how much
+/// randomness a genome consumes. An experiment that has not enabled joint health
+/// keeps [`INPUTS_PER_SLOT`] and therefore keeps every result it ever produced.
+pub const INPUTS_PER_SLOT_WITH_HEALTH: usize = 4;
 
 /// Fixed shape of every controller in an experiment.
 ///
@@ -38,17 +47,31 @@ pub const INPUTS_PER_SLOT: usize = 3;
 pub struct BrainLayout {
     pub max_slots: usize,
     pub hidden: usize,
+    /// Inputs each slot contributes: [`INPUTS_PER_SLOT`], or
+    /// [`INPUTS_PER_SLOT_WITH_HEALTH`] when the experiment lets joints break.
+    pub slot_inputs: usize,
 }
 
 impl BrainLayout {
     pub fn new(max_slots: usize, hidden: usize) -> BrainLayout {
+        BrainLayout::with_health(max_slots, hidden, false)
+    }
+
+    pub fn with_health(max_slots: usize, hidden: usize, health: bool) -> BrainLayout {
         assert!(max_slots > 0 && hidden > 0);
-        BrainLayout { max_slots, hidden }
+        let slot_inputs = if health { INPUTS_PER_SLOT_WITH_HEALTH } else { INPUTS_PER_SLOT };
+        BrainLayout { max_slots, hidden, slot_inputs }
+    }
+
+    /// Whether this layout carries a health input for each slot.
+    #[inline]
+    pub fn senses_health(&self) -> bool {
+        self.slot_inputs >= INPUTS_PER_SLOT_WITH_HEALTH
     }
 
     #[inline]
     pub fn inputs(&self) -> usize {
-        GLOBAL_INPUTS + INPUTS_PER_SLOT * self.max_slots
+        GLOBAL_INPUTS + self.slot_inputs * self.max_slots
     }
 
     #[inline]
@@ -67,7 +90,7 @@ impl BrainLayout {
     /// Index of the first slot-local input for `slot`.
     #[inline]
     pub fn slot_input_base(&self, slot: usize) -> usize {
-        GLOBAL_INPUTS + slot * INPUTS_PER_SLOT
+        GLOBAL_INPUTS + slot * self.slot_inputs
     }
 }
 

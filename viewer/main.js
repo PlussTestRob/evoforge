@@ -10,6 +10,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { initLibrary } from './library.js';
 
 const POSE_STRIDE = 7;
 
@@ -25,6 +26,8 @@ const ui = {
   host: el('canvas-host'), hud: el('hud'), error: el('error'), empty: el('empty'),
   scrub: el('scrub'), track: el('track-measured'), play: el('play'),
   restart: el('restart'), speed: el('speed'), readout: el('readout'),
+  openRun: el('open-run'), folder: el('folder'), toggleLib: el('toggle-library'),
+  library: el('library'), trackEl: el('track'),
 };
 
 // ---------------------------------------------------------------- scene setup
@@ -256,6 +259,9 @@ function fillHud(r) {
     .map(([kind, n]) => `${n} ${kind}`)
     .join(', ');
   el('h-hz').textContent = num(r.trace.record_hz, 0);
+  const breaks = (r.trace.breaks || []).length;
+  el('h-breaks').textContent = breaks ? `${breaks}` : 'none';
+  el('h-breaks').className = breaks ? 'warn' : '';
   el('h-diverged').hidden = !m.diverged;
   ui.hud.hidden = false;
 }
@@ -279,16 +285,33 @@ function load(json, sourceName) {
 
   // Shade the measured span of the timeline; everything before measure_start_t
   // is the settling drop, where the controller is held off.
-  const span = Math.max(t1 - t0, 1e-6);
+  const span = Math.max(t1 - t0, 1e-6);  // also used to place the break marks
   const ms = typeof json.trace.measure_start_t === 'number' ? json.trace.measure_start_t : t0;
   const measuredPct = 100 * (1 - Math.min(Math.max((ms - t0) / span, 0), 1));
   ui.track.style.width = `${measuredPct}%`;
+
+  // Mark on the timeline the moment each limb came off.
+  for (const mark of [...ui.trackEl.querySelectorAll('.brk')]) mark.remove();
+  for (const b of json.trace.breaks || []) {
+    const mark = document.createElement('div');
+    mark.className = 'brk';
+    mark.title = `joint failed at ${b.t.toFixed(2)} s`;
+    mark.style.cssText =
+      `position:absolute;top:0;bottom:0;width:2px;background:var(--bad);` +
+      `left:${(100 * (b.t - t0)) / span}%`;
+    ui.trackEl.appendChild(mark);
+  }
 
   ui.scrub.min = t0;
   ui.scrub.max = t1;
   ui.scrub.step = Math.min(1 / (json.trace.record_hz || 60) / 4, 0.005);
   for (const c of [ui.scrub, ui.play, ui.restart, ui.speed]) c.disabled = false;
   ui.empty.hidden = true;
+
+  if (selecting && selecting.id === json.organism_id) {
+    library.setActive(json.organism_id);
+  }
+  selecting = null;
 
   simTime = t0;
   setPlaying(false);
@@ -417,6 +440,47 @@ function readFile(file) {
   };
   reader.readAsText(file);
 }
+
+// ---------------------------------------------------------------- run library
+
+const library = initLibrary({
+  onSelect(entry) {
+    selecting = entry;
+    readFile(entry.file);
+  },
+});
+let selecting = null;
+
+ui.openRun.addEventListener('click', () => ui.folder.click());
+
+ui.folder.addEventListener('change', async (e) => {
+  const files = e.target.files;
+  if (!files || !files.length) return;
+  ui.library.hidden = false;
+  ui.toggleLib.hidden = false;
+  ui.toggleLib.textContent = 'Hide list';
+  el('lib-title').textContent = 'Reading…';
+  el('lib-sub').textContent = '';
+  clearError();
+  const n = await library.open(files, (done, total) => {
+    el('lib-sub').textContent = `reading replay headers ${done} / ${total}`;
+  });
+  if (!n) {
+    showError(
+      'No replays in that folder. Choose the run directory itself — the one ' +
+      'containing manifest.json and a replays/ subfolder.',
+    );
+  }
+  resize();
+  // Let the picker fire again for the same folder.
+  e.target.value = '';
+});
+
+ui.toggleLib.addEventListener('click', () => {
+  ui.library.hidden = !ui.library.hidden;
+  ui.toggleLib.textContent = ui.library.hidden ? 'Show list' : 'Hide list';
+  resize();
+});
 
 ui.file.addEventListener('change', (e) => {
   const f = e.target.files && e.target.files[0];

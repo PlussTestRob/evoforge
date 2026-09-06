@@ -49,6 +49,24 @@ pub struct Metrics {
     /// Measured window length, seconds.
     pub duration: Real,
     pub steps: u32,
+    /// Highest the centre of mass reached during the measured window, absolute.
+    /// Compare against `start.y` to get height gained.
+    #[serde(default)]
+    pub peak_height: Real,
+    /// Seconds with no attached part touching the ground: hang time.
+    ///
+    /// Measured over attached parts only, so shedding a limb and watching it
+    /// bounce away does not read as flight.
+    #[serde(default)]
+    pub airborne_seconds: Real,
+    /// Joints that wore out and let a limb detach during the run.
+    ///
+    /// An outcome, not a rendering detail: this is recorded for *every*
+    /// organism, so how often bodies tear themselves apart can be measured
+    /// across a whole run without opening a single replay. Always zero for an
+    /// experiment whose joints cannot break.
+    #[serde(default)]
+    pub joints_lost: u32,
     /// The solver gave up on this organism. Its metrics are meaningless.
     pub diverged: bool,
 }
@@ -80,7 +98,12 @@ pub fn score(cfg: &FitnessCfg, m: &Metrics) -> Real {
         Objective::DistanceX => m.displacement_x,
         Objective::Speed => m.mean_speed(),
     };
+    // Height is measured from where the organism started rather than from the
+    // ground, so simply being tall is worth nothing — only *gaining* height is.
+    let climbed = (m.peak_height - m.start.y).max(0.0);
     base + cfg.upright_bonus * m.upright_seconds - cfg.energy_penalty * m.actuation
+        + cfg.air_bonus * m.airborne_seconds
+        + cfg.height_bonus * climbed
 }
 
 #[cfg(test)]
@@ -101,8 +124,42 @@ mod tests {
             actuation: 100.0,
             duration: 10.0,
             steps: 1200,
+            peak_height: 0.0,
+            airborne_seconds: 0.0,
+            joints_lost: 0,
             diverged: false,
         }
+    }
+
+    /// Height is scored from where the organism started, so a tall organism
+    /// that never leaves the ground earns nothing for its stature.
+    #[test]
+    fn only_height_actually_gained_is_rewarded() {
+        let cfg = FitnessCfg { height_bonus: 10.0, ..Default::default() };
+        let mut m = metrics();
+        m.start = vec3(0.0, 0.9, 0.0); // starts tall
+        m.peak_height = 0.9; // and never rises
+        let flat = score(&cfg, &m);
+        m.peak_height = 1.4; // now it jumps half a metre
+        assert!(
+            (score(&cfg, &m) - flat - 5.0).abs() < 1e-4,
+            "half a metre gained should be worth height_bonus/2"
+        );
+
+        // Sinking below the starting height is worth zero, not a penalty: the
+        // objective already charges for going nowhere.
+        m.peak_height = 0.2;
+        assert!((score(&cfg, &m) - flat).abs() < 1e-4);
+    }
+
+    #[test]
+    fn hang_time_is_rewarded_per_second() {
+        let cfg = FitnessCfg { air_bonus: 2.0, ..Default::default() };
+        let mut m = metrics();
+        m.airborne_seconds = 0.0;
+        let grounded = score(&cfg, &m);
+        m.airborne_seconds = 1.5;
+        assert!((score(&cfg, &m) - grounded - 3.0).abs() < 1e-4);
     }
 
     #[test]
@@ -118,8 +175,12 @@ mod tests {
     #[test]
     fn penalties_and_bonuses_apply() {
         let m = metrics();
-        let cfg =
-            FitnessCfg { objective: Objective::Distance, energy_penalty: 0.01, upright_bonus: 0.5 };
+        let cfg = FitnessCfg {
+            objective: Objective::Distance,
+            energy_penalty: 0.01,
+            upright_bonus: 0.5,
+            ..Default::default()
+        };
         // 5 + 0.5*6 - 0.01*100
         assert!((score(&cfg, &m) - 7.0).abs() < 1e-5);
     }

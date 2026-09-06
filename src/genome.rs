@@ -147,6 +147,17 @@ pub struct Genome {
     /// Controller parameters, laid out by [`BrainLayout`]. Fixed length for a
     /// given experiment, which is what makes crossover a simple aligned choice.
     pub weights: Vec<Real>,
+    /// How hard this organism is willing to drive its motors, in `[0, 1]`, where
+    /// 0 is reckless and 1 is maximally restrained.
+    ///
+    /// Only consulted when joints can break. It is a standing disposition rather
+    /// than a reaction, which is the point: an organism does not know how long
+    /// its trial will last, so whether to sprint and risk tearing a joint or to
+    /// pace itself has to be a heritable bet rather than something it can work
+    /// out from what it senses. The per-joint health input is the reactive half
+    /// of the same trade.
+    #[serde(default)]
+    pub caution: Real,
 }
 
 impl Genome {
@@ -181,7 +192,7 @@ impl Genome {
             })
             .collect();
 
-        Genome { parts, weights }
+        Genome { parts, weights, caution: random_caution(rng, limits) }
     }
 
     #[inline]
@@ -295,6 +306,17 @@ impl Genome {
 /// shapes has to produce exactly the random stream it produced before shapes
 /// existed, or every result recorded before this feature becomes unreproducible
 /// and the constants in `tests/golden.rs` become lies.
+/// Draw a caution disposition, but only for an experiment whose joints can
+/// break. Same discipline as [`random_shape`]: a feature that is switched off
+/// must not move the random stream.
+fn random_caution(rng: &mut Rng, limits: &BodyLimits) -> Real {
+    if limits.joint_endurance > 0.0 {
+        rng.unit()
+    } else {
+        0.0
+    }
+}
+
 fn random_shape(rng: &mut Rng, limits: &BodyLimits) -> ShapeKind {
     match limits.shapes.len() {
         0 => ShapeKind::Box,
@@ -337,6 +359,10 @@ pub fn mutate(
             }
             *w = clamp(*w, -brain.weight_limit, brain.weight_limit);
         }
+    }
+
+    if limits.joint_endurance > 0.0 && rng.chance(params.caution_rate) {
+        genome.caution = clamp(genome.caution + rng.normal_scaled(params.caution_sigma), 0.0, 1.0);
     }
 
     // Morphology.
@@ -489,6 +515,13 @@ pub fn crossover(primary: &Genome, secondary: &Genome, rng: &mut Rng) -> Genome 
         }
     }
 
+    // Same guard as everywhere else: with joint damage off both parents carry
+    // exactly 0.0, so no draw is spent and the stream is unchanged. With it on,
+    // caution recombines by the same uniform coin flip as every other gene.
+    if (primary.caution != 0.0 || secondary.caution != 0.0) && rng.chance(0.5) {
+        child.caution = secondary.caution;
+    }
+
     debug_assert_eq!(child.weights.len(), secondary.weights.len());
     for (w, &o) in child.weights.iter_mut().zip(secondary.weights.iter()) {
         if rng.chance(0.5) {
@@ -547,6 +580,42 @@ mod tests {
             seen.extend(g.parts.iter().map(|p| p.shape));
         }
         assert_eq!(seen.len(), 4, "not every offered shape was ever drawn: {seen:?}");
+    }
+
+    /// The same compatibility invariant as for shapes, for the caution gene and
+    /// the health input: with joint damage off, not one random number is spent
+    /// on either, and the weight vector is the length it always was.
+    #[test]
+    fn joint_damage_off_spends_no_randomness_and_keeps_the_brain_layout() {
+        let plain = Config::default();
+        let mut healthy = Config::default();
+        healthy.body.joint_endurance = 12.0;
+        assert!(!plain.joints_can_break() && healthy.joints_can_break());
+
+        let a = plain.brain_layout();
+        let b = healthy.brain_layout();
+        assert!(!a.senses_health() && b.senses_health());
+        assert!(b.weight_count() > a.weight_count(), "enabling health should widen the controller");
+
+        // Two genomes drawn from the same seed under the plain config: identical,
+        // and the stream is left in the same place.
+        let mut r1 = Rng::new(4242);
+        let g1 = Genome::random(&mut r1, &plain.body, &plain.brain, &a);
+        assert_eq!(g1.caution, 0.0);
+        assert_eq!(g1.weights.len(), a.weight_count());
+
+        let mut g2 = g1.clone();
+        mutate(&mut g2, &mut r1, &plain.mutation, &plain.body, &plain.brain, &a);
+        assert_eq!(g2.caution, 0.0, "caution drifted in an experiment that has no wear");
+
+        // And with it on, caution is a real, varying trait.
+        let mut seen = Vec::new();
+        for seed in 0..20 {
+            let mut r = Rng::new(seed);
+            seen.push(Genome::random(&mut r, &healthy.body, &healthy.brain, &b).caution);
+        }
+        assert!(seen.iter().all(|c| (0.0..=1.0).contains(c)));
+        assert!(seen.windows(2).any(|w| w[0] != w[1]), "caution never varied across seeds");
     }
 
     #[test]

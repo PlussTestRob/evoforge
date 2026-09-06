@@ -47,7 +47,13 @@ impl Config {
 
     /// The controller shape implied by this configuration.
     pub fn brain_layout(&self) -> BrainLayout {
-        BrainLayout::new(self.body.max_parts, self.brain.hidden)
+        BrainLayout::with_health(self.body.max_parts, self.brain.hidden, self.joints_can_break())
+    }
+
+    /// Whether this experiment lets joints wear out and limbs detach.
+    #[inline]
+    pub fn joints_can_break(&self) -> bool {
+        self.body.joint_endurance > 0.0
     }
 
     /// Number of physics steps in one evaluation, including the settling period.
@@ -132,6 +138,12 @@ impl Config {
         if !(0.0..=1.0).contains(&self.body.taper_top_scale) {
             bad("body.taper_top_scale must be within [0, 1]")?;
         }
+        if self.body.joint_endurance < 0.0 {
+            bad("body.joint_endurance must not be negative (0 disables joint damage)")?;
+        }
+        if !(0.0..=1.0).contains(&self.body.min_drive) {
+            bad("body.min_drive must be within [0, 1]")?;
+        }
         if self.body.density <= 0.0 {
             bad("body.density must be positive")?;
         }
@@ -187,6 +199,7 @@ impl Config {
         rate(self.mutation.weight_reset_rate, "mutation.weight_reset_rate")?;
         rate(self.mutation.size_rate, "mutation.size_rate")?;
         rate(self.mutation.shape_rate, "mutation.shape_rate")?;
+        rate(self.mutation.caution_rate, "mutation.caution_rate")?;
         rate(self.mutation.attach_rate, "mutation.attach_rate")?;
         rate(self.mutation.joint_limit_rate, "mutation.joint_limit_rate")?;
         rate(self.mutation.joint_kind_rate, "mutation.joint_kind_rate")?;
@@ -280,6 +293,10 @@ pub struct MutationParams {
     pub joint_axis_rate: Real,
     pub motor_rate: Real,
     pub motor_sigma: Real,
+    /// Probability per genome of perturbing the caution trait, and the size of
+    /// that perturbation. Only consulted when `body.joint_endurance` is positive.
+    pub caution_rate: Real,
+    pub caution_sigma: Real,
     /// Probability per part of redrawing its shape. Only consulted when
     /// `body.shapes` offers more than one, so a box-only experiment never spends
     /// a draw on it.
@@ -306,6 +323,8 @@ impl Default for MutationParams {
             joint_axis_rate: 0.03,
             motor_rate: 0.05,
             motor_sigma: 0.15,
+            caution_rate: 0.08,
+            caution_sigma: 0.12,
             shape_rate: 0.04,
             add_part_rate: 0.06,
             remove_part_rate: 0.05,
@@ -341,6 +360,21 @@ pub struct BodyLimits {
     /// experiment rather than evolved, because a second size gene would mostly
     /// duplicate what `half_extents` already says.
     pub taper_top_scale: Real,
+    /// How much overwork a joint survives, in radians of undelivered rotation.
+    ///
+    /// A motorised joint takes damage only while its motor is saturated — the
+    /// controller is asking for a speed the joint's genetic `motor_torque`
+    /// cannot deliver — and the damage is the rotation it fell short by. When
+    /// the total reaches this, the joint fails and the limb detaches.
+    ///
+    /// `0` disables joint damage entirely, which is the default: with it off no
+    /// randomness is spent on the caution gene and the controller keeps its
+    /// original input count, so an experiment reproduces exactly what it did
+    /// before joints could break.
+    pub joint_endurance: Real,
+    /// Floor on how far the caution gene may throttle motor demand, so a maximally
+    /// cautious organism is still able to move.
+    pub min_drive: Real,
 }
 
 impl Default for BodyLimits {
@@ -358,6 +392,8 @@ impl Default for BodyLimits {
             hinge_probability: 0.85,
             shapes: vec![ShapeKind::Box],
             taper_top_scale: 0.45,
+            joint_endurance: 0.0,
+            min_drive: 0.2,
         }
     }
 }
@@ -477,11 +513,29 @@ pub struct FitnessCfg {
     pub energy_penalty: Real,
     /// Added per second spent with the root block upright.
     pub upright_bonus: Real,
+    /// Added per second with no attached part touching the ground.
+    ///
+    /// This is what makes hopping beat sliding. Zero by default: without it an
+    /// organism has no reason ever to leave the ground, and the cheapest way to
+    /// travel is to stay on it.
+    pub air_bonus: Real,
+    /// Added per metre the centre of mass rises above where it started.
+    ///
+    /// Pairs with `air_bonus`: hang time alone rewards a long low skim, and
+    /// height alone rewards a rear-up that never leaves the ground. Together
+    /// they ask for a jump.
+    pub height_bonus: Real,
 }
 
 impl Default for FitnessCfg {
     fn default() -> Self {
-        FitnessCfg { objective: Objective::Distance, energy_penalty: 0.0, upright_bonus: 0.0 }
+        FitnessCfg {
+            objective: Objective::Distance,
+            energy_penalty: 0.0,
+            upright_bonus: 0.0,
+            air_bonus: 0.0,
+            height_bonus: 0.0,
+        }
     }
 }
 
@@ -615,6 +669,15 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     // Folded in only when the experiment actually uses shapes. A box-only
     // configuration therefore keeps the digest it had before shapes existed,
     // which is what lets a run started before this feature still be resumed.
+    // As with shapes: folded in only when the feature is enabled, so an
+    // experiment that cannot break joints keeps the digest it always had.
+    if cfg.joints_can_break() {
+        f.tag(b"joint_health");
+        f.real(cfg.body.joint_endurance);
+        f.real(cfg.body.min_drive);
+        f.real(cfg.mutation.caution_rate);
+        f.real(cfg.mutation.caution_sigma);
+    }
     if uses_shapes(&cfg.body.shapes) {
         f.tag(b"shapes");
         for kind in &cfg.body.shapes {
@@ -658,6 +721,13 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
         Objective::Speed => 2,
     });
     f.real(cfg.fitness.energy_penalty);
+    // Guarded like every other opt-in term: an experiment that does not reward
+    // leaving the ground keeps the digest it had before jumping was scorable.
+    if cfg.fitness.air_bonus != 0.0 || cfg.fitness.height_bonus != 0.0 {
+        f.tag(b"jump");
+        f.real(cfg.fitness.air_bonus);
+        f.real(cfg.fitness.height_bonus);
+    }
     f.real(cfg.fitness.upright_bonus);
 
     if include_bookkeeping {
