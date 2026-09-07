@@ -704,11 +704,31 @@ inferred from the numbers:
 * **Rough** selects slightly larger bodies and visibly less vibration. A 13 cm
   ripple is enough to stop buzzing from working as well as it does on glass.
 * **Fractal** selects large machines — nearly the eight-part maximum — that are
-  not obviously good at moving themselves. What they appear to have found is
-  moving *just enough to fall off a nearby drop*. On ground with 5.6 m of relief
-  and cliffs to 82 degrees, that is a perfectly sound reading of "travel as far
-  as you can". A plausible untested prediction is that more generations would
-  find rolling.
+  not obviously good at moving themselves. Roughly half the population recorded
+  at generation 20 moves *just enough to fall off a nearby drop* and then stops.
+  Organism 2032 is the clearest case: 96% of its travel comes in the first half
+  of the measured window while it descends 0.34 m, after which it spends six
+  seconds thrashing in place — path length still growing, displacement flat, and
+  13,337 units of actuation spent on neither. On ground with 5.6 m of relief and
+  cliffs to 82 degrees, that is a perfectly sound reading of "travel as far as
+  you can". A plausible untested prediction is that more generations would find
+  rolling.
+
+  It is not the whole population, and at generation 20 it is not winning: the
+  other half move steadily, two of the seven recorded organisms net *climb*, and
+  the steady movers outscore the fallers (1.67 m against 1.31 m and below). So
+  falling reads as a cheap competing optimum that caps out low rather than as
+  the dominant strategy — which is a different problem from an exploit, and a
+  more interesting one.
+
+  **How to see this, since the obvious statistic does not.** Net elevation
+  change over a run says how far down an organism ended up, not when it earned
+  its distance, and on these bodies it is uniformly about −0.22 m whatever the
+  organism is doing — which makes it look modest and makes it correlate weakly
+  with fitness. The signature that works is *temporal*: what share of the final
+  displacement was reached in the first half of the window. A gait splits it
+  roughly 50/50, as every flat and rough organism does. A fall-and-stop puts 80%
+  or more in the first half.
 
 None of those three is a defect, and none of them is something to legislate
 against. They are correct answers to the question actually being asked, which is

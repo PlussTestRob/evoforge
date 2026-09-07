@@ -71,13 +71,28 @@ as far as you can", and all three are correct:
 |---|---|
 | flat | small two-part machines that *vibrate* along. Nothing about a plane and a distance objective asks for more. |
 | sine | slightly larger bodies, visibly less vibration. A 13 cm ripple is enough to make buzzing stop paying so well. |
-| terraced fractal | large bodies, near the eight-part maximum, that move *just enough to fall off a nearby drop*. On ground with 5.6 m of relief that is a sound reading of the question. |
+| terraced fractal | large bodies, near the eight-part maximum. About half of them move *just enough to fall off a nearby drop* and then stop; the rest move steadily and some net climb. On ground with 5.6 m of relief, falling is a sound reading of the question. |
 
 The third is the interesting one, and the temptation is to call it cheating. It
 is not: the physics is right, the measurement is honest, and falling down a hill
 really is a way of covering ground. If what we want is *controlled* descent
 rather than a well-aimed fall, then the objective has to be able to tell those
 apart — which is Phase 2, not a penalty term.
+
+Note also that it is not winning. The organisms that fall and stop score *below*
+the ones that move steadily on the same ground, so this is a cheap local optimum
+that caps out low rather than a strategy taking over the population. That is a
+more interesting problem than an exploit, and a different one: the question is
+whether a gait can be established before the cheap answer is discovered.
+
+**Finding it needs the right statistic.** Net elevation change does not reveal
+it — it is near-uniform across the population and correlates weakly with
+fitness, so it reads as unremarkable. The signature is temporal: the share of
+final displacement reached in the first half of the measured window. A gait
+splits it about 50/50; a fall-and-stop puts 80% or more in the first half. The
+same blind spot affects `dead_organism_probe` above, and for the same reason —
+an organism that works its way to a lip and then falls is doing something no
+motors-off corpse can imitate.
 
 The diagnostic tools in [examples/](examples/) exist to make the distinction
 decidable rather than arguable, and they carry forward into every phase below:
@@ -206,6 +221,15 @@ in particular*.
   capsule-capsule contacts are already there for self-collision — and the care
   needed is keeping obstacles out of everything that assumes a body belongs to
   the organism: `centre_of_mass`, `body_slots`, `detached`, the spawn drop.
+
+**Scheduling difficulty within a run.** The terraced landscape offers a cheap
+answer — move a little, fall off something, stop — that is reachable in very few
+generations and caps out below real locomotion. Ramping the terrain's sharpness
+across a run, so a gait is established before that answer becomes available, is
+planned in [CURRICULUM_PLAN.md](CURRICULUM_PLAN.md). It is an enabler rather than
+a task: it changes when the existing objective gets hard, not what it asks for.
+The plan also settles why the config-digest check that blocks a staged resume
+should be left alone rather than given an escape hatch.
 
 Standing gates for this phase, because harder ground raises the price of honest
 locomotion and therefore the relative value of anything free: the corpse gate
