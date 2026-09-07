@@ -1,5 +1,11 @@
 # Plan: seeded fractal terrain
 
+> **Historical record.** This is a completed plan, kept for the reasoning and the
+> measurements in it. The solver bug it discovered was fixed in
+> [TERRAIN_PLAN_2.md](TERRAIN_PLAN_2.md); the A/B comparison it voided has still
+> not been rerun. For where the project is going now, see
+> [ROADMAP.md](ROADMAP.md), which carries the outstanding items forward.
+
 Status: **built, stages 1-4 and the experiment file. Run — and the run found a
 pre-existing bug in the simulator that invalidates the comparison.**
 
@@ -33,15 +39,21 @@ m/s per step and keeps it. Terrain is irrelevant — it works on a flat plane.
 **This predates the terrain work entirely.** `runs/animals-1788676600`, a
 270-generation run from 6 September on the committed code, has a champion that
 covers 26.6 m of its 35.7 m dead — 75% free. That is the run the README
-describes as reaching "22 m of commanded travel". The diff for this feature
+describes under "Toward animals". The diff for this feature
 touches the terrain enum, one call site in `build_contacts`, and tests; no
 solver code.
 
-What the fractal terrain did was make the *honest* strategy more expensive, so
-the exploit's relative advantage grew and it took over the population instead
-of appearing in one champion of five. Harder ground did not select for better
-locomotion; it selected harder for the cheat. This is §12's first lesson
-arriving on schedule, one layer lower than expected.
+What the fractal terrain did was make locomotion more expensive, so the fault's
+relative advantage grew and it took over the population instead of appearing in
+one champion of five. Harder ground did not select for better locomotion; it
+selected harder for whatever the solver was giving away. This is §12's first
+lesson arriving on schedule, one layer lower than expected.
+
+Worth being precise about what kind of problem this was. It is not an organism
+finding an unanticipated strategy inside the rules — that is a result, and this
+project keeps those. It is the simulator failing to implement the physics it
+claims to: a body was gaining momentum nothing supplied. See the taxonomy in
+[ROADMAP.md](ROADMAP.md).
 
 The A/B is therefore void as a terrain comparison and has to be rerun after the
 solver is fixed. The standard fix is a split-impulse pass: accumulate the
@@ -346,10 +358,12 @@ Each of these was learned the hard way here:
   in 8 seconds. The fix was to express the spring as a *natural frequency* rather
   than a stiffness, making it independent of the inertia it acts on. There is now
   `a_tendon_never_adds_energy` guarding it.
-* **Anything that scores behaviour gets gamed within tens of generations.** The
+* **A metric will be taken at exactly its word, within tens of generations.** The
   first hang-time metric counted "no contact" as airborne, and evolution promptly
   produced organisms hovering a millimetre above the ground. Contacts only exist
   once a point is *below* the surface, so any clearance test needs a real margin.
+  The lesson is about the precision of the measurement, not about the organisms:
+  name a quantity carelessly and you will be shown precisely what you asked for.
 * **Measure more than once.** Two conclusions in this project were drawn from
   single unreplicated measurements and were wrong. Benchmarks on a laptop vary by
   2× between identical runs depending on power state — check whether the machine
@@ -358,6 +372,9 @@ Each of these was learned the hard way here:
   replay files with a separate implementation has caught real bugs more than once.
 
 ## 13. Repository state when this was written
+
+*Stale as of the merge of this work; kept because the unmeasured performance
+claim below is still unmeasured.*
 
 * Branch `more-like-animals`, last commit `4364149`.
 * **Uncommitted: `src/phenotype.rs`** — an allocation fix in `build` replacing a

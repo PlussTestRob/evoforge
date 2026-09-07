@@ -4,7 +4,7 @@
 
 EvoForge explores how complex physical structures and behaviors can emerge through evolution from relatively simple rules.
 
-Creatures are constructed from blocks and joints, controlled by small neural networks, and evaluated in a simulated physical environment. Successful organisms reproduce, unsuccessful organisms are culled, and mutations introduce variation across generations.
+Organisms are constructed from primitive parts and joints, controlled by small neural networks, and evaluated in a simulated physical environment. Successful organisms reproduce, unsuccessful organisms are culled, and mutations introduce variation across generations.
 
 The goal is not to build a game or a general-purpose AI framework. EvoForge is an **artificial-life laboratory**: a fast, reproducible environment for experimenting with evolution, morphology, neural control, and emergent behavior.
 
@@ -39,6 +39,24 @@ Its behavior determines its fitness.
 The fittest organisms become the parents of the next generation.
 
 Repeat.
+
+## Where This Is Going
+
+Organisms are currently scored on how far they travel. That is the *first*
+fitness criterion, not the defining one — it was chosen because it is the
+simplest measurement that separates a body which does something from a body
+which does nothing.
+
+The direction of the project is to make the evaluation system capable of asking
+harder questions — go uphill, go downhill, reach that beacon, reach as many
+beacons as you can — and then to give organisms sensors so that what they are
+being asked about is something they can perceive. The progression is:
+
+> evolved locomotion → richer evaluation → varied environments and tasks →
+> sensors → bodies, controllers and environments under selection together
+
+[ROADMAP.md](ROADMAP.md) sets that out in phases, each anchored to a seam that
+already exists in the code.
 
 ## Goals
 
@@ -122,9 +140,9 @@ The renderer does not participate in the simulation. It consumes recorded data a
 
 ## Organisms
 
-The initial concept is based on modular, block-based organisms.
+The initial concept is based on modular organisms built from primitive parts.
 
-A creature may consist of:
+An organism may consist of:
 
 * Rigid parts — a box, a taper, a sphere, a capsule or a cylinder
 * Fixed connections
@@ -132,12 +150,26 @@ A creature may consist of:
 * Rotational/orbital joints
 * Joint limits
 * Motorized joints
-* Sensors
+* Passive tendons
 * A neural-network controller
 
 The exact morphology system is intentionally expected to evolve alongside the project.
 
 The important distinction is that the **body and controller are part of the organism**, rather than treating the neural network as an abstract agent operating independently of its physical form.
+
+### Sensing
+
+An organism's controller already receives inputs describing the organism *to
+itself*: its orientation, its velocity, its height, and for each joint an angle,
+a ground-contact flag and — where joints can wear out — remaining health. These
+are proprioceptive, fixed for an experiment, and identical for every organism in
+it.
+
+Sensors in the fuller sense — reporting something about the world *outside* the
+body, mounted on a particular part, described by the genome, and aimed by the
+controller when that part is on a moving limb — are Phase 3 of
+[ROADMAP.md](ROADMAP.md). Sensing is intended to become part of the evolved
+organism rather than an external channel handed to it.
 
 ## Neural Networks
 
@@ -179,19 +211,57 @@ Population size, selection pressure, mutation rate, crossover behavior, and othe
 
 ## Fitness
 
-Fitness is experiment-dependent.
+Fitness is experiment-dependent, and the set of questions it can ask is expected
+to grow. Distance traveled is where it starts, not where it stops.
 
-Potential objectives include:
+Objectives available today:
 
-* Distance traveled
+* Distance traveled, in any direction
+* Signed displacement along +X
 * Average velocity
-* Elevation gained
-* Progress toward a target
-* Energy efficiency
-* Stability
-* Combination objectives
+* Progress along a commanded heading
 
-An experiment should be able to define its objective without requiring fundamental changes to the simulation architecture.
+with optional terms for time spent upright, time spent airborne, height gained,
+and energy spent.
+
+Objectives the evaluation system is being built to support:
+
+* Elevation gained, and elevation lost under control
+* Reaching a particular beacon
+* Reaching as many beacons as possible within a run
+* Evaluation across several environments and tasks within one experiment
+
+An experiment should be able to define its objective without requiring
+fundamental changes to the simulation architecture. Scoring reads a recorded
+metric set and never reaches into the physics world, so an objective added later
+can be applied to results gathered earlier.
+
+## Unexpected Behavior
+
+Evolution under a simple objective finds simple answers, and they are frequently
+not the answers anyone had in mind. An organism that discovers an unanticipated
+way to score well, while staying inside the rules of the simulation, has done
+exactly what it was asked to do. That is a **result**, not a defect, and this
+project does not treat it as something to be suppressed.
+
+The goal is not organisms that look like animals, humans, or conventionally
+designed robots. The goal is an environment in which physical structures and
+neural controllers can evolve toward success under evaluation criteria that get
+progressively more meaningful.
+
+Three things do look alike from a fitness curve and are worth telling apart:
+
+| | | |
+|---|---|---|
+| **A simulation fault** | the score required the simulator to break its own physics | fix the bug |
+| **A measurement fault** | the metric did not measure what its name says | fix the instrument |
+| **A strategy** | correct physics, honest measurement, and it scores anyway | keep it, and if you want something else, ask a different question |
+
+Both faults have happened here, and each was fixed at the level it occurred —
+never by making a behavior illegal. The tools in [examples/](examples/) exist to
+make the distinction decidable rather than arguable; `dead_organism_probe`, which
+switches a champion's motors off and measures how far it still travels, is the
+sharpest of them. See [ROADMAP.md](ROADMAP.md) for the full treatment.
 
 ## Experiments
 
@@ -517,8 +587,11 @@ trials, self-collision and twelve solver iterations cost roughly an order of
 magnitude against `directed-walkers` — and it does not yet produce quadrupeds.
 
 **A result reported here previously was wrong, and how it was wrong is worth
-keeping.** A 270-generation run reached 35 m of commanded travel, and the
-organism that did it covered 26 of those metres with its motors switched off.
+keeping.** It is the reference example of a *simulation fault* rather than a
+strategy: the score was not something the organism earned under the rules, it was
+the solver breaking its own physics. A 270-generation run reached 35 m of
+commanded travel, and the organism that did it covered 26 of those metres with
+its motors switched off.
 Self-collision plus Baumgarte stabilisation had made a motor: overlapping parts
 were shoved apart, the shove was added straight into velocity and *kept*, and a
 body whose joints pulled those parts back together every step collected it
@@ -625,6 +698,12 @@ above it counts as flying. Asked for hang time that way, evolution needed forty
 generations to produce organisms spending half the trial "airborne" while never
 rising above the grass.
 
+That is a *measurement fault*, and the fix was to make the word mean what it
+says rather than to penalise hovering. The same reasoning produced the
+centre-of-mass correction in the previous section: shedding a limb used to move
+the measured average for free, so the discontinuity is cancelled and detaching a
+part is now worth exactly zero metres — not forbidden, just not paid for.
+
 ```toml
 [fitness]
 objective = "distance_x"
@@ -657,7 +736,7 @@ phantom position penalty from where the wreckage lands.
 The organism gets both halves of the trade-off:
 
 * **Sensing** — each slot gains a controller input carrying that joint's
-  remaining health, so a creature can feel a joint going and ease off it.
+  remaining health, so an organism can feel a joint going and ease off it.
 * **Disposition** — a heritable `caution` gene in `[0, 1]` throttles how hard
   every motor is driven. It is a standing bet, not a reaction: an organism
   cannot know how long its trial will last, so whether to sprint and risk
@@ -706,7 +785,7 @@ python -m http.server 8000 --directory viewer
 ```
 
 Then open <http://localhost:8000>. Click **Load sample** for the checked-in
-two-block generation-0 replay, or use the file picker — or drag and drop — to
+two-part generation-0 replay, or use the file picker — or drag and drop — to
 open any file from `runs/<run>/replays/`, such as a champion produced by
 `evo replay <run> --best --hz 60`.
 
@@ -738,8 +817,8 @@ the lit part is the measured window that fitness is computed over.
 
 ## Project Status
 
-**Milestone 1 complete: the pipeline works end to end and evolution demonstrably
-occurs.**
+**Phase 0 of [ROADMAP.md](ROADMAP.md) is complete: the pipeline works end to end,
+evolution demonstrably occurs, and it reproduces bit for bit.**
 
 A first run of `experiments/first-walkers.toml` — 100 organisms, 100 generations,
 seventeen seconds of wall clock — took best fitness from 0.79 m to 4.76 m and the
@@ -750,13 +829,20 @@ shows the population as a whole is improving. Omnidirectional `distance` can be
 satisfied by tumbling; `experiments/directed-walkers.toml` asks for signed +X
 progress and an upright bonus.
 
+Everything since has widened what a body can be and what the ground can do —
+five part shapes, bilateral symmetry, segmentation, muscle-limited torque,
+tendons, self-collision, joint wear, and seeded fractal terrain with hills and
+cliffs. What has *not* widened much is the question being asked, which is what
+Phases 1 and 2 of the roadmap are about.
+
 Implemented:
 
-* block-based organisms with fixed and hinged joints, limits and motors
+* organisms of jointed primitive parts, with limits, motors and optional tendons
 * a small hand-written feed-forward controller, evolved rather than trained
 * a purpose-built impulse-based rigid-body solver — gravity, ground contact,
-  friction, joints, joint limits, joint motors
-* flat terrain behind a height-function interface
+  friction, joints, joint limits, joint motors, optional self-collision
+* flat, sine and seeded fractal terrain behind one analytic height function
+* repeated trials with per-trial start, terrain and commanded-heading variation
 * genome and phenotype as distinct concepts, with stable controller slots that
   survive morphological mutation
 * tournament selection, elitism, slot-aligned crossover, per-gene mutation,
@@ -769,11 +855,16 @@ Implemented:
 * `evo bench`, reporting organisms/second, scaling efficiency, and cost per
   million evaluations
 
-Not built, deliberately: self-collision, a renderer, evolved network topology,
-non-flat terrain, and any cloud infrastructure. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning behind each of those, the
+Not built: discrete obstacles, sensors that perceive the world outside the body,
+tasks other than travelling, a renderer, evolved network topology, and any cloud
+infrastructure. The first three are on [ROADMAP.md](ROADMAP.md); see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning behind the rest, the
 assumptions that would affect scaling, and where the implementation is meant to
 be replaced.
+
+One outstanding debt worth naming: the 80-generation A/B comparing sine ground
+against fractal ground was invalidated by the solver bug described above and has
+not been rerun, so what harder terrain actually buys is currently unmeasured.
 
 ## License
 

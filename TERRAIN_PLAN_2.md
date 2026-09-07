@@ -1,5 +1,10 @@
 # Plan: hills, cliffs, and ground worth crossing
 
+> **Historical record.** This is a completed plan, kept for the reasoning and the
+> measurements in it. Two items were never done: the A/B comparison of §8 stage 7,
+> and the discrete obstacles of §5. Both are carried forward into
+> [ROADMAP.md](ROADMAP.md), which is where current direction lives.
+
 Status: **built, stages 1-6.** Successor to [TERRAIN_PLAN.md](TERRAIN_PLAN.md),
 which built `TerrainModel::Fractal`.
 
@@ -61,9 +66,10 @@ per step and keeps it as momentum. It predates all terrain work:
 **Harder terrain makes this worse, not better.** The 80-generation A/B already
 showed why: the fractal run scored 28.1 against the sine field's 12.0, not
 because the organisms were better but because harder ground raised the price of
-honest locomotion, so the exploit's relative advantage grew and it took the
-whole population. Every increase in difficulty proposed below pushes harder in
-that same direction.
+locomotion, so the fault's relative advantage grew and it took the whole
+population. Note that this is a defect in the simulator rather than an organism
+outsmarting its objective — the physics itself was wrong. Every increase in
+difficulty proposed below pushes harder in that same direction.
 
 Fix the solver first. Everything after §1 is void until then.
 

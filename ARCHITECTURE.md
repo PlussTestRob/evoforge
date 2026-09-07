@@ -1,7 +1,8 @@
 # EvoForge architecture
 
 This document records *why* the code is shaped the way it is, and where it is
-expected to change. For what the project is, see [README.md](README.md).
+expected to change. For what the project is, see [README.md](README.md); for
+where it is going and in what order, [ROADMAP.md](ROADMAP.md).
 
 ## The three properties everything else follows from
 
@@ -35,8 +36,8 @@ config      TOML experiment configuration
 genome      heritable description; mutation and crossover
 brain       fixed-topology feed-forward controller, evaluated over a weight slice
 phenotype   genome -> bodies and joints (the only place genes become geometry)
-physics     rigid bodies, shapes, contacts, joints, motors, limits
-sim         one evaluation: sensors -> controller -> motors -> step -> metrics
+physics     rigid bodies, shapes, contacts, joints, motors, limits, terrain noise
+sim         one evaluation: inputs -> controller -> motors -> step -> metrics
 fitness     metrics -> scalar
 evolution   population, selection, reproduction, lineage
 record      run directories, statistics, checkpoints, replays
@@ -100,6 +101,57 @@ penalty applied before the controller has any say.
 the recorder always emits a frame there even when the boundary does not fall on
 the recording grid, so a viewer can draw that pose rather than interpolate
 towards it.
+
+## Evaluation: metrics, objectives, and what a trial asks for
+
+Scoring is deliberately two stages, and the boundary between them is the most
+load-bearing seam in the project after purity itself.
+
+`sim` produces `Metrics` — a flat struct of scalars measured over the window.
+`fitness::score` reduces `Metrics` to one number under a configured `Objective`.
+**`fitness` cannot see the physics world at all.** An objective that could reach
+into solver state would acquire dependencies on solver details, and then results
+would stop being comparable across the solver changes this project keeps making.
+The second consequence is that full metrics are recorded for every organism, so
+a finished run can be scored under an objective that did not exist when it ran,
+without re-simulating anything.
+
+Above that sits a third thing which is not yet named in the code: **what the
+trial asked for.** `sim` already draws one per trial — a commanded heading — and
+does three things with it that generalise exactly:
+
+1. it is a parameter of the world for that trial, derived from the experiment
+   seed and the trial index, so every organism faces the same set of demands;
+2. it is handed to the controller as input (`COMMAND_X`, `COMMAND_Z`), so the
+   organism can act on it;
+3. it is scored against, through `Metrics::heading_progress`.
+
+A beacon to reach, a slope to climb, or a sequence of targets has that same
+three-part shape. Generalising it is Phase 1 of [ROADMAP.md](ROADMAP.md), and
+the thing to preserve while doing so is that (2) and (3) stay separable: an
+organism can be *told* where a target is, or it can be given a sensor and made to
+find it, and the difference between those two runs is the measurement of what the
+sensor is worth.
+
+Two constraints bind anything added here.
+
+**Input count sets the weight-vector length**, which sets how much randomness a
+genome consumes, which sets whether earlier results still reproduce. This is why
+every optional input so far is conditional rather than unconditional —
+`INPUTS_PER_SLOT_WITH_HEALTH`, `GLOBAL_INPUTS_WITH_COMMAND`. Sensors will need a
+per-experiment budget for the same reason `max_slots` exists: the layout is
+sized for the maximum, and an organism carrying fewer feeds zeros into the rest.
+
+**A metric must measure what its name says.** Two have failed that test. A
+detached limb dropping out of an average moved the measured centre of mass for
+free, worth 3.34 m to one organism; `World::centre_of_mass` now cancels the
+discontinuity, so shedding a part is worth exactly zero metres. And "airborne"
+originally meant "no contact", which a body hovering a millimetre up satisfies;
+`AIRBORNE_CLEARANCE` gave it a real margin. Both were repaired at the
+instrument, not by penalising the behaviour — which is the general rule. A
+strategy that scores under correct physics and an honest measurement is a
+result; if it is not the result we wanted, the fix is a different question, not
+a penalty term.
 
 ## Key data structures
 
@@ -166,9 +218,15 @@ reproducibility, and has no per-evaluation setup cost worth measuring — which
 matters when the workload is millions of very short evaluations rather than one
 long one.
 
-**Not implemented, deliberately.** Self-collision: an organism's blocks pass
-through each other, as in Sims (1994). This removes the broad phase entirely and
-avoids the jitter that overlapping freshly-mutated limbs would cause.
+**Optional, and off by default.** Self-collision: with
+`environment.self_collision` unset an organism's parts pass through each other,
+as in Sims (1994), which removes the broad phase entirely and avoids the jitter
+that overlapping freshly-mutated limbs would cause. Switched on, parts are
+approximated by capsules and jointed pairs are exempt, because they are meant to
+touch. It is the single largest per-evaluation cost in the codebase, and it is
+also where the worst bug this project has had lived: positional correction was
+being added into real velocity, which made overlapping parts a motor. See
+`self_collision_is_not_a_motor`.
 
 **The intended replacement.** Organisms are trees with no self-collision, which
 is exactly the case where a reduced-coordinate articulated-body formulation
@@ -182,8 +240,10 @@ are much harder to get *wrong*.
 Stated explicitly, because they are the ones worth revisiting before spending
 money on compute:
 
-- **No self-collision.** Removes the broad phase. Adding it later is the single
-  biggest per-evaluation cost increase available.
+- **Self-collision is off unless asked for.** Off removes the broad phase; on is
+  the single biggest per-evaluation cost in the simulator. Experiments that
+  enable it are roughly an order of magnitude slower than those that do not,
+  together with the extra trials and solver iterations they usually want.
 - **Small bodies (<= a few dozen parts).** The solver is O(iterations x
   constraints) with dense 3x3 solves; fine at this size, poor at hundreds.
 - **Fixed controller topology.** Weight vectors are uniform across a population,
@@ -204,7 +264,10 @@ money on compute:
 |---|---|---|
 | `physics::World::step` | sequential impulses, split positional correction | Featherstone ABA |
 | `physics::TerrainModel` | `Flat`, `Rough`, `Fractal`, behind `height_at`/`normal_at`/`sample` | discrete obstacles |
-| `fitness::Objective` | three variants over `Metrics` | anything that reads `Metrics` |
+| `fitness::Objective` | four variants over `Metrics` | anything that reads `Metrics` |
+| `fitness::Metrics` | a fixed struct of scalars, recorded per organism | more fields; it is the only thing an objective may read |
+| the per-trial command | one heading, drawn per trial and fed to the controller | a general task description: a target, a slope, a sequence of them |
+| `brain`'s input set | fixed proprioceptive inputs, sized by `BrainLayout` | plus exteroceptive sensors, budgeted per experiment |
 | `genome::crossover` | slot-aligned uniform | morphological crossover |
 | `brain` | one hidden layer, fixed size | recurrent, or evolved topology |
 | `record` | JSON / JSON Lines | binary traces, object storage |
