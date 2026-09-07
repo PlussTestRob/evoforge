@@ -314,6 +314,10 @@ fn accumulate(a: Metrics, b: Metrics) -> Metrics {
         displacement_x: a.displacement_x + b.displacement_x,
         path_length: a.path_length + b.path_length,
         max_displacement: a.max_displacement + b.max_displacement,
+        net_gain: a.net_gain + b.net_gain,
+        net_loss: a.net_loss + b.net_loss,
+        climb: a.climb + b.climb,
+        descent: a.descent + b.descent,
         mean_height: a.mean_height + b.mean_height,
         upright_seconds: a.upright_seconds + b.upright_seconds,
         actuation: a.actuation + b.actuation,
@@ -335,6 +339,10 @@ fn scale_metrics(m: &mut Metrics, k: Real) {
     m.displacement_x *= k;
     m.path_length *= k;
     m.max_displacement *= k;
+    m.net_gain *= k;
+    m.net_loss *= k;
+    m.climb *= k;
+    m.descent *= k;
     m.mean_height *= k;
     m.upright_seconds *= k;
     m.actuation *= k;
@@ -342,6 +350,43 @@ fn scale_metrics(m: &mut Metrics, k: Real) {
     m.heading_progress *= k;
     m.peak_height *= k;
     m.airborne_seconds *= k;
+}
+
+/// Hysteresis filter over the centre-of-mass height, accumulating total ascent
+/// and descent.
+///
+/// The band is what separates climbing from a gait's bobbing. `reference` moves
+/// only when a move is *registered*, which is the whole point: a per-step
+/// threshold would let a slow steady drift through unrecorded, because no single
+/// step clears the band, while this holds the reference still until the drift
+/// itself clears it. Conversely an organism oscillating within the band moves the
+/// reference never, and accumulates nothing however long it bounces.
+struct ElevationTracker {
+    reference: Real,
+    deadband: Real,
+    climb: Real,
+    descent: Real,
+}
+
+impl ElevationTracker {
+    fn new(start_y: Real, deadband: Real) -> ElevationTracker {
+        ElevationTracker { reference: start_y, deadband, climb: 0.0, descent: 0.0 }
+    }
+
+    /// Registered in whole moves, not in excess-over-band: crediting only
+    /// `dy - deadband` would lose one band per registration and undercount a long
+    /// climb taken in small steps.
+    #[inline]
+    fn observe(&mut self, y: Real) {
+        let dy = y - self.reference;
+        if dy > self.deadband {
+            self.climb += dy;
+            self.reference = y;
+        } else if dy < -self.deadband {
+            self.descent -= dy;
+            self.reference = y;
+        }
+    }
 }
 
 /// One trial: build the organism, simulate it, and score it.
@@ -398,6 +443,7 @@ fn run_trial_towards(
     let mut height_sum = 0.0;
     let mut measured_steps: u32 = 0;
     let mut measurement_began = false;
+    let mut elevation = ElevationTracker::new(0.0, cfg.fitness.climb_deadband.max(0.0));
     // Actuation spent during the settle drop belongs to no measured window: the
     // controller is held off, so it is impulse the organism could not have
     // influenced. Subtracting the settle total keeps every metric on `Metrics`
@@ -414,6 +460,7 @@ fn run_trial_towards(
         if step == settle_steps {
             metrics.start = pheno.world.centre_of_mass();
             previous_com = metrics.start;
+            elevation = ElevationTracker::new(metrics.start.y, elevation.deadband);
             settle_actuation = pheno.world.actuation_impulse;
             measurement_began = true;
         }
@@ -455,6 +502,9 @@ fn run_trial_towards(
             }
 
             metrics.peak_height = metrics.peak_height.max(com.y);
+
+            elevation.observe(com.y);
+
             // Airborne means the whole organism has cleared the ground by a real
             // margin. Debris is excluded deliberately: a shed limb bouncing
             // along is not the organism flying.
@@ -494,11 +544,19 @@ fn run_trial_towards(
             let offset = horizontal(com - metrics.start);
             metrics.displacement = offset.length();
             metrics.displacement_x = offset.x;
+            // Clamped here, per trial, and only averaged afterwards. Clamping
+            // after the average would net a climb on one trial against a fall on
+            // another and report neither.
+            let net = com.y - metrics.start.y;
+            metrics.net_gain = net.max(0.0);
+            metrics.net_loss = (-net).max(0.0);
         }
         metrics.mean_height =
             if measured_steps > 0 { height_sum / measured_steps as Real } else { 0.0 };
     }
 
+    metrics.climb = elevation.climb;
+    metrics.descent = elevation.descent;
     metrics.steps = measured_steps;
     metrics.duration = measured_steps as Real * dt;
     metrics.actuation = pheno.world.actuation_impulse - settle_actuation;
@@ -615,6 +673,96 @@ fn should_apply_control(step: u32, settle_steps: u32, control_interval: u32) -> 
 }
 
 #[cfg(test)]
+mod elevation_tests {
+    use super::ElevationTracker;
+
+    /// The gate the deadband exists for.
+    ///
+    /// An organism bouncing on the spot travels nowhere, and must earn nothing
+    /// for it. Without a band this is a perpetual-motion fitness source: every
+    /// upward wobble is ascent, and a gait supplies thousands of them.
+    #[test]
+    fn bobbing_on_the_spot_earns_no_climb() {
+        let mut t = ElevationTracker::new(0.0, 0.05);
+        // 4 cm amplitude at 120 Hz for eight seconds: 960 samples, well inside
+        // the band and far more vertical movement than a real gait produces.
+        for i in 0..960 {
+            let phase = (i % 8) as f32 / 8.0;
+            t.observe(0.04 * if phase < 0.5 { 1.0 } else { -1.0 });
+        }
+        assert_eq!(t.climb, 0.0, "bobbing inside the band accumulated ascent");
+        assert_eq!(t.descent, 0.0, "bobbing inside the band accumulated descent");
+    }
+
+    /// A slow drift must still be recorded, or the band would hide real
+    /// climbing taken in steps smaller than itself.
+    #[test]
+    fn a_slow_climb_is_recorded_despite_the_band() {
+        let mut t = ElevationTracker::new(0.0, 0.05);
+        // One metre, in 1 cm increments — every one of them inside the band.
+        for i in 1..=100 {
+            t.observe(i as f32 * 0.01);
+        }
+        assert!(
+            (t.climb - 1.0).abs() <= 0.05,
+            "a 1 m climb in 1 cm steps registered {} m; the band must not eat it",
+            t.climb
+        );
+        assert_eq!(t.descent, 0.0);
+    }
+
+    /// On a monotone climb, cumulative and net must agree to within one band.
+    /// If they diverge, the accumulation has a sign or reference bug.
+    #[test]
+    fn cumulative_and_net_agree_on_a_monotone_climb() {
+        let mut t = ElevationTracker::new(0.0, 0.05);
+        for i in 1..=200 {
+            t.observe(i as f32 * 0.02);
+        }
+        let net = 200.0 * 0.02;
+        assert!((t.climb - net).abs() <= 0.05, "climb {} against net {net}", t.climb);
+    }
+
+    /// Widening the band can only remove movement, never add it. Catches
+    /// reference-tracking errors that a single-band test would pass.
+    #[test]
+    fn a_wider_band_never_registers_more() {
+        let signal: Vec<f32> = (0..600)
+            .map(|i| {
+                let t = i as f32 * 0.05;
+                0.3 * t.sin() + 0.04 * (t * 11.0).sin() + t * 0.002
+            })
+            .collect();
+        let mut previous = f32::INFINITY;
+        for band in [0.0, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5] {
+            let mut t = ElevationTracker::new(signal[0], band);
+            for &y in &signal {
+                t.observe(y);
+            }
+            assert!(
+                t.climb <= previous + 1e-4,
+                "band {band} registered {} m, more than the narrower band's {previous} m",
+                t.climb
+            );
+            previous = t.climb;
+        }
+    }
+
+    /// Descent is the mirror of climb, not a separate rule.
+    #[test]
+    fn descent_mirrors_climb() {
+        let mut up = ElevationTracker::new(0.0, 0.05);
+        let mut down = ElevationTracker::new(0.0, 0.05);
+        for i in 1..=100 {
+            up.observe(i as f32 * 0.02);
+            down.observe(i as f32 * -0.02);
+        }
+        assert!((up.climb - down.descent).abs() < 1e-5);
+        assert_eq!(up.descent, 0.0);
+        assert_eq!(down.climb, 0.0);
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rng::Rng;
@@ -628,6 +776,75 @@ mod tests {
 
     fn random_genome(cfg: &Config, seed: u64) -> Genome {
         Genome::random(&mut Rng::new(seed), &cfg.body, &cfg.brain, &cfg.brain_layout())
+    }
+
+    /// A structural test of the trial-aggregation contract, not of any one field.
+    ///
+    /// `accumulate` and `scale_metrics` enumerate every member of `Metrics` by
+    /// hand, and neither fails to compile when a newly added field is missed.
+    /// Forgotten in `accumulate`, the field silently reads zero in any
+    /// multi-trial experiment; forgotten in `scale_metrics`, it reads `n` times
+    /// too large. With every trial made identical, running one trial and running
+    /// three must give exactly the same metrics — summed-then-scaled fields
+    /// because the mean of n copies is the value, and the `max`-aggregated ones
+    /// because the maximum of n copies is too.
+    #[test]
+    fn trial_count_does_not_change_the_metrics_when_the_trials_are_identical() {
+        let mut cfg = quick_config();
+        // Nothing may differ between trials: no start jitter, no steering, and
+        // flat ground so there is no per-trial landscape shift either.
+        cfg.simulation.start_jitter = 0.0;
+        cfg.simulation.steer = false;
+        cfg.environment.terrain = crate::config::Terrain::Flat;
+        let g = random_genome(&cfg, 11);
+
+        cfg.simulation.trials = 1;
+        let one = evaluate(&g, &cfg, false).metrics;
+        cfg.simulation.trials = 3;
+        let three = evaluate(&g, &cfg, false).metrics;
+
+        let close = |name: &str, a: Real, b: Real| {
+            let tol = 1e-4 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "{name}: one trial gave {a}, three identical trials gave {b}.                  A field missing from `accumulate` reads zero; one missing from                  `scale_metrics` reads three times too large."
+            );
+        };
+        close("start.y", one.start.y, three.start.y);
+        close("end.y", one.end.y, three.end.y);
+        close("displacement", one.displacement, three.displacement);
+        close("displacement_x", one.displacement_x, three.displacement_x);
+        close("path_length", one.path_length, three.path_length);
+        close("max_displacement", one.max_displacement, three.max_displacement);
+        close("mean_height", one.mean_height, three.mean_height);
+        close("upright_seconds", one.upright_seconds, three.upright_seconds);
+        close("actuation", one.actuation, three.actuation);
+        close("duration", one.duration, three.duration);
+        close("peak_height", one.peak_height, three.peak_height);
+        close("airborne_seconds", one.airborne_seconds, three.airborne_seconds);
+        close("heading_progress", one.heading_progress, three.heading_progress);
+        close("net_gain", one.net_gain, three.net_gain);
+        close("net_loss", one.net_loss, three.net_loss);
+        close("climb", one.climb, three.climb);
+        close("descent", one.descent, three.descent);
+        assert_eq!(one.steps, three.steps, "steps");
+        assert_eq!(one.joints_lost, three.joints_lost, "joints_lost");
+    }
+
+    /// Net gain and loss are clamped per trial and only then averaged, so an
+    /// organism that climbs on one trial and falls on another reports both
+    /// rather than netting them to nothing.
+    #[test]
+    fn net_gain_and_loss_are_never_both_zero_for_an_organism_that_moved_vertically() {
+        let cfg = quick_config();
+        let g = random_genome(&cfg, 12);
+        let m = evaluate(&g, &cfg, false).metrics;
+        let net = m.end.y - m.start.y;
+        if net > 1e-4 {
+            assert!(m.net_gain > 0.0 && m.net_loss == 0.0, "{m:?}");
+        } else if net < -1e-4 {
+            assert!(m.net_loss > 0.0 && m.net_gain == 0.0, "{m:?}");
+        }
     }
 
     #[test]

@@ -67,6 +67,36 @@ pub struct Metrics {
     /// for going right has learned nothing worth having.
     #[serde(default)]
     pub heading_progress: Real,
+    /// Net elevation ended *above* the settled start, in metres; zero if the
+    /// organism finished level or lower.
+    ///
+    /// Deliberately not derived from `end.y - start.y` at scoring time. Both are
+    /// clamped at zero per trial and only then averaged, and `max(0, mean)` is
+    /// not `mean(max(0, ..))` — an organism that climbs on one trial and falls on
+    /// another has genuinely gained on one of them.
+    ///
+    /// Unexploitable by construction: the only way to raise it is to end higher.
+    #[serde(default)]
+    pub net_gain: Real,
+    /// Net elevation ended *below* the settled start, in metres; zero if level
+    /// or higher. The mirror of [`Metrics::net_gain`], clamped the same way.
+    #[serde(default)]
+    pub net_loss: Real,
+    /// Total ascent over the run, hysteresis-filtered by
+    /// `fitness.climb_deadband`.
+    ///
+    /// Measures how much climbing was *done* rather than where the organism
+    /// ended up, so a hill climbed and descended still counts. That richness is
+    /// also the risk: an unfiltered version pays per unit of vertical wobble,
+    /// and an organism bobbing on the spot would accumulate ascent forever. The
+    /// deadband is what stops that, and `bobbing_on_the_spot_earns_no_climb`
+    /// is the test that keeps it stopped.
+    #[serde(default)]
+    pub climb: Real,
+    /// Total descent over the run, filtered by the same band as
+    /// [`Metrics::climb`].
+    #[serde(default)]
+    pub descent: Real,
     /// Joints that wore out and let a limb detach during the run.
     ///
     /// An outcome, not a rendering detail: this is recorded for *every*
@@ -113,6 +143,14 @@ pub fn score(cfg: &FitnessCfg, m: &Metrics) -> Real {
     base + cfg.upright_bonus * m.upright_seconds - cfg.energy_penalty * m.actuation
         + cfg.air_bonus * m.airborne_seconds
         + cfg.height_bonus * climbed
+        // Elevation, as two independent questions: how much height was kept, and
+        // how much was given away. Kept separate rather than netted so that an
+        // experiment can pay for one without implying the other — asking for
+        // climbing is not the same as forbidding descent.
+        + cfg.climb_bonus * m.net_gain
+        - cfg.descent_penalty * m.net_loss
+        + cfg.cumulative_climb_bonus * m.climb
+        - cfg.cumulative_descent_penalty * m.descent
 }
 
 #[cfg(test)]
@@ -136,6 +174,10 @@ mod tests {
             heading_progress: 3.0,
             peak_height: 0.0,
             airborne_seconds: 0.0,
+            net_gain: 0.0,
+            net_loss: 0.0,
+            climb: 0.0,
+            descent: 0.0,
             joints_lost: 0,
             diverged: false,
         }
@@ -170,6 +212,71 @@ mod tests {
         let grounded = score(&cfg, &m);
         m.airborne_seconds = 1.5;
         assert!((score(&cfg, &m) - grounded - 3.0).abs() < 1e-4);
+    }
+
+    /// Elevation ended above the start is paid for; elevation given away is
+    /// charged for. The two are independent, so an experiment can ask for
+    /// climbing without also forbidding descent.
+    #[test]
+    fn elevation_is_paid_for_in_both_directions() {
+        let cfg = FitnessCfg { climb_bonus: 10.0, descent_penalty: 4.0, ..Default::default() };
+        let mut m = metrics();
+        let level = score(&cfg, &m);
+
+        m.net_gain = 0.5;
+        assert!((score(&cfg, &m) - level - 5.0).abs() < 1e-4, "half a metre up is worth 5");
+
+        m.net_gain = 0.0;
+        m.net_loss = 0.5;
+        assert!((score(&cfg, &m) - level + 2.0).abs() < 1e-4, "half a metre down costs 2");
+    }
+
+    /// The failure mode `energy_penalty` already documents, in its sharper form.
+    ///
+    /// An organism that never moves loses no elevation, and unlike actuation it
+    /// is not even charged for standing there. If the descent penalty outweighs
+    /// what distance pays, evolution's best answer is to do nothing — so the
+    /// objective has to keep a term that immobility cannot satisfy.
+    #[test]
+    fn standing_still_does_not_beat_travelling() {
+        // Weights in the range the plan proposes: elevation dominant per metre,
+        // distance still the base objective.
+        let cfg = FitnessCfg {
+            objective: Objective::DistanceX,
+            climb_bonus: 10.0,
+            descent_penalty: 4.0,
+            ..Default::default()
+        };
+
+        let still = Metrics { diverged: false, ..Default::default() };
+
+        // A champion of the shipped fractal experiment: travels well, and gives
+        // away half a metre of height doing it.
+        let mut mover = Metrics { diverged: false, ..Default::default() };
+        mover.displacement = 5.5;
+        mover.displacement_x = 5.5;
+        mover.net_loss = 0.5;
+
+        assert!(
+            score(&cfg, &mover) > score(&cfg, &still),
+            "doing nothing scored {} against {} for an organism that travelled 5.5 m;              lower descent_penalty or keep a larger distance term",
+            score(&cfg, &still),
+            score(&cfg, &mover)
+        );
+    }
+
+    /// The weights are the only thing that turns these terms on, so a default
+    /// configuration must score exactly as it did before they existed.
+    #[test]
+    fn elevation_terms_are_inert_by_default() {
+        let cfg = FitnessCfg::default();
+        let mut m = metrics();
+        let before = score(&cfg, &m);
+        m.net_gain = 3.0;
+        m.net_loss = 3.0;
+        m.climb = 9.0;
+        m.descent = 9.0;
+        assert_eq!(score(&cfg, &m), before, "an unweighted elevation term changed the score");
     }
 
     #[test]

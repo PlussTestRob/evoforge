@@ -796,6 +796,44 @@ is precisely the kind of measurement [TERRAIN_PLAN.md](TERRAIN_PLAN.md) §12 war
 about relying on. The ordering and the corpse gate are solid; the part-count
 finding deserves a longer run before it is treated as established.
 
+### What 150 generations on the fractal field actually does
+
+The fractal arm was extended to generation 150 to find out whether it plateaus.
+It does not, and the answer changes what the numbers above appear to say.
+
+| | gen 29 | gen 149 |
+|---|---|---|
+| best fitness | 3.97 | **7.24** |
+| median fitness | 2.53 | 4.14 |
+| median travel, recorded organisms | 1.31 m | **6.58 m** |
+| fall-and-stop share of recorded organisms | 3 of 7 | **0–1 of 7** |
+| median temporal split | 51% | 45% |
+| distance covered dead (corpse gate) | 22% | 13% |
+
+Two things happened, and only one of them was expected.
+
+**The crude strategy dissolved on its own.** The fall-and-stop organisms of
+generation 20 are essentially gone by generation 120, without any intervention:
+the median temporal split settles at 45%, which is what a gait looks like, and
+median travel among recorded organisms rises eighteenfold to 6.58 m — level with
+what *flat* ground produced. Best fitness gains per 30-generation block run +2.21,
++0.27, +0.36, +0.43, so progress is decelerating but had not stopped at 150.
+
+**A subtler bias entrenched instead.** At generation 149 every organism in the
+population ends lower than it started — 100 of 100, spanning −0.010 to −0.725 m —
+and fitness now correlates with elevation change at **−0.60**. At generation 29
+that correlation was −0.15. So while the obvious downhill strategy was
+disappearing, selection under a pure distance objective was quietly getting
+*better* at travelling downhill: champions now cover about ten metres of ground
+per metre of height they give up, a ratio stable since generation 40.
+
+That is the more interesting result, and it is a specification finding rather
+than an optimisation one. Distance on sloped ground pays for descent, and 150
+generations is long enough for that to become the population's defining
+characteristic. It is what [FITNESS_PLAN.md](FITNESS_PLAN.md) exists to address —
+not by penalising the behaviour, but by asking a question that elevation is part
+of the answer to.
+
 ### Rewarding a jump
 
 Distance objectives have no opinion about the ground, and the cheapest way to
@@ -883,6 +921,75 @@ with shapes, disabling it is exact rather than approximate. No randomness is
 spent on the caution gene, and the controller keeps its original input count, so
 the weight vector stays the length it always was and every earlier result
 reproduces bit for bit.
+
+### Scoring elevation, not just distance
+
+Distance is the first fitness criterion, not the only one. Four terms score what
+an organism did with its height, and all of them default to zero.
+
+```toml
+[fitness]
+objective = "distance_x"
+
+climb_bonus = 10.0        # per metre ended above the settled start
+descent_penalty = 4.0     # per metre ended below it
+
+cumulative_climb_bonus = 0.0      # per metre of total ascent
+cumulative_descent_penalty = 0.0  # per metre of total descent
+climb_deadband = 0.05             # metres of movement before either registers
+```
+
+The first pair is **net**: where the organism finished, relative to where it
+settled. Clamped per trial and only then averaged, so climbing on one trial and
+falling on another reports both rather than netting to nothing. It cannot be
+farmed — the only way to raise it is to end higher.
+
+The second pair is **cumulative**: total ascent and descent over the run, so a
+hill climbed and descended still counts. That is richer and it is the pair that
+needs watching, because anything paying per unit of vertical movement invites an
+organism to bob on the spot. `climb_deadband` is a hysteresis band, not a
+per-step threshold: the reference height moves only when a move registers, so a
+slow drift still accumulates while a gait's wobble never leaves the band.
+Measured on organisms evolved under a pure distance objective, an honest gait
+produces at most 0.05 m of incidental ascent over a whole run, which is where the
+default came from. `Config::validate` refuses a cumulative term with no band.
+
+Two cautions, both of them measured rather than theoretical.
+
+**An organism that never moves loses no elevation**, and unlike `energy_penalty`
+it is not even charged for standing there. If `descent_penalty` outweighs what
+distance pays, the best strategy is to do nothing — keep a distance term in the
+objective. `standing_still_does_not_beat_travelling` is the gate.
+
+**A climb bonus is worth nothing on ground with no reachable climb.** Across 150
+generations of the shipped fractal experiment, not one organism ever ended higher
+than it started, so `climb_bonus` changes no score and no ranking there at any
+value. Check what climb is actually reachable before tuning the weight.
+
+### Re-scoring a finished run
+
+Because full metrics are stored for every organism and `fitness::score` reads
+nothing else, a completed run can be scored under a different question without
+re-simulating anything:
+
+```bash
+# What would this population have looked like under a descent penalty?
+./target/release/evo rescore runs/<run> --descent-penalty 8 --tail 10
+
+# And which organisms would that have promoted?
+./target/release/evo rescore runs/<run> --descent-penalty 8 --show-generation 149
+```
+
+It reports the best and median under both scorings and how much of the top ten
+survives the re-weighting — a scoring that reorders nobody is not asking a new
+question. With no weights overridden it is a round trip and must reproduce the
+recorded fitness exactly, which is what makes the rest of its output worth
+reading.
+
+Runs that finished before elevation was recorded can still be re-scored on the
+net terms: `start` and `end` were always stored, so the pair is recovered from
+them, approximately for multi-trial runs because the stored endpoints are already
+averaged.
 
 ### Viewer
 

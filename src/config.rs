@@ -353,6 +353,27 @@ impl Config {
         if self.fitness.energy_penalty < 0.0 || self.fitness.upright_bonus < 0.0 {
             bad("fitness energy_penalty and upright_bonus must be non-negative")?;
         }
+        // Penalties are subtracted, so a negative one is a bonus wearing the
+        // wrong name — and a negative `descent_penalty` pays an organism to fall,
+        // which is precisely the behaviour these terms exist to stop rewarding by
+        // accident.
+        if self.fitness.descent_penalty < 0.0 || self.fitness.cumulative_descent_penalty < 0.0 {
+            bad("fitness descent penalties must be non-negative")?;
+        }
+        if self.fitness.climb_deadband < 0.0 {
+            bad("fitness climb_deadband must be non-negative")?;
+        }
+        // A cumulative term with no band pays per unit of vertical wobble, and a
+        // gait produces plenty. Refusing this outright is cheaper than
+        // discovering it forty generations into a run.
+        if (self.fitness.cumulative_climb_bonus != 0.0
+            || self.fitness.cumulative_descent_penalty != 0.0)
+            && self.fitness.climb_deadband <= 0.0
+        {
+            bad(
+                "fitness climb_deadband must be greater than zero when a cumulative                  elevation term is used: without a band, an organism bobbing on the                  spot accumulates ascent without travelling",
+            )?;
+        }
         Ok(())
     }
 }
@@ -871,6 +892,40 @@ pub struct FitnessCfg {
     /// height alone rewards a rear-up that never leaves the ground. Together
     /// they ask for a jump.
     pub height_bonus: Real,
+
+    /// Added per metre the organism *ends* above where it settled.
+    ///
+    /// This is the "go uphill" term. Distance and elevation are not comparable
+    /// per metre: on the shipped fractal terrain an evolved champion covers
+    /// about ten metres of ground per metre of height it gives up, so a weight
+    /// near 10 is what makes half a metre of climb worth as much as a whole
+    /// run. Zero by default.
+    pub climb_bonus: Real,
+    /// Subtracted per metre the organism ends *below* where it settled.
+    ///
+    /// Beware the failure mode `energy_penalty` documents: an organism that
+    /// never moves loses no elevation, and unlike actuation it is not even
+    /// charged for standing there. Keep a distance term in the objective, or
+    /// the highest-scoring strategy is to do nothing. Zero by default.
+    pub descent_penalty: Real,
+    /// Added per metre of *total* ascent, hysteresis-filtered — a hill climbed
+    /// and then descended still counts. Richer than `climb_bonus` and the one
+    /// that has to be watched, since anything paying per unit of vertical
+    /// movement invites bobbing on the spot. Zero by default.
+    pub cumulative_climb_bonus: Real,
+    /// Subtracted per metre of total descent, filtered by the same band.
+    /// Zero by default.
+    pub cumulative_descent_penalty: Real,
+    /// How far the centre of mass must leave its last registered height before
+    /// the move counts toward `Metrics::climb` or `Metrics::descent`, in metres.
+    ///
+    /// A band rather than a per-step threshold: the reference height only moves
+    /// when a move is registered, so a slow drift still accumulates while a
+    /// gait's bobbing does not. Measured on organisms evolved under a pure
+    /// distance objective, an honest gait produces at most 0.05 m of incidental
+    /// ascent over a whole run on rough ground, and 0.05 m of band removes all
+    /// of it. Affects the recorded metrics whether or not they are scored.
+    pub climb_deadband: Real,
 }
 
 impl Default for FitnessCfg {
@@ -881,6 +936,11 @@ impl Default for FitnessCfg {
             upright_bonus: 0.0,
             air_bonus: 0.0,
             height_bonus: 0.0,
+            climb_bonus: 0.0,
+            descent_penalty: 0.0,
+            cumulative_climb_bonus: 0.0,
+            cumulative_descent_penalty: 0.0,
+            climb_deadband: 0.05,
         }
     }
 }
@@ -1151,6 +1211,21 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
         f.tag(b"jump");
         f.real(cfg.fitness.air_bonus);
         f.real(cfg.fitness.height_bonus);
+    }
+    // Same rule for elevation. `climb_deadband` changes the recorded metrics
+    // whatever the weights are, but it can only change the *dynamics* when a
+    // cumulative term reads them, so it is folded in with the terms that use it.
+    if cfg.fitness.climb_bonus != 0.0
+        || cfg.fitness.descent_penalty != 0.0
+        || cfg.fitness.cumulative_climb_bonus != 0.0
+        || cfg.fitness.cumulative_descent_penalty != 0.0
+    {
+        f.tag(b"elevation");
+        f.real(cfg.fitness.climb_bonus);
+        f.real(cfg.fitness.descent_penalty);
+        f.real(cfg.fitness.cumulative_climb_bonus);
+        f.real(cfg.fitness.cumulative_descent_penalty);
+        f.real(cfg.fitness.climb_deadband);
     }
     f.real(cfg.fitness.upright_bonus);
 

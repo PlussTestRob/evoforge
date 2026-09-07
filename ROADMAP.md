@@ -167,7 +167,9 @@ Work:
   result is self-describing: what the organism was asked, and what it did.
 - **Widen `Metrics` where evaluation needs it.** It is already the sole input to
   scoring and is already recorded per organism. Elevation gained and lost, and
-  distance to a target, are the two additions Phase 2 needs.
+  distance to a target, are the two additions Phase 2 needs. The elevation pair
+  is planned in [FITNESS_PLAN.md](FITNESS_PLAN.md), together with the weighting
+  and the re-scoring tool below.
 - **Re-scoring without re-simulating.** Because full metrics are stored for every
   organism, an existing run can be scored under a different objective after the
   fact. This is stated as a design intent in `fitness.rs` and is not yet

@@ -73,7 +73,14 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 ///   that turns the savage regions into plateaus separated by near-vertical
 ///   risers. All three default to off, so a v6 `fractal` trace still describes
 ///   the same field it always did.
-pub const ARTIFACT_FORMAT: u32 = 7;
+/// * `8` — `Metrics` gained four elevation fields: net gain and net loss, each
+///   clamped per trial before averaging, and hysteresis-filtered totals for
+///   ascent and descent. All four default to zero on read, and every fitness
+///   weight that reads them defaults to zero, so a v7 record scores exactly what
+///   it scored before. Net gain and loss are also recoverable from a v7 record's
+///   stored `start` and `end`, which is what lets `evo rescore` ask elevation
+///   questions of runs that finished before the metric existed.
+pub const ARTIFACT_FORMAT: u32 = 8;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

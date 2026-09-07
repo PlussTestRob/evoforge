@@ -22,6 +22,20 @@ const HEADER_SLICE = 65536;
 /** How many replay headers to read at once. */
 const CONCURRENCY = 16;
 
+/**
+ * Net elevation change over the measured window.
+ *
+ * Reads the recorded pair when a replay has it, and falls back to the endpoints
+ * for anything written before format 8, where the metric did not exist yet.
+ */
+function netElevation(m) {
+  if (typeof m.net_gain === 'number' || typeof m.net_loss === 'number') {
+    return (m.net_gain || 0) - (m.net_loss || 0);
+  }
+  if (m.end && m.start) return m.end.y - m.start.y;
+  return 0;
+}
+
 /** Sort keys offered in the dropdown, and what the presets below reach for. */
 const SORTS = [
   { key: 'fitness', label: 'fitness', of: (e) => e.fitness },
@@ -31,6 +45,9 @@ const SORTS = [
   { key: 'wander', label: 'wander (path − displacement)', of: (e) => e.wander },
   { key: 'upright', label: 'seconds upright', of: (e) => e.m.upright_seconds },
   { key: 'height', label: 'mean height', of: (e) => e.m.mean_height },
+  { key: 'elevation', label: 'net elevation', of: (e) => netElevation(e.m) },
+  { key: 'climb', label: 'total ascent', of: (e) => e.m.climb || 0 },
+  { key: 'descent', label: 'total descent', of: (e) => e.m.descent || 0 },
   { key: 'actuation', label: 'actuation (effort)', of: (e) => e.m.actuation },
   { key: 'economy', label: 'distance per effort', of: (e) => e.economy },
   { key: 'breaks', label: 'joints lost', of: (e) => e.breaks },
@@ -71,6 +88,8 @@ const PRESETS = [
   { label: 'Wanderers', sort: 'wander', dir: -1 },
   { label: 'Most efficient', sort: 'economy', dir: -1 },
   { label: 'Hardest working', sort: 'actuation', dir: -1 },
+  { label: 'Climbers', sort: 'elevation', dir: -1 },
+  { label: 'Descenders', sort: 'elevation', dir: 1 },
   { label: 'Broke a joint', sort: 'breaks', dir: -1, filter: 'broke' },
   { label: 'Most cautious', sort: 'caution', dir: -1 },
   { label: 'Latest', sort: 'generation', dir: -1 },
