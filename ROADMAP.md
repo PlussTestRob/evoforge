@@ -63,6 +63,22 @@ Note what none of those did: none of them made a behaviour illegal. An organism
 may still fling a limb, still ride a slope down, still commit everything to one
 launch. Those score what they genuinely earn under the objective in force.
 
+**Three strategies currently in the repository, none of them a problem.** The
+same experiment run on three grounds produces three different answers to "travel
+as far as you can", and all three are correct:
+
+| ground | what evolves |
+|---|---|
+| flat | small two-part machines that *vibrate* along. Nothing about a plane and a distance objective asks for more. |
+| sine | slightly larger bodies, visibly less vibration. A 13 cm ripple is enough to make buzzing stop paying so well. |
+| terraced fractal | large bodies, near the eight-part maximum, that move *just enough to fall off a nearby drop*. On ground with 5.6 m of relief that is a sound reading of the question. |
+
+The third is the interesting one, and the temptation is to call it cheating. It
+is not: the physics is right, the measurement is honest, and falling down a hill
+really is a way of covering ground. If what we want is *controlled* descent
+rather than a well-aimed fall, then the objective has to be able to tell those
+apart — which is Phase 2, not a penalty term.
+
 The diagnostic tools in [examples/](examples/) exist to make the distinction
 decidable rather than arguable, and they carry forward into every phase below:
 
@@ -76,6 +92,15 @@ decidable rather than arguable, and they carry forward into every phase below:
 
 They are observation instruments. Their output belongs in the description of a
 result, not in a penalty term.
+
+**A known blind spot, since it bears on how the corpse figure is read.**
+`dead_organism_probe` measures free distance from where an organism *starts*. An
+organism that spends a little actuation getting itself to a cliff edge and then
+falls is doing something no motors-off corpse can imitate, because a corpse never
+reaches the edge. The figure is therefore a lower bound on how much of a score
+the terrain handed over, not a full accounting. It remains the right gate for
+what it was built for — catching the simulator propelling things — and Phase 1's
+task descriptions are what would let a metric distinguish the rest.
 
 ## Phase 0 — where we are
 
@@ -91,13 +116,17 @@ per-trial start, terrain and heading variation; tournament selection with
 elitism, slot-aligned crossover and mutation; checkpoint, resume and extension;
 selective recording and exact re-simulation; a browser replay viewer.
 
-Two debts carried forward from the terrain work, both stated in
+Two items carried forward from the terrain work, both stated in
 [TERRAIN_PLAN_2.md](TERRAIN_PLAN_2.md):
 
-- **The terrain A/B was never rerun.** The 80-generation comparison of sine
-  against fractal ground was voided by the solver bug, which the fractal run
-  happened to amplify. The solver is fixed; the comparison is still outstanding,
-  and until it is run we do not actually know what harder ground buys.
+- **The terrain A/B has been rerun once, briefly.** The 80-generation comparison
+  of sine against fractal ground was voided by the solver bug, which the fractal
+  run happened to amplify. A 30-generation, three-arm rerun (flat, sine, fractal)
+  now scores monotonically with difficulty — 9.18, 7.53, 3.97 — and passes the
+  corpse gate on every arm, so the comparison is valid again. What is still
+  outstanding is a longer replicated run: thirty generations on one seed is a
+  direction check, and the part-count result below deserves more than that. See
+  [README.md](README.md) for the full figures.
 - **Discrete obstacles were deferred** and remain the only proposed feature that
   produces a discontinuity at or above a wheel's own radius. Picked up in
   Phase 2.
@@ -153,7 +182,10 @@ in particular*.
   Downhill is deliberately included even though it is the easier problem — an
   organism that can only fall down a hill and an organism that can descend under
   control both score well on distance, and the point of the task is to build the
-  measurement that separates them.
+  measurement that separates them. This is no longer hypothetical: on the
+  terraced landscape the current objective already selects for bodies that move
+  just far enough to fall off something, which is the clearest demonstration
+  available that distance alone cannot ask the question we want.
 - **Beacons.** A target position in the world; the metric is closest approach, or
   whether it was touched. **This is buildable before any sensor exists**: hand
   the controller the beacon's relative position exactly as the commanded heading

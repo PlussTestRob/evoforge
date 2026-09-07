@@ -678,6 +678,104 @@ cargo run --release --example terrain_samples > samples.json
 node viewer/terrain_check.mjs samples.json
 ```
 
+### What each ground selects for
+
+Three arms of `animals.toml`, identical but for `[environment]`, same seed, 30
+generations of 100: flat, the sine field, and the terraced fractal landscape.
+
+| arm | best | mean | median | median gen 0 → 29 | mean parts 0 → 29 | distinct structures |
+|---|---|---|---|---|---|---|
+| flat | 9.18 | 6.65 | 8.94 | 1.07 → 8.94 | 4.52 → 2.12 | 21 / 100 |
+| rough | 7.53 | 4.21 | 4.98 | 0.86 → 4.98 | 4.52 → 3.14 | 46 / 100 |
+| fractal | 3.97 | 2.44 | 2.53 | 0.80 → 2.53 | 4.52 → 7.82 | 97 / 100 |
+
+Scores fall monotonically with difficulty. That is the result the earlier
+comparison could not produce: on the pre-0.3.0 solver the fractal run scored 28.1
+against the sine field's 12.0 — harder ground scoring more than twice as high,
+which was the tell that the simulator, not the organisms, was doing the
+travelling. The median rises in every arm, so all three populations are improving
+as populations rather than carrying one lucky champion.
+
+**What the three grounds actually produce**, watched in the viewer rather than
+inferred from the numbers:
+
+* **Flat** selects small machines that *vibrate*. Two parts, buzzing, and that is
+  enough — nothing in a flat plane plus a distance objective asks for more.
+* **Rough** selects slightly larger bodies and visibly less vibration. A 13 cm
+  ripple is enough to stop buzzing from working as well as it does on glass.
+* **Fractal** selects large machines — nearly the eight-part maximum — that are
+  not obviously good at moving themselves. What they appear to have found is
+  moving *just enough to fall off a nearby drop*. On ground with 5.6 m of relief
+  and cliffs to 82 degrees, that is a perfectly sound reading of "travel as far
+  as you can". A plausible untested prediction is that more generations would
+  find rolling.
+
+None of those three is a defect, and none of them is something to legislate
+against. They are correct answers to the question actually being asked, which is
+"how far did you get". The fractal population in particular is doing something
+the objective genuinely rewards; if what we want is controlled descent rather
+than a well-aimed fall, the fix is a task that can tell those apart — which is
+what [ROADMAP.md](ROADMAP.md) Phase 2 is for — and not a penalty for falling.
+
+**The corpse gate passes**, which is what makes the comparison valid at all.
+Champions re-evaluated with their motors fully off:
+
+| arm | champion alive | motors off | share |
+|---|---|---|---|
+| flat | 6.28 m | −0.14 m | −2% |
+| rough | 2.96 m | 0.20 m | 7% |
+| fractal | 1.54 m | 0.34 m | 22% |
+
+Against 97% before the split-impulse fix. The gate is the absolute figure — under
+2 m in eight seconds — and 0.34 m clears it comfortably; the 22% share is
+inflated by a small denominator, because locomotion on that ground is only 1.54 m
+to begin with.
+
+**One blind spot in that probe worth writing down.** It measures free distance
+from where the organism *starts*. An organism that spends a little actuation
+getting itself to a cliff edge and then falls is not doing anything a
+motors-off corpse can imitate, because a corpse never reaches the edge. So the
+figures above are a lower bound on how much of the fractal score the terrain is
+handing over, not a full accounting. That is a limitation of the diagnostic, not
+a reason to distrust the comparison — the point of the gate is to catch the
+simulator propelling things, and it does.
+
+**Part count moves in opposite directions**, and it is not free drift doing it.
+`examples/drift_probe.rs`, motors off, 40 random organisms per part count:
+
+| parts | flat | rough | fractal |
+|---|---|---|---|
+| 2 | −0.02 m | −0.07 m | 0.09 m |
+| 4 | 0.01 m | −0.04 m | 0.10 m |
+| 8 | 0.04 m | 0.04 m | 0.17 m |
+
+Drift does rise with part count on the fractal field, but going from four parts
+to eight buys 0.07 m against a spread of roughly 1.5 m between the population
+mean and the best — about 5% of what selection is working on. And on flat and
+rough, where drift is essentially zero, part count *collapses* rather than
+growing. So the growth to 7.8 parts reads as a real finding about hard ground
+rather than as bodies farming the solver.
+
+**Cost, decomposed.** At equal body size (generation 0, 4.52 parts in every arm)
+the terrain alone costs 5.6x from flat to fractal and 2.1x from rough to fractal,
+which matches what the terrain plan predicted. The rest is endogenous: hard
+ground evolves bigger bodies and bigger bodies cost more to simulate, so the
+fractal arm got 2x slower over the run while the flat arm got 1.5x faster. End to
+end the arms differed 11x in wall clock, and only about half of that is the
+ground itself.
+
+| arm | generation 0 | generation 29 |
+|---|---|---|
+| flat | 82.2 organisms/s @ 4.52 parts | 122.7 @ 2.12 parts |
+| rough | 30.6 organisms/s @ 4.52 parts | 38.9 @ 3.14 parts |
+| fractal | 14.7 organisms/s @ 4.52 parts | 7.4 @ 7.82 parts |
+
+**Read this as a direction check, not a settled comparison.** Thirty generations
+on one seed, against the eighty of the original A/B, with no repetition — which
+is precisely the kind of measurement [TERRAIN_PLAN.md](TERRAIN_PLAN.md) §12 warns
+about relying on. The ordering and the corpse gate are solid; the part-count
+finding deserves a longer run before it is treated as established.
+
 ### Rewarding a jump
 
 Distance objectives have no opinion about the ground, and the cheapest way to
@@ -862,9 +960,11 @@ infrastructure. The first three are on [ROADMAP.md](ROADMAP.md); see
 assumptions that would affect scaling, and where the implementation is meant to
 be replaced.
 
-One outstanding debt worth naming: the 80-generation A/B comparing sine ground
-against fractal ground was invalidated by the solver bug described above and has
-not been rerun, so what harder terrain actually buys is currently unmeasured.
+The A/B that the solver bug invalidated has been rerun at 30 generations, across
+three grounds rather than two — see [What each ground selects for](#what-each-ground-selects-for).
+Scores now fall monotonically with difficulty and the corpse gate passes on every
+arm. A longer replicated run is still wanted before the part-count result is
+treated as established.
 
 ## License
 

@@ -2,9 +2,11 @@
 
 > **Historical record.** This is a completed plan, kept for the reasoning and the
 > measurements in it. The solver bug it discovered was fixed in
-> [TERRAIN_PLAN_2.md](TERRAIN_PLAN_2.md); the A/B comparison it voided has still
-> not been rerun. For where the project is going now, see
-> [ROADMAP.md](ROADMAP.md), which carries the outstanding items forward.
+> [TERRAIN_PLAN_2.md](TERRAIN_PLAN_2.md), and the A/B comparison it voided has
+> since been rerun at 30 generations across three grounds — scores now fall
+> monotonically with difficulty, and the corpse gate passes on every arm. See
+> "What each ground selects for" in [README.md](README.md) for the figures, and
+> [ROADMAP.md](ROADMAP.md) for where the project is going now.
 
 Status: **built, stages 1-4 and the experiment file. Run — and the run found a
 pre-existing bug in the simulator that invalidates the comparison.**
