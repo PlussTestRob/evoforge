@@ -68,7 +68,12 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 ///   `fractal` trace cannot interpret it; the viewer says so and falls back to a
 ///   flat plane rather than drawing a plausible lie. Absent samples mean flat
 ///   ground, which is what every v5 artefact without them meant.
-pub const ARTIFACT_FORMAT: u32 = 6;
+/// * `7` — terrain gained three more bands: detail at organism scale, a slow
+///   field saying where the ground is calm and where it is savage, and terracing
+///   that turns the savage regions into plateaus separated by near-vertical
+///   risers. All three default to off, so a v6 `fractal` trace still describes
+///   the same field it always did.
+pub const ARTIFACT_FORMAT: u32 = 7;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

@@ -72,12 +72,12 @@ What landed, against the staging in §11:
 Two findings that contradict this plan as written, both measured with
 `examples/terrain_probe.rs`:
 
-* **Domain warping does not produce heterogeneity** (§4). Relief per 12 m tile
-  varies by 10% of its mean whether warp is 0 or 1 — warping a stationary field
-  with a stationary displacement leaves it stationary. What warp actually buys
-  is the tail of the slope distribution: at a=0.25, w=6, the steepest slope
-  anywhere goes from 19 degrees to 29. The docs say this rather than the
-  adjective.
+* **Domain warping does not produce heterogeneity** (§4) — *later found to be
+  wrong; see TERRAIN_PLAN_2.md.* The measurement behind it used the spread of
+  *relief* per 12 m tile, which a large smooth hill dominates and which
+  therefore cannot see a change in local steepness. Measured as the spread of
+  mean *slope*, warp 0 to 1 roughly doubles it. What warp genuinely cannot do
+  is produce cliffs.
 * **Peak-to-trough is 2.34x amplitude**, not 2.5x, and the fractal field at a
   given amplitude is *gentler* than `rough` unless the wavelength comes down
   with it — local slope is set by the finest octave, not the nominal one. The

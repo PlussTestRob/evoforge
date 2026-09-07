@@ -10,8 +10,18 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { initLibrary } from './library.js';
-import { terrainHeight, finestFeature, terrainCheck, seedPair } from './terrain.js';
+// The `?v=` on these is a cache buster; see the note in index.html. Bump all
+// three together — a half-updated viewer is worse than a stale one.
+import { initLibrary } from './library.js?v=0.3.0';
+import {
+  terrainHeight,
+  finestFeature,
+  terrainCheck,
+  seedPair,
+} from './terrain.js?v=0.3.0';
+
+/** Shown in the HUD, so "is my viewer current?" is answerable at a glance. */
+const VIEWER_VERSION = '0.3.0';
 
 const POSE_STRIDE = 7;
 
@@ -84,16 +94,18 @@ function shapeGround(terrain) {
   // nominal wavelength. This is where the single-scale field caught me out
   // once, and a four-octave one has eight times as far to fall.
   //
-  // The cap is a real limit, not a formality. At the shipped fractal settings
-  // the finest octave is 0.375 m across, and resolving it properly would ask
-  // for 1900 segments: 3.6 million vertices, and — measured in node — some
-  // eight seconds of hashing, for a ripple three centimetres deep. The cap
-  // spends 780 ms on 361k vertices instead and smooths that ripple away.
-  // Everything an organism can actually climb is drawn.
-  const span = shaped ? ROUGH_SPAN : GROUND_SPAN;
-  const segments = shaped
-    ? Math.min(MAX_GROUND_SEGMENTS, Math.ceil((span / finestFeature(terrain)) * 8))
-    : 1;
+  // The cap is a real limit, not a formality: a terrace riser is 160 mm wide,
+  // and resolving that across the full sheet would ask for thousands of
+  // segments and tens of millions of hashes. Terraced ground therefore gets a
+  // smaller sheet as well — an organism that has to climb a wall every twenty
+  // metres is not going to cross ninety of them — which buys back the
+  // resolution where it is needed. Measured in node, the cap costs about
+  // 780 ms on 361k vertices.
+  const terraced = kind === 'fractal' && (terrain.step ?? 0) > 0;
+  const span = terraced ? TERRACED_SPAN : shaped ? ROUGH_SPAN : GROUND_SPAN;
+  // `finestFeature` returns 0 for terraced ground, which asks for the cap.
+  const wanted = Math.ceil((span / finestFeature(terrain)) * 8);
+  const segments = shaped ? Math.min(MAX_GROUND_SEGMENTS, wanted || MAX_GROUND_SEGMENTS) : 1;
   const next = new THREE.PlaneGeometry(span, span, segments, segments);
   if (shaped) {
     // Resolve the seed once rather than per vertex; it costs a BigInt parse.
@@ -110,10 +122,22 @@ function shapeGround(terrain) {
   ground.geometry.dispose();
   ground.geometry = next;
   grid.visible = !shaped; // a flat grid over shaped ground reads as a mistake
+  // What was actually built, for the HUD. A replay drawn on a flat plane when
+  // its trace says otherwise is the failure this reports: it looks like the
+  // organism is falling through the ground, and the usual cause is a browser
+  // serving cached JavaScript against freshly written replay data.
+  groundMesh = shaped ? `${span} m sheet, ${segments}x${segments}` : 'flat plane';
 }
+
+let groundMesh = 'flat plane';
 
 const GROUND_SPAN = 200;
 const ROUGH_SPAN = 90;
+/** Terraced ground is drawn on a smaller sheet, so the cliffs get enough mesh
+ *  resolution to read as cliffs rather than ramps: 30 m across the cap's 600
+ *  segments is 50 mm each, against 160 mm walls. An organism that has to climb
+ *  a wall every twenty metres is not going to cross ninety of them. */
+const TERRACED_SPAN = 30;
 const MAX_GROUND_SEGMENTS = 600;
 /** `TerrainModel`'s variants. Anything else came from a newer evoforge. */
 const KNOWN_TERRAIN = new Set(['flat', 'rough', 'fractal']);
@@ -314,7 +338,18 @@ function fillHud(r) {
   const breaks = (r.trace.breaks || []).length;
   el('h-breaks').textContent = breaks ? `${breaks}` : 'none';
   el('h-breaks').className = breaks ? 'warn' : '';
-  el('h-terrain').textContent = (r.trace.terrain && r.trace.terrain.kind) || 'flat';
+  const t = r.trace.terrain;
+  const bands = t && t.kind === 'fractal'
+    ? [
+        'landscape',
+        (t.detail_amplitude ?? 0) > 0 ? 'detail' : null,
+        (t.modulation ?? 0) > 0 ? 'modulated' : null,
+        (t.step ?? 0) > 0 ? (t.terrace_mask ? 'terraced (masked)' : 'terraced') : null,
+      ].filter(Boolean).join(' + ')
+    : null;
+  el('h-terrain').textContent =
+    `${(t && t.kind) || 'flat'}${bands ? ` — ${bands}` : ''} — drawn as ${groundMesh}`;
+  el('h-viewer').textContent = VIEWER_VERSION;
   el('h-diverged').hidden = !m.diverged;
   ui.hud.hidden = false;
 }

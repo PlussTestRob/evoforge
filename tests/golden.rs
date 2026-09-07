@@ -27,6 +27,19 @@
 //!   investigating before trusting any result from that machine.
 //!
 //! The constants were produced on x86-64 by `cargo run --example golden_probe`.
+//!
+//! # History
+//!
+//! Re-baselined once, at version 0.3.0, when the solver was changed to a split
+//! impulse: positional correction now accumulates in a pseudo-velocity used only
+//! to displace bodies, instead of being added into `lin_vel` where it stayed as
+//! momentum. That was not a refactor. It removed a source of free energy that
+//! evolved organisms were living on — champions crossed twenty-six metres with
+//! their motors switched off — and every number below moved. Genomes stored
+//! under 0.2.x will not re-simulate to their recorded fitness, which is what the
+//! version bump says. See `self_collision_is_not_a_motor` in
+//! `src/physics/world.rs` for the failure it fixed, and note that no test here
+//! caught it: these constants pin *reproducibility*, not correctness.
 
 use evoforge::config::Config;
 use evoforge::evolution::{self, Population};
@@ -50,19 +63,19 @@ const STRUCTURE_HASH: u64 = 0x8fa4_6b52_502d_4257;
 /// Bit patterns, not values: `assert_eq!` on floats would accept a result that
 /// differs in the last place, and the last place is exactly where drift starts.
 const ONE_ORGANISM: [(&str, u32); 8] = [
-    ("fitness", 0x3d98_96f8),
-    ("displacement", 0x3d26_1371),
-    ("displacement_x", 0x3be2_2d08),
-    ("path_length", 0x3daa_e39e),
-    ("max_displacement", 0x3d42_d463),
-    ("mean_height", 0x3e6f_40b6),
+    ("fitness", 0x3dc4_ff04),
+    ("displacement", 0x3d5b_63e0),
+    ("displacement_x", 0x3baa_a080),
+    ("path_length", 0x3d97_707a),
+    ("max_displacement", 0x3d5b_63e0),
+    ("mean_height", 0x3e6e_888e),
     ("upright_seconds", 0x3fbf_fff7),
-    ("actuation", 0x43aa_84fb),
+    ("actuation", 0x43a6_2fa5),
 ];
 
 /// `(best fitness bits, best organism id)` for generations 0..4.
 const GENERATION_BESTS: [(u32, u64); 4] =
-    [(0x3f4d_837a, 4), (0x3f55_2b96, 27), (0x3f84_aff4, 43), (0x3f85_6935, 61)];
+    [(0x3f4f_867a, 3), (0x3f4f_867a, 17), (0x3f76_59cd, 44), (0x3f76_59cd, 49)];
 
 fn golden_config() -> Config {
     Config::from_toml_str(GOLDEN_CONFIG).expect("the frozen config must stay valid")

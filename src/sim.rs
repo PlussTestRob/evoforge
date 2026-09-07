@@ -47,6 +47,15 @@ const MAX_START_OFFSET: Real = 0.5;
 /// own largest feature. Wide enough that two trials share no feature at all.
 const TERRAIN_SHIFT_SPAN: Real = 64.0;
 
+/// How many places to try before setting an organism down on whatever is there.
+const SPAWN_SEARCH_TRIES: u32 = 12;
+/// Radius of the patch that has to be level, metres. About the span of the
+/// largest organism the body limits allow.
+const SPAWN_FOOTPRINT: Real = 0.6;
+/// How level that patch has to be, as the `y` component of the surface normal.
+/// 0.96 is a slope of about 16 degrees — a hillside, not a wall.
+const SPAWN_MIN_LEVELNESS: Real = 0.96;
+
 pub const CLOCK_HZ: Real = 1.0;
 
 /// One recorded instant: body poses at a point in time.
@@ -261,10 +270,25 @@ fn terrain_shift(rng: &mut Rng, cfg: &Config) -> phenotype::TerrainShift {
     if !terrain_varies(cfg) {
         return phenotype::TerrainShift::NONE;
     }
-    let offset_x = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
-    let offset_z = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
-    let (sin, cos) = crate::math::dsincos(rng.range(0.0, crate::math::TAU));
-    phenotype::TerrainShift { offset_x, offset_z, sin, cos }
+    let mut candidate = phenotype::TerrainShift::NONE;
+    for _ in 0..SPAWN_SEARCH_TRIES {
+        let offset_x = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
+        let offset_z = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
+        let (sin, cos) = crate::math::dsincos(rng.range(0.0, crate::math::TAU));
+        candidate = phenotype::TerrainShift { offset_x, offset_z, sin, cos };
+        // The organism is set down at the origin, so what matters is the ground
+        // the *shifted* field puts there. On a terraced landscape roughly one
+        // patch in ten is a cliff face, and starting half inside one is not a
+        // trial, it is a coin toss.
+        let terrain = phenotype::terrain_for(cfg, candidate);
+        if terrain.levelness_near(0.0, 0.0, SPAWN_FOOTPRINT) >= SPAWN_MIN_LEVELNESS {
+            break;
+        }
+    }
+    // If every candidate was a cliff the last one is used anyway: refusing to
+    // place the organism at all would be worse, and a config whose ground is
+    // that hostile everywhere is caught by `Config::validate`.
+    candidate
 }
 
 /// The direction this trial asks the organism to travel.
@@ -878,6 +902,52 @@ mod tests {
             // The stream is untouched: the very next draw is the first draw.
             let mut fresh = Rng::new(1234);
             assert_eq!(rng.next_u64(), fresh.next_u64());
+        }
+    }
+
+    /// A corpse must not travel.
+    ///
+    /// The single most useful test in this file, and it did not exist for the
+    /// two months in which every headline result was inflated by its absence.
+    /// An organism with its motors switched off has nothing to move it: no
+    /// muscle, no tendon, and — once it has settled — no potential energy to
+    /// spend. Whatever ground it covers is ground the *world* gave it, and any
+    /// locomotion score is only meaningful above that number.
+    ///
+    /// Run over ordinary random genomes rather than evolved ones on purpose:
+    /// evolution is what finds the exploit, so a test that waits for evolution
+    /// to find it has already let a run be wasted. Big terrain makes this
+    /// sharper, not softer — five metres of relief is metres of free
+    /// displacement for anything that will roll downhill.
+    #[test]
+    fn a_dead_organism_does_not_travel() {
+        for terrain in [
+            crate::config::Terrain::Flat,
+            crate::config::Terrain::Rough,
+            crate::config::Terrain::Fractal,
+        ] {
+            let mut cfg = fractal_config();
+            cfg.environment.terrain = terrain;
+            // The organism's own throttle, turned to zero. Not a special case in
+            // the simulator: `caution` and `min_drive` are how an evolved
+            // organism holds back, and this is that mechanism at its limit. It
+            // is only consulted when joints can wear out, so that has to be on.
+            cfg.body.joint_endurance = 150.0;
+            cfg.body.min_drive = 0.0;
+            assert!(cfg.joints_can_break());
+
+            let mut worst: Real = 0.0;
+            for seed in 0..24 {
+                let mut g = random_genome(&cfg, 5_000 + seed);
+                g.caution = 1.0;
+                let m = evaluate(&g, &cfg, false).metrics;
+                worst = worst.max(m.displacement);
+            }
+            assert!(
+                worst < 2.0,
+                "{terrain:?}: a motorless organism covered {worst} m in {} s",
+                cfg.simulation.duration
+            );
         }
     }
 

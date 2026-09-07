@@ -116,6 +116,36 @@ const WARP_OFFSET_Z = -1.749;
 const WARP_SEED_X_LO = 0x5f580001, WARP_SEED_X_HI = 0x57415250;
 const WARP_SEED_Z_LO = 0x5f5a0001, WARP_SEED_Z_HI = 0x57415250;
 const OCTAVE_STRIDE_LO = 0x56450001, OCTAVE_STRIDE_HI = 0x4f435441;
+const DETAIL_SEED_LO = 0x494c0001, DETAIL_SEED_HI = 0x44455441;
+const MODULATION_SEED_LO = 0x4c415445, MODULATION_SEED_HI = 0x4d4f4455;
+const MODULATION_OFFSET_X = 7.13;
+const MODULATION_OFFSET_Z = -2.71;
+
+/** `6t^5 - 15t^4 + 10t^3`, clamped. Mirrors `smootherstep` in world.rs. */
+function smootherstep(t) {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+/** Fractional Brownian motion. Mirrors `fbm` in world.rs. */
+function fbm(seedLo, seedHi, x, z, octaves, lacunarity, gain) {
+  let sum = 0, frequency = 1, weight = 1;
+  let lo = seedLo, hi = seedHi;
+  const n = Math.min(octaves, 8);
+  for (let o = 0; o < n; o++) {
+    const step = o + 1;
+    sum += weight * perlin(lo, hi,
+      x * frequency + step * OCTAVE_OFFSET_X, z * frequency + step * OCTAVE_OFFSET_Z);
+    frequency *= lacunarity;
+    weight *= gain;
+    // The next octave's seed: `seed.wrapping_add(o * OCTAVE_SEED_STRIDE)`.
+    const carried = lo + OCTAVE_STRIDE_LO;
+    hi = (hi + OCTAVE_STRIDE_HI + (carried > 0xffffffff ? 1 : 0)) >>> 0;
+    lo = carried >>> 0;
+  }
+  return sum;
+}
 
 /**
  * A trace's `terrain.seed` as a `[lo, hi]` pair.
@@ -148,37 +178,63 @@ function terrainHeight(terrain, x, z, seed) {
   if (terrain.kind !== 'fractal') return terrain.height ?? 0;
 
   const [seedLo, seedHi] = seed || seedPair(terrain.seed);
-  const invW = 1 / Math.max(terrain.wavelength, 1e-3);
-  const px = (x * terrain.rot_cos - z * terrain.rot_sin) * invW + terrain.offset_x;
-  const pz = (x * terrain.rot_sin + z * terrain.rot_cos) * invW + terrain.offset_z;
+  const wavelength = Math.max(terrain.wavelength, 1e-3);
+  const invW = 1 / wavelength;
 
-  let qx = px, qz = pz;
+  // World space to field space, in metres: rotate about the origin, then
+  // translate by the per-trial offset. Metres rather than wavelengths, so the
+  // bands below can each divide by their own wavelength and stay registered.
+  const mx = x * terrain.rot_cos - z * terrain.rot_sin + terrain.offset_x * wavelength;
+  const mz = x * terrain.rot_sin + z * terrain.rot_cos + terrain.offset_z * wavelength;
+
+  let gx = mx, gz = mz;
   if (terrain.warp !== 0) {
+    const px = mx * invW, pz = mz * invW;
     const wx = perlin(
       (seedLo ^ WARP_SEED_X_LO) >>> 0, (seedHi ^ WARP_SEED_X_HI) >>> 0,
       px * WARP_FREQUENCY + WARP_OFFSET_X, pz * WARP_FREQUENCY + WARP_OFFSET_Z);
     const wz = perlin(
       (seedLo ^ WARP_SEED_Z_LO) >>> 0, (seedHi ^ WARP_SEED_Z_HI) >>> 0,
       px * WARP_FREQUENCY + WARP_OFFSET_Z, pz * WARP_FREQUENCY + WARP_OFFSET_X);
-    qx = px + terrain.warp * wx;
-    qz = pz + terrain.warp * wz;
+    gx = mx + terrain.warp * wavelength * wx;
+    gz = mz + terrain.warp * wavelength * wz;
   }
 
-  let sum = 0, frequency = 1, weight = 1;
-  let octLo = seedLo, octHi = seedHi;
-  const octaves = Math.min(terrain.octaves, 8);
-  for (let o = 0; o < octaves; o++) {
-    const step = o + 1;
-    sum += weight * perlin(octLo, octHi,
-      qx * frequency + step * OCTAVE_OFFSET_X, qz * frequency + step * OCTAVE_OFFSET_Z);
-    frequency *= terrain.lacunarity;
-    weight *= terrain.gain;
-    // The next octave's seed: `seed.wrapping_add(o * OCTAVE_SEED_STRIDE)`.
-    const carried = octLo + OCTAVE_STRIDE_LO;
-    octHi = (octHi + OCTAVE_STRIDE_HI + (carried > 0xffffffff ? 1 : 0)) >>> 0;
-    octLo = carried >>> 0;
+  // Band 1: the landscape.
+  let h = terrain.amplitude * fbm(seedLo, seedHi, gx * invW, gz * invW,
+    terrain.octaves, terrain.lacunarity, terrain.gain);
+
+  // Band 3: how savage the ground is here. Zero for a trace written before this
+  // band existed, which is what makes those still draw correctly.
+  const modulation = terrain.modulation ?? 0;
+  let m = 1;
+  if (modulation > 0) {
+    const mw = 1 / Math.max(terrain.modulation_wavelength, 1e-3);
+    const v = perlin(
+      (seedLo ^ MODULATION_SEED_LO) >>> 0, (seedHi ^ MODULATION_SEED_HI) >>> 0,
+      gx * mw + MODULATION_OFFSET_X, gz * mw + MODULATION_OFFSET_Z);
+    m = 1 - modulation + modulation * smootherstep(0.5 + 0.5 * v);
   }
-  return terrain.amplitude * sum;
+
+  // Band 2: detail at organism scale, scaled by the modulation.
+  const detail = terrain.detail_amplitude ?? 0;
+  if (detail > 0) {
+    const dw = 1 / Math.max(terrain.detail_wavelength, 1e-3);
+    h += detail * m * fbm(
+      (seedLo ^ DETAIL_SEED_LO) >>> 0, (seedHi ^ DETAIL_SEED_HI) >>> 0,
+      gx * dw, gz * dw, terrain.detail_octaves, terrain.lacunarity, terrain.gain);
+  }
+
+  // Band 4: cliffs.
+  const step = terrain.step ?? 0;
+  if (step > 0) {
+    const riser = Math.min(Math.max(terrain.riser, 1e-3), 1);
+    const t = h / step;
+    const floor = Math.floor(t);
+    const terraced = (floor + smootherstep((t - floor - 0.5) / riser + 0.5)) * step;
+    h = terrain.terrace_mask ? h + m * (terraced - h) : terraced;
+  }
+  return h;
 }
 
 /** Size of the finest feature the field has, which is what the mesh must resolve. */
@@ -187,8 +243,21 @@ function finestFeature(terrain) {
   // Rough is two octaves an octave apart, so its finest is half its wavelength.
   if (terrain.kind === 'rough') return Math.max(terrain.wavelength, 0.1) / 2;
   if (terrain.kind !== 'fractal') return Infinity;
-  const steps = Math.max(terrain.lacunarity, 1) ** Math.max(terrain.octaves - 1, 0);
-  return Math.max(terrain.wavelength / steps, 0.1);
+  const lac = Math.max(terrain.lacunarity, 1);
+  let finest = terrain.wavelength / lac ** Math.max(terrain.octaves - 1, 0);
+  if ((terrain.detail_amplitude ?? 0) > 0) {
+    finest = Math.min(
+      finest,
+      terrain.detail_wavelength / lac ** Math.max(terrain.detail_octaves - 1, 0),
+    );
+  }
+  // A terrace riser is finer than any octave: the whole band's height change
+  // compressed into `riser` of a terrace, which for the shipped settings is
+  // 160 mm. Resolving it properly would ask for millions of vertices, so
+  // terraced ground simply asks for everything the segment cap will give and
+  // draws its cliffs a little softer than the physics feels them.
+  if ((terrain.step ?? 0) > 0) return 0;
+  return Math.max(finest, 0.05);
 }
 
 /**

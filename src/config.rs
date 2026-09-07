@@ -13,6 +13,20 @@ use crate::brain::BrainLayout;
 use crate::genome::ShapeKind;
 use crate::math::Real;
 
+/// The speed a terrace wall has to survive being hit at, m/s.
+///
+/// Not `max_linear_speed`, which is a divergence clamp at 60 m/s rather than a
+/// speed anything reaches. Measured honest gaits in this project run at one to
+/// two metres a second; three leaves room for a faster one without demanding
+/// walls so wide they stop being walls.
+const WALL_CROSSING_SPEED: Real = 3.0;
+
+/// How many integration steps a body must take to cross a wall.
+///
+/// Below about four the contact solver meets the wall as one huge penetration
+/// rather than a surface; below one, the body tunnels straight through.
+const MIN_WALL_STEPS: Real = 4.0;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -93,6 +107,54 @@ impl Config {
         fingerprint(self, false)
     }
 
+    /// Refuse terraces whose walls are too thin for the timestep to resolve.
+    ///
+    /// A cliff in a height field is only a cliff if a body meets it over
+    /// several integration steps. Cross it in one and the solver sees a single
+    /// enormous penetration and responds accordingly; cross it in less than one
+    /// and the body tunnels through as though it were not there. Neither is
+    /// terrain, and both are the kind of thing evolution finds and lives on.
+    fn validate_terrace_walls(&self) -> Result<(), ConfigError> {
+        if self.environment.terrain != Terrain::Fractal || self.environment.terrain_step <= 0.0 {
+            return Ok(());
+        }
+        // Built with an arbitrary seed: wall width is a property of the band
+        // structure, not of which landscape the seed picks out.
+        let field = crate::physics::FractalField {
+            seed: 1,
+            amplitude: self.environment.terrain_amplitude,
+            wavelength: self.environment.terrain_wavelength,
+            octaves: self.environment.terrain_octaves,
+            lacunarity: self.environment.terrain_lacunarity,
+            gain: self.environment.terrain_gain,
+            warp: self.environment.terrain_warp,
+            detail_amplitude: self.environment.terrain_detail_amplitude,
+            detail_wavelength: self.environment.terrain_detail_wavelength,
+            detail_octaves: self.environment.terrain_detail_octaves,
+            modulation: self.environment.terrain_modulation,
+            modulation_wavelength: self.environment.terrain_modulation_wavelength,
+            step: self.environment.terrain_step,
+            riser: self.environment.terrain_riser,
+            terrace_mask: self.environment.terrain_terrace_mask,
+            ..Default::default()
+        };
+        let width = field.riser_width();
+        let per_step = WALL_CROSSING_SPEED * self.simulation.timestep;
+        if width < MIN_WALL_STEPS * per_step {
+            return Err(ConfigError::Invalid(format!(
+                "environment.terrain_riser is too small for this timestep: the terrace \
+                 walls would be {:.0} mm wide, which a body at {WALL_CROSSING_SPEED} m/s \
+                 crosses in {:.1} steps. Raise terrain_riser or terrain_step, lower \
+                 terrain_amplitude, or lower simulation.timestep, until the walls are at \
+                 least {:.0} mm.",
+                width * 1000.0,
+                width / per_step,
+                MIN_WALL_STEPS * per_step * 1000.0,
+            )));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |m: &str| -> Result<(), ConfigError> { Err(ConfigError::Invalid(m.into())) };
         let rate = |v: Real, name: &str| -> Result<(), ConfigError> {
@@ -171,6 +233,30 @@ impl Config {
         if self.environment.terrain_warp < 0.0 {
             bad("environment.terrain_warp must not be negative")?;
         }
+        if self.environment.terrain_detail_amplitude < 0.0 {
+            bad("environment.terrain_detail_amplitude must not be negative")?;
+        }
+        if self.environment.terrain_detail_wavelength <= 0.0 {
+            bad("environment.terrain_detail_wavelength must be positive")?;
+        }
+        if self.environment.terrain_detail_octaves < 1
+            || self.environment.terrain_detail_octaves > crate::physics::world::MAX_TERRAIN_OCTAVES
+        {
+            bad("environment.terrain_detail_octaves must be within [1, 8]")?;
+        }
+        rate(self.environment.terrain_modulation, "environment.terrain_modulation")?;
+        if self.environment.terrain_modulation_wavelength <= 0.0 {
+            bad("environment.terrain_modulation_wavelength must be positive")?;
+        }
+        if self.environment.terrain_step < 0.0 {
+            bad("environment.terrain_step must not be negative (0 is smooth ground)")?;
+        }
+        if !(0.0..=1.0).contains(&self.environment.terrain_riser)
+            || (self.environment.terrain_step > 0.0 && self.environment.terrain_riser <= 0.0)
+        {
+            bad("environment.terrain_riser must be within (0, 1] when terracing is on")?;
+        }
+        self.validate_terrace_walls()?;
         if self.body.tendon_frequency < 0.0 || self.body.tendon_damping < 0.0 {
             bad("body.tendon_frequency and body.tendon_damping must not be negative")?;
         }
@@ -640,16 +726,65 @@ pub struct EnvironmentCfg {
     /// Domain warp strength, in units of `terrain_wavelength`. Zero is plain
     /// fractional Brownian motion.
     ///
-    /// Warping bends the field into ridges and basins rather than blobs, which
-    /// is what makes it read as landscape. What it does *not* do, despite the
-    /// usual claim, is make the ground heterogeneous: measured with
-    /// `examples/terrain_probe.rs`, the spread of relief across 12 m tiles sits
-    /// at 10% of the mean whether warp is 0 or 1, because warping a stationary
-    /// field with a stationary displacement leaves it stationary. What it
-    /// genuinely buys is the tail of the slope distribution — at amplitude 0.25
-    /// and wavelength 6, the steepest slope anywhere goes from 19 degrees at 0
-    /// to 29 at 1, with the median unmoved at 5.
+    /// Warping bends the field into ridges and basins rather than blobs. It
+    /// buys the tail of the slope distribution — at amplitude 0.25 and
+    /// wavelength 6 the steepest slope anywhere goes from 19 degrees to 29 —
+    /// and it does make the ground more heterogeneous: the spread of mean slope
+    /// across 12 m tiles roughly doubles, from 0.04 of its mean to 0.11.
+    ///
+    /// An earlier version of this comment claimed the opposite, on the strength
+    /// of measuring the spread of *relief* per tile rather than of slope. A
+    /// tile on the flank of a large hill has enormous relief and can still be
+    /// billiard-smooth, so relief answers a different question. What warping
+    /// cannot do is produce cliffs; that is `terrain_step`.
     pub terrain_warp: Real,
+    /// Amplitude of a second, finer band of noise laid over the landscape,
+    /// metres. Zero — the default — leaves the field exactly as it was before
+    /// this band existed.
+    ///
+    /// The landscape band sets how big the hills are; this one sets what the
+    /// ground under an organism's feet is like, and they want different
+    /// wavelengths. One band cannot do both: fractional Brownian motion has a
+    /// single steepness, set by amplitude over wavelength, and it applies it at
+    /// every scale at once.
+    pub terrain_detail_amplitude: Real,
+    pub terrain_detail_wavelength: Real,
+    pub terrain_detail_octaves: u32,
+    /// How strongly a slow field varies the detail band's amplitude, in
+    /// `[0, 1]`. Zero is uniform detail everywhere.
+    ///
+    /// Warping the domain also varies the ground's character, but only by
+    /// rearranging one stationary field; scaling a band's amplitude by a
+    /// second, slower field is the direct way to say "calm here, savage
+    /// there". Measured as the spread of mean slope across 12 m tiles, the
+    /// landscape band alone sits at 0.09 of its mean, this raises it to 0.12,
+    /// and with `terrain_terrace_mask` it reaches 0.23.
+    pub terrain_modulation: Real,
+    /// Size of the calm and savage regions, metres.
+    pub terrain_modulation_wavelength: Real,
+    /// Terrace height, metres. Zero — the default — is a smooth field.
+    ///
+    /// Quantising height to terraces is the only thing here that produces a
+    /// genuinely sheer face. Scaling the noise up does not: ten metres of
+    /// relief still tops out near 48 degrees, and the median slope climbs with
+    /// the maximum, which is uniformly steep ground rather than occasional
+    /// cliffs. A terrace is flat for most of its span and climbs through the
+    /// rest, so the difficulty sits in a small fraction of the area and the
+    /// rest stays crossable — measured at 91% of the plane under 40 degrees
+    /// with a 99th-percentile slope of 82.
+    pub terrain_step: Real,
+    /// Fraction of a terrace spent climbing. The riser is steeper than the
+    /// underlying slope by exactly `1 / terrain_riser`.
+    ///
+    /// Its floor is physics, not taste: a body at 3 m/s covers 25 mm per step,
+    /// and a wall it crosses in one step is a wall the solver meets as a single
+    /// enormous penetration. `validate` refuses a combination that makes the
+    /// walls too thin for the timestep.
+    pub terrain_riser: Real,
+    /// Terrace only where `terrain_modulation` says the ground is savage,
+    /// blending back into untouched hills elsewhere. Concentrates the cliffs
+    /// rather than tiling the world with them, at the cost of shorter walls.
+    pub terrain_terrace_mask: bool,
     /// Whether each trial slides and turns the landscape underneath the
     /// organism.
     ///
@@ -678,6 +813,14 @@ impl Default for EnvironmentCfg {
             terrain_lacunarity: 2.0,
             terrain_gain: 0.5,
             terrain_warp: 0.3,
+            terrain_detail_amplitude: 0.0,
+            terrain_detail_wavelength: 3.0,
+            terrain_detail_octaves: 4,
+            terrain_modulation: 0.0,
+            terrain_modulation_wavelength: 35.0,
+            terrain_step: 0.0,
+            terrain_riser: 0.12,
+            terrain_terrace_mask: false,
             terrain_per_trial: true,
             gravity: 9.81,
             friction: 0.8,
@@ -964,6 +1107,27 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
         f.real(cfg.environment.terrain_warp);
         f.bool(cfg.environment.terrain_per_trial);
     }
+    // Each later band is folded in only when it is switched on, so a fractal
+    // experiment that predates a band keeps the digest it had — the same rule
+    // shapes, tendons and breakable joints already follow.
+    if cfg.environment.terrain == Terrain::Fractal && cfg.environment.terrain_detail_amplitude > 0.0
+    {
+        f.tag(b"detail");
+        f.real(cfg.environment.terrain_detail_amplitude);
+        f.real(cfg.environment.terrain_detail_wavelength);
+        f.u32(cfg.environment.terrain_detail_octaves);
+    }
+    if cfg.environment.terrain == Terrain::Fractal && cfg.environment.terrain_modulation > 0.0 {
+        f.tag(b"modulation");
+        f.real(cfg.environment.terrain_modulation);
+        f.real(cfg.environment.terrain_modulation_wavelength);
+    }
+    if cfg.environment.terrain == Terrain::Fractal && cfg.environment.terrain_step > 0.0 {
+        f.tag(b"terrace");
+        f.real(cfg.environment.terrain_step);
+        f.real(cfg.environment.terrain_riser);
+        f.bool(cfg.environment.terrain_terrace_mask);
+    }
     f.real(cfg.environment.gravity);
     f.real(cfg.environment.friction);
     f.real(cfg.environment.restitution);
@@ -1238,6 +1402,36 @@ mod tests {
         rough.environment.terrain = Terrain::Rough;
         assert_ne!(rough.digest(), a.digest());
         assert_ne!(Config::default().digest(), rough.digest());
+    }
+
+    /// Terracing is the one setting whose floor is physics rather than taste: a
+    /// wall thinner than a few integration steps is not a cliff, it is a
+    /// tunnelling bug waiting for evolution to find it.
+    #[test]
+    fn validation_measures_terrace_wall_width() {
+        let base = "[environment]\nterrain = \"fractal\"\nterrain_amplitude = 3.0\n\
+                    terrain_wavelength = 25.0\nterrain_octaves = 5\n\
+                    terrain_detail_amplitude = 0.35\nterrain_step = 0.8\n";
+        // As shipped: 150 mm walls, six steps at 3 m/s.
+        Config::from_toml_str(&format!("{base}terrain_riser = 0.12\n")).unwrap();
+
+        // A quarter of the riser is a quarter of the wall, and below what the
+        // contact solver can meet as a surface.
+        let err = Config::from_toml_str(&format!("{base}terrain_riser = 0.03\n"))
+            .expect_err("a 40 mm wall should be refused");
+        assert!(err.to_string().contains("terrain_riser"), "{err}");
+        assert!(err.to_string().contains("mm wide"), "{err}");
+
+        // The same walls become fine at a finer timestep, because what the rule
+        // is really about is how far a body moves between contacts.
+        Config::from_toml_str(&format!(
+            "{base}terrain_riser = 0.03\n\n[simulation]\ntimestep = 0.001\n"
+        ))
+        .unwrap();
+
+        // And with terracing off there are no walls to be too thin.
+        Config::from_toml_str("[environment]\nterrain = \"fractal\"\nterrain_riser = 0.001\n")
+            .unwrap();
     }
 
     #[test]

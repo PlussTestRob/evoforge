@@ -12,22 +12,30 @@
 #   can be selected for one particular hill rather than for coping with hills.
 #
 # What this is instead
-#   Four octaves of seeded gradient noise over a warped domain: aperiodic, keyed
-#   on the experiment seed, and slid and turned under the organism between
-#   trials so that no two trials share a feature. Measured with
-#   `examples/terrain_probe.rs`, these settings give 0.62 m of relief with a
-#   median slope of 9.9 degrees — about as steep underfoot as the old ground,
-#   but with hills to climb rather than a ripple to cross. The tail is what
-#   differs most: 19 degrees at the 90th percentile against 15.8, and 46 degrees
-#   at the steepest against 21.
+#   Four bands of seeded gradient noise: hills 25 m across and 6 m deep, detail
+#   at the scale of an organism's own body, a slow field saying where the ground
+#   is calm and where it is savage, and terracing that turns the savage regions
+#   into plateaus separated by near-vertical risers. Aperiodic, keyed on the
+#   experiment seed, and slid and turned under the organism between trials so
+#   that no two trials share a feature.
+#
+#   One band could not do this. Fractional Brownian motion has a single
+#   steepness, set by amplitude over wavelength, and applies it at every scale
+#   it spans: scaled up it gives uniformly steep ground, never occasional
+#   cliffs. Ten metres of relief still tops out near 50 degrees with the median
+#   climbing in lockstep.
+#
+#   Measured with `cargo run --release --example terrain_probe`: 6.3 m of
+#   relief, median slope 8 degrees, 99th percentile 79, maximum 87, 93% of the
+#   plane walkable, and only 1 straight 20 m crossing in 400 that avoids meeting
+#   a wall. The difficulty is concentrated rather than spread, which is what
+#   leaves a fitness gradient to climb instead of a ceiling to hit everywhere.
 #
 # What this is honestly not
-#   It is still a height field: single-valued, smooth, no overhangs and no gaps.
-#   That is exactly what a wheel is good at, so this alone is not expected to
-#   settle wheels against legs. Raising the amplitude makes the ground steeper,
-#   not a different kind of problem. What defeats a wheel is a discontinuity at
-#   or above its own radius, and that needs discrete obstacles. Run this first
-#   and see whether smooth ground was enough before building them.
+#   Still a height field: single-valued, smooth, no overhangs and no gaps. The
+#   measured ceiling is about 88 degrees and the contact solver is unreliable
+#   above roughly 75. What defeats a wheel is a discontinuity at or above its
+#   own radius, and that needs discrete obstacles, which are not built.
 
 [experiment]
 name = "fractal-animals"
@@ -111,21 +119,43 @@ terrain = "fractal"
 # 0 derives the landscape from experiment.seed. Set it to compare two
 # experiments on identical ground.
 terrain_seed = 0
-# Relief runs to about 2.5x this: 0.62 m peak to trough.
-terrain_amplitude = 0.25
-# Largest feature, metres. The finest of the four octaves is an eighth of it,
-# 0.375 m, which is about the size of an organism's largest part.
-terrain_wavelength = 3.0
-terrain_octaves = 4
+
+# Band 1 — the landscape. Big, smooth hills: about 6 m of relief across 25 m
+# features, which is ten times the length of an organism.
+terrain_amplitude = 3.0
+terrain_wavelength = 25.0
+terrain_octaves = 5
 terrain_lacunarity = 2.0
 terrain_gain = 0.5
-# Bends the field into ridges and basins. Measured effect is on the tail of the
-# slope distribution, not on how uniform the ground is — see the note on
-# `terrain_warp` in src/config.rs.
+# Bends the field into ridges and basins: buys the tail of the slope
+# distribution, and roughly doubles how much the ground's character varies from
+# place to place. See the note on `terrain_warp` in src/config.rs.
 terrain_warp = 0.6
+
+# Band 2 — detail at organism scale, laid over the hills.
+terrain_detail_amplitude = 0.35
+terrain_detail_wavelength = 3.0
+terrain_detail_octaves = 4
+
+# Band 3 — where the ground is calm and where it is savage.
+terrain_modulation = 0.9
+terrain_modulation_wavelength = 35.0
+
+# Band 4 — cliffs. Quantising height to 0.8 m terraces with a narrow riser is
+# the only thing here that makes a genuinely sheer face.
+terrain_step = 0.8
+# The riser is steeper than the underlying slope by 1/this. Its floor is
+# physics: at 0.12 the walls come out about 150 mm wide, which a body at 3 m/s
+# crosses in six steps. `Config::validate` measures this and refuses anything
+# thinner than four steps — 0.03 here would be rejected.
+terrain_riser = 0.12
+# Terrace only the savage regions and blend back into hills elsewhere, so the
+# cliffs are somewhere rather than everywhere.
+terrain_terrace_mask = true
+
 # Slide and turn the landscape between trials, so a gait cannot be tuned to one
-# hill. This is the half of the change that `start_jitter` cannot do: half a
-# metre on a three-metre feature is the same hill from slightly along it.
+# hill. Each trial also searches for a level patch to start on rather than
+# spawning an organism half inside a cliff.
 terrain_per_trial = true
 self_collision = true
 gravity = 9.81

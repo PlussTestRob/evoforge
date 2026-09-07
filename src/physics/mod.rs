@@ -12,4 +12,4 @@ pub mod world;
 
 pub use body::RigidBody;
 pub use shape::Shape;
-pub use world::{Joint, TerrainModel, World, WorldParams};
+pub use world::{FractalField, Joint, TerrainModel, World, WorldParams};

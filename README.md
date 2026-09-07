@@ -512,57 +512,87 @@ terrain_wavelength = 1.6
 objective = "heading"     # distance along the commanded direction
 ```
 
-`experiments/animals.toml` turns on all of it at once. It is slow — three trials,
-self-collision and twelve solver iterations cost roughly an order of magnitude
-against `directed-walkers` — and it does not yet produce quadrupeds: sixty
-generations reached 22 m of commanded travel with an organism that is still
-mostly rolling, upright for under two seconds of eight. The machinery is there;
-what it needs is compute and tuning, not more rules.
+`experiments/animals.toml` turns all of it on at once. It is slow — three
+trials, self-collision and twelve solver iterations cost roughly an order of
+magnitude against `directed-walkers` — and it does not yet produce quadrupeds.
+
+**A result reported here previously was wrong, and how it was wrong is worth
+keeping.** A 270-generation run reached 35 m of commanded travel, and the
+organism that did it covered 26 of those metres with its motors switched off.
+Self-collision plus Baumgarte stabilisation had made a motor: overlapping parts
+were shoved apart, the shove was added straight into velocity and *kept*, and a
+body whose joints pulled those parts back together every step collected it
+forever. Evolution found that long before it found walking, and no test in the
+suite objected, because every determinism test compares a run against itself.
+
+Version 0.3.0 fixes it — the correction now displaces bodies without ever
+becoming momentum — and adds the test that would have caught it:
+`a_dead_organism_does_not_travel`, which switches an organism's motors off and
+insists it goes nowhere. Genomes stored under 0.2.x will not re-simulate to
+their recorded fitness, and results from those runs should be read as upper
+bounds rather than distances. `examples/dead_organism_probe.rs` will say how
+much of any given champion was real.
 
 ### Ground that is actually ground
 
 `terrain = "rough"` is two octaves of a sine field. It repeats every wavelength,
 it has no seed, and it has features at one scale only, so every organism in
-every trial of every experiment meets the same 13 cm ripple — memorisable in
-principle, and not much like a landscape.
+every trial of every experiment meets the same 13 cm ripple.
 
-`terrain = "fractal"` is four octaves of seeded gradient noise over a warped
-domain: aperiodic, keyed on the experiment seed, and slid and turned under the
-organism between trials so no two trials share a hill. There is no
-transcendental anywhere in it — integer hashing and polynomial arithmetic only —
-which makes it a *better* reproducibility story than the sine field, not a
-worse one, and its gradient is still exact, so contacts get the slope's own
-normal rather than a finite-difference guess.
+`terrain = "fractal"` is four bands of seeded gradient noise, and the reason it
+is four is that one band cannot do the job. Fractional Brownian motion has a
+single steepness, set by amplitude over wavelength, and applies it at every
+scale it spans — so scaling it up gives uniformly steep ground, never occasional
+cliffs. Ten metres of relief still tops out around 50 degrees with the median
+climbing in lockstep.
+
+| band | what it does |
+|---|---|
+| landscape | hills, tens of metres across and metres deep |
+| detail | ground texture at the scale of an organism's own body |
+| modulation | a slow field saying where the ground is calm and where it is savage |
+| terracing | quantises height to steps, turning hillside into plateau-and-cliff |
+
+Terracing is the one that makes a sheer face: the riser is steeper than the
+underlying slope by exactly `1 / terrain_riser`, and because a terrace is flat
+for most of its span, the difficulty ends up concentrated in a small fraction of
+the area with the rest left crossable. Measured on the shipped settings with
+`cargo run --release --example terrain_probe`: 6.3 m of relief, median slope 8
+degrees, 99th percentile 79, maximum 87, **93% of the plane walkable**, and only
+1 straight 20 m crossing in 400 that avoids meeting a wall.
 
 ```toml
 [environment]
 terrain = "fractal"
-terrain_seed = 0          # 0 derives the landscape from experiment.seed
-terrain_amplitude = 0.25  # relief runs to about 2.5x this
-terrain_wavelength = 3.0  # largest feature, metres
-terrain_octaves = 4       # finest is wavelength / lacunarity^(octaves-1)
-terrain_lacunarity = 2.0
-terrain_gain = 0.5
-terrain_warp = 0.6        # bends the field into ridges and basins
-terrain_per_trial = true  # move the landscape between trials
+terrain_seed = 0                     # 0 derives it from experiment.seed
+terrain_amplitude = 3.0              # the landscape band
+terrain_wavelength = 25.0
+terrain_octaves = 5
+terrain_warp = 0.6
+terrain_detail_amplitude = 0.35      # organism-scale texture
+terrain_detail_wavelength = 3.0
+terrain_modulation = 0.9             # calm regions and savage ones
+terrain_modulation_wavelength = 35.0
+terrain_step = 0.8                   # terrace height: the cliffs
+terrain_riser = 0.12                 # fraction of a terrace spent climbing
+terrain_terrace_mask = true          # cliffs only where it is savage
+terrain_per_trial = true             # move the landscape between trials
 ```
 
-`experiments/fractal-animals.toml` is `animals.toml` with exactly that changed.
-Measured with `cargo run --release --example terrain_probe`, those settings give
-0.62 m of relief against the old 0.13 m, at about the same median slope (9.9
-degrees against 10.3) but with a far longer tail: 46 degrees at the steepest
-against 21.
+There is no seam anywhere in this: `TerrainModel` is one analytic function over
+an unbounded domain, with no chunks, tiles or stitching, and the physics never
+touches a mesh. Its gradient is exact, so contacts get the slope's own normal
+rather than a finite-difference guess, and there is no transcendental in it at
+all — integer hashing and polynomial arithmetic only, which makes it a *better*
+reproducibility story than the sine field rather than a worse one.
 
-Two things it is honestly not. It is **not heterogeneous** — the domain warp is
-usually sold as making some regions flat and others broken, and measurement says
-otherwise: relief per 12 m tile varies by 10% of its mean whether the warp is
-off or at full strength, because warping a stationary field with a stationary
-displacement leaves it stationary. And it is **still a height field**:
-single-valued and smooth, with no overhangs, walls or gaps, which is exactly
-what a wheel is good at. Raising the amplitude makes the ground steeper, not a
-different kind of problem. What defeats a wheel is a discontinuity at or above
-its own radius — discrete obstacles — and whether that is needed is a question
-for after this has run, not before.
+Two limits worth stating plainly. `terrain_riser` has a floor that is physics
+rather than taste — a wall thinner than a few integration steps is not a cliff
+but a tunnelling bug, so `Config::validate` measures the walls a config would
+produce and refuses the ones that are too thin. And it is **still a height
+field**: single-valued and smooth, with a measured ceiling near 88 degrees and a
+contact solver that is unreliable above about 75. Overhangs, gaps and true
+vertical need discrete obstacles, which are not built.
 
 The viewer mirrors the height field in JavaScript rather than being shipped a
 sampled patch with every replay. That is cheap and it can drift, so every

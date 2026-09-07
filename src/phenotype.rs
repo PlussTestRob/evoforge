@@ -596,6 +596,14 @@ pub fn build_with_start(
 /// Stream tag for terrain seeds derived from `experiment.seed`.
 const TERRAIN_STREAM: u64 = 0x5445_5252_4149_4e01;
 
+/// The ground this config describes, with the landscape moved as `shift` says.
+///
+/// Public because choosing where to set an organism down needs to ask the
+/// terrain what it looks like there, before there is a phenotype to build.
+pub fn terrain_for(cfg: &Config, shift: TerrainShift) -> TerrainModel {
+    cfg_terrain(cfg, shift)
+}
+
 fn cfg_terrain(cfg: &Config, shift: TerrainShift) -> TerrainModel {
     match cfg.environment.terrain {
         crate::config::Terrain::Flat => TerrainModel::Flat { height: 0.0 },
@@ -603,25 +611,36 @@ fn cfg_terrain(cfg: &Config, shift: TerrainShift) -> TerrainModel {
             amplitude: cfg.environment.terrain_amplitude,
             wavelength: cfg.environment.terrain_wavelength,
         },
-        crate::config::Terrain::Fractal => TerrainModel::Fractal {
-            // A seed of zero means "give me a landscape for this experiment";
-            // anything else names one, so two experiments can be compared on
-            // identical ground.
-            seed: match cfg.environment.terrain_seed {
-                0 => crate::rng::derive_seed(&[cfg.experiment.seed, TERRAIN_STREAM]),
-                s => s,
-            },
-            amplitude: cfg.environment.terrain_amplitude,
-            wavelength: cfg.environment.terrain_wavelength,
-            octaves: cfg.environment.terrain_octaves,
-            lacunarity: cfg.environment.terrain_lacunarity,
-            gain: cfg.environment.terrain_gain,
-            warp: cfg.environment.terrain_warp,
-            offset_x: shift.offset_x,
-            offset_z: shift.offset_z,
-            rot_sin: shift.sin,
-            rot_cos: shift.cos,
-        },
+        crate::config::Terrain::Fractal => {
+            let env = &cfg.environment;
+            TerrainModel::Fractal(crate::physics::FractalField {
+                // A seed of zero means "give me a landscape for this
+                // experiment"; anything else names one, so two experiments can
+                // be compared on identical ground.
+                seed: match env.terrain_seed {
+                    0 => crate::rng::derive_seed(&[cfg.experiment.seed, TERRAIN_STREAM]),
+                    s => s,
+                },
+                amplitude: env.terrain_amplitude,
+                wavelength: env.terrain_wavelength,
+                octaves: env.terrain_octaves,
+                lacunarity: env.terrain_lacunarity,
+                gain: env.terrain_gain,
+                warp: env.terrain_warp,
+                detail_amplitude: env.terrain_detail_amplitude,
+                detail_wavelength: env.terrain_detail_wavelength,
+                detail_octaves: env.terrain_detail_octaves,
+                modulation: env.terrain_modulation,
+                modulation_wavelength: env.terrain_modulation_wavelength,
+                step: env.terrain_step,
+                riser: env.terrain_riser,
+                terrace_mask: env.terrain_terrace_mask,
+                offset_x: shift.offset_x,
+                offset_z: shift.offset_z,
+                rot_sin: shift.sin,
+                rot_cos: shift.cos,
+            })
+        }
     }
 }
 

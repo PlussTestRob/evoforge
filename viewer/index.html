@@ -224,6 +224,7 @@
       <dt>record hz</dt><dd id="h-hz">—</dd>
       <dt>joints lost</dt><dd id="h-breaks">—</dd>
       <dt>terrain</dt><dd id="h-terrain">—</dd>
+      <dt>viewer</dt><dd id="h-viewer">—</dd>
     </dl>
     <div id="h-diverged" class="warn" hidden>solver diverged — metrics meaningless</div>
   </div>
@@ -264,6 +265,13 @@
   }
 }
 </script>
-<script type="module" src="./main.js"></script>
+<!-- The query string is a cache buster, and it earns its keep. This viewer is
+     plain ES modules served by `python -m http.server`, which sends no
+     cache-control headers, so a browser is entitled to keep serving the
+     JavaScript it fetched last week while happily re-fetching the replay JSON.
+     The result is new data drawn by old code: a fractal replay rendered on a
+     flat plane, with the organism apparently falling through the ground. Bump
+     this whenever anything in viewer/*.js changes. -->
+<script type="module" src="./main.js?v=0.3.0"></script>
 </body>
 </html>

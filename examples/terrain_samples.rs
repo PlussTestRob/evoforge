@@ -11,7 +11,7 @@
 //! function.
 
 use evoforge::math::Real;
-use evoforge::physics::TerrainModel;
+use evoforge::physics::{FractalField, TerrainModel};
 
 /// Deliberately awkward: every octave of gradient noise is exactly zero at its
 /// lattice points, so round numbers would agree between two different fields.
@@ -41,59 +41,15 @@ fn case(label: &str, m: TerrainModel) -> String {
     )
 }
 
-/// The fractal variant's parameters as a struct, so that a case can vary one of
-/// them with `..` — which an enum variant does not allow.
-#[derive(Clone, Copy)]
-struct Frac {
-    seed: u64,
-    amplitude: Real,
-    wavelength: Real,
-    octaves: u32,
-    lacunarity: Real,
-    gain: Real,
-    warp: Real,
-    offset_x: Real,
-    offset_z: Real,
-    rot_sin: Real,
-    rot_cos: Real,
-}
-
-impl Frac {
-    fn seeded(seed: u64) -> Frac {
-        Frac {
-            seed,
-            amplitude: 0.25,
-            wavelength: 6.0,
-            octaves: 4,
-            lacunarity: 2.0,
-            gain: 0.5,
-            warp: 0.3,
-            offset_x: 0.0,
-            offset_z: 0.0,
-            rot_sin: 0.0,
-            rot_cos: 1.0,
-        }
-    }
-
-    fn model(self) -> TerrainModel {
-        TerrainModel::Fractal {
-            seed: self.seed,
-            amplitude: self.amplitude,
-            wavelength: self.wavelength,
-            octaves: self.octaves,
-            lacunarity: self.lacunarity,
-            gain: self.gain,
-            warp: self.warp,
-            offset_x: self.offset_x,
-            offset_z: self.offset_z,
-            rot_sin: self.rot_sin,
-            rot_cos: self.rot_cos,
-        }
-    }
+/// The shipped defaults with one seed changed. `FractalField::default()` is the
+/// landscape band alone — every later band off — so a case that varies one field
+/// with `..` is varying exactly that one thing.
+fn seeded(seed: u64) -> FractalField {
+    FractalField { seed, ..FractalField::default() }
 }
 
 fn main() {
-    let d = |seed| Frac::seeded(seed).model();
+    let d = |seed| TerrainModel::Fractal(seeded(seed));
     let cases = vec![
         case("flat", TerrainModel::Flat { height: 0.0 }),
         case("flat, raised", TerrainModel::Flat { height: 1.25 }),
@@ -105,34 +61,110 @@ fn main() {
         case("fractal, seed 2^53+1", d(9_007_199_254_740_993)),
         case("fractal, seed u64::MAX", d(u64::MAX)),
         case("fractal, seed 0x8000...", d(0x8000_0000_0000_0000)),
-        case("fractal, no warp", Frac { warp: 0.0, ..Frac::seeded(7) }.model()),
-        case("fractal, heavy warp", Frac { warp: 1.0, ..Frac::seeded(7) }.model()),
-        case("fractal, one octave", Frac { octaves: 1, ..Frac::seeded(7) }.model()),
-        case("fractal, six octaves", Frac { octaves: 6, ..Frac::seeded(7) }.model()),
+        case("fractal, no warp", TerrainModel::Fractal(FractalField { warp: 0.0, ..seeded(7) })),
+        case("fractal, heavy warp", TerrainModel::Fractal(FractalField { warp: 1.0, ..seeded(7) })),
+        case(
+            "fractal, one octave",
+            TerrainModel::Fractal(FractalField { octaves: 1, ..seeded(7) }),
+        ),
+        case(
+            "fractal, six octaves",
+            TerrainModel::Fractal(FractalField { octaves: 6, ..seeded(7) }),
+        ),
         case(
             "fractal, odd lacunarity",
-            Frac { lacunarity: 2.7, gain: 0.65, ..Frac::seeded(7) }.model(),
+            TerrainModel::Fractal(FractalField { lacunarity: 2.7, gain: 0.65, ..seeded(7) }),
         ),
-        case("fractal, fine", Frac { amplitude: 0.05, wavelength: 1.5, ..Frac::seeded(7) }.model()),
+        case(
+            "fractal, fine",
+            TerrainModel::Fractal(FractalField { amplitude: 0.05, wavelength: 1.5, ..seeded(7) }),
+        ),
         // A long way out in field space, where an f32 has the least of its
         // precision left and the mirror has the most room to disagree.
         case(
             "fractal, offset",
-            Frac { offset_x: 41.5, offset_z: -63.25, ..Frac::seeded(7) }.model(),
+            TerrainModel::Fractal(FractalField { offset_x: 41.5, offset_z: -63.25, ..seeded(7) }),
         ),
-        case("fractal, rotated", Frac { rot_sin: 0.6, rot_cos: 0.8, ..Frac::seeded(7) }.model()),
+        case(
+            "fractal, rotated",
+            TerrainModel::Fractal(FractalField { rot_sin: 0.6, rot_cos: 0.8, ..seeded(7) }),
+        ),
         case(
             "fractal, moved as a trial would",
-            Frac {
+            TerrainModel::Fractal(FractalField {
                 wavelength: 3.0,
                 warp: 0.6,
                 offset_x: -37.125,
                 offset_z: 58.5,
                 rot_sin: -0.28,
                 rot_cos: 0.96,
-                ..Frac::seeded(0xDEAD_BEEF_CAFE_F00D)
-            }
-            .model(),
+                ..seeded(0xDEAD_BEEF_CAFE_F00D)
+            }),
+        ),
+        // The bands added after the first, one at a time and then together.
+        case(
+            "fractal, detail band",
+            TerrainModel::Fractal(FractalField {
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                detail_amplitude: 0.35,
+                ..seeded(11)
+            }),
+        ),
+        case(
+            "fractal, modulated detail",
+            TerrainModel::Fractal(FractalField {
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                detail_amplitude: 0.35,
+                modulation: 0.9,
+                ..seeded(11)
+            }),
+        ),
+        case(
+            "fractal, terraced",
+            TerrainModel::Fractal(FractalField {
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                step: 0.8,
+                riser: 0.12,
+                ..seeded(11)
+            }),
+        ),
+        case(
+            "fractal, terraced and masked",
+            TerrainModel::Fractal(FractalField {
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                detail_amplitude: 0.35,
+                modulation: 0.9,
+                step: 0.8,
+                riser: 0.12,
+                terrace_mask: true,
+                ..seeded(11)
+            }),
+        ),
+        case(
+            "fractal, every band, moved as a trial would",
+            TerrainModel::Fractal(FractalField {
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                detail_amplitude: 0.35,
+                modulation: 0.9,
+                step: 1.2,
+                riser: 0.2,
+                terrace_mask: true,
+                offset_x: -13.5,
+                offset_z: 21.25,
+                rot_sin: -0.28,
+                rot_cos: 0.96,
+                ..seeded(0xFEED_FACE_DEAD_BEEF)
+            }),
         ),
     ];
     println!("{{\"cases\":[{}]}}", cases.join(","));

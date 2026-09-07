@@ -86,57 +86,382 @@ pub enum TerrainModel {
     /// only. See [`noise`](super::noise) for the construction and
     /// [`Self::sample`] for the chain rule through the warp.
     ///
-    /// Two honest limits, both measured rather than assumed — see
-    /// `examples/terrain_probe.rs`:
+    /// One honest limit, measured rather than assumed:
     ///
-    /// * **It is not heterogeneous.** The domain warp is usually sold as making
-    ///   some regions flat and others broken. It does not: relief per 12 m tile
-    ///   varies by 10% of its mean whether the warp is off or at full strength,
-    ///   because warping a stationary field with a stationary displacement
-    ///   leaves it stationary. The warp earns its place on the slope tail, not
-    ///   on regional variation.
     /// * **It is still a height field**, so it is single-valued and smooth: no
     ///   overhangs, no vertical walls, no gaps. Smooth undulation is exactly
     ///   what a wheel is good at, and raising `amplitude` makes the ground
     ///   *steeper* rather than a different kind of problem. What defeats a
     ///   wheel is a discontinuity at or above its own radius, and that needs
     ///   discrete obstacles, not a better height field.
-    Fractal {
-        /// Field identity. Two seeds give unrelated landscapes.
-        ///
-        /// Written to JSON as a decimal *string*: JavaScript's only number is a
-        /// double, so a bare `u64` above 2^53 comes back off by a few — and a
-        /// seed off by a few is a different landscape entirely. The viewer has
-        /// to reproduce this exactly.
-        #[serde(with = "seed_as_string")]
-        seed: u64,
-        /// Scale of the whole field, metres. Peak-to-trough runs to about
-        /// `2.5 * amplitude` in practice; see [`Self::height_bound`] for the
-        /// hard limit.
-        amplitude: Real,
-        /// Size of the largest feature, metres.
-        wavelength: Real,
-        /// How many octaves are summed. Each one is `lacunarity` times finer
-        /// and `gain` times shallower than the last.
-        octaves: u32,
-        lacunarity: Real,
-        gain: Real,
-        /// Domain warp strength, in units of `wavelength`. Zero is plain fBm —
-        /// uniform, and recognisably so. Raising it bends the field into
-        /// ridges and valleys, and is what produces the heterogeneity above.
-        warp: Real,
-        /// Rigid motion of the field under the world, so that a trial can be
-        /// run on a different piece of the same landscape. Identity is
-        /// `(0, 0, sin 0, cos 0)`.
-        offset_x: Real,
-        offset_z: Real,
-        rot_sin: Real,
-        rot_cos: Real,
-    },
+    Fractal(FractalField),
+}
+
+/// The parameters of a fractal landscape.
+///
+/// A struct rather than a pile of enum fields because there are now four bands
+/// of them, and because a struct can be built with `..Default::default()` —
+/// which is what lets every new band default to *off* and keeps a config that
+/// does not mention them meaning exactly what it meant before.
+///
+/// Serialised flat into the `fractal` variant, so a trace still reads
+/// `{"kind": "fractal", "amplitude": ..., ...}`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FractalField {
+    /// Field identity. Two seeds give unrelated landscapes.
+    ///
+    /// Written to JSON as a decimal *string*: JavaScript's only number is a
+    /// double, so a bare `u64` above 2^53 comes back off by a few — and a seed
+    /// off by a few is a different landscape entirely. The viewer has to
+    /// reproduce this exactly.
+    #[serde(with = "seed_as_string")]
+    pub seed: u64,
+
+    // --- Band 1: the landscape itself. -----------------------------------
+    /// Scale of the largest band, metres. Relief runs to about 1.8x this.
+    pub amplitude: Real,
+    /// Size of the largest feature, metres.
+    pub wavelength: Real,
+    /// How many octaves are summed. Each one is `lacunarity` times finer and
+    /// `gain` times shallower than the last.
+    pub octaves: u32,
+    pub lacunarity: Real,
+    pub gain: Real,
+    /// Domain warp strength, in units of `wavelength`.
+    ///
+    /// Bends the field into ridges and basins rather than blobs. It buys the
+    /// tail of the slope distribution, and it roughly doubles how much the
+    /// ground's character varies from place to place. What it cannot do is
+    /// produce a cliff — that is `step` — or concentrate the difficulty, which
+    /// is `terrace_mask`.
+    pub warp: Real,
+
+    // --- Band 2: detail at organism scale. --------------------------------
+    /// Amplitude of a second, finer band laid over the landscape, metres.
+    /// Zero leaves the field exactly as it was before this band existed.
+    pub detail_amplitude: Real,
+    pub detail_wavelength: Real,
+    pub detail_octaves: u32,
+
+    // --- Band 3: where the ground is calm and where it is savage. ---------
+    /// How strongly a slow field modulates the detail band's amplitude, in
+    /// `[0, 1]`. Zero is uniform detail everywhere.
+    pub modulation: Real,
+    /// Size of the calm and savage regions, metres.
+    pub modulation_wavelength: Real,
+
+    // --- Band 4: cliffs. ---------------------------------------------------
+    /// Terrace height, metres. Zero is a smooth field.
+    ///
+    /// Quantising the height to steps is the only thing here that produces a
+    /// genuinely sheer face: fractional Brownian motion has one steepness and
+    /// applies it everywhere, so scaling it up gives uniformly steep ground
+    /// rather than occasional cliffs. A terrace is flat for most of its span
+    /// and climbs through the rest, which puts the difficulty in a small
+    /// fraction of the area and leaves the rest crossable.
+    pub step: Real,
+    /// Fraction of a terrace spent on the riser. The riser is steeper than the
+    /// underlying slope by exactly `1 / riser`, so this is the cliff knob.
+    ///
+    /// It has a floor that is physics rather than taste: a wall must be several
+    /// integration steps wide or a body crosses it in one and meets it as a
+    /// single enormous penetration. `Config::validate` enforces that.
+    pub riser: Real,
+    /// Terrace only the savage regions, blending smoothly back into untouched
+    /// hills elsewhere. Concentrates the cliffs instead of tiling the world
+    /// with them.
+    pub terrace_mask: bool,
+
+    // --- Per-trial placement. ---------------------------------------------
+    /// Rigid motion of the field under the world, so a trial can be run on a
+    /// different piece of the same landscape. Translation is in units of
+    /// `wavelength`; rotation is stored as its sine and cosine so that no
+    /// trigonometry happens per sample. Identity is `(0, 0, 0, 1)`.
+    pub offset_x: Real,
+    pub offset_z: Real,
+    pub rot_sin: Real,
+    pub rot_cos: Real,
+}
+
+impl Default for FractalField {
+    /// Every band but the first is off, so a `FractalField` built with
+    /// `..Default::default()` is the field as it was before the bands existed.
+    fn default() -> FractalField {
+        FractalField {
+            seed: 0,
+            amplitude: 0.25,
+            wavelength: 6.0,
+            octaves: 4,
+            lacunarity: 2.0,
+            gain: 0.5,
+            warp: 0.3,
+            detail_amplitude: 0.0,
+            detail_wavelength: 3.0,
+            detail_octaves: 4,
+            modulation: 0.0,
+            modulation_wavelength: 35.0,
+            step: 0.0,
+            riser: 0.12,
+            terrace_mask: false,
+            offset_x: 0.0,
+            offset_z: 0.0,
+            rot_sin: 0.0,
+            rot_cos: 1.0,
+        }
+    }
+}
+
+impl FractalField {
+    /// Height and its exact gradient, `(h, dh/dx, dh/dz)`, in metres.
+    ///
+    /// Composed as bands rather than one noise call, because that is what makes
+    /// each piece independently measurable — see `examples/terrain_probe.rs`.
+    /// The gradient is carried through every band by the product and chain
+    /// rules; the places it goes wrong are the warp Jacobian, the `dm` term
+    /// where modulation multiplies the detail band, and the `dm * gap` term
+    /// where the mask blends terraced ground into smooth. All three are checked
+    /// against central differences in the tests.
+    pub fn height_and_gradient(&self, x: Real, z: Real) -> (Real, Real, Real) {
+        let wavelength = self.wavelength.max(1e-3);
+        let inv_w = 1.0 / wavelength;
+
+        // World space to field space, in *metres*: rotate about the origin,
+        // then translate by the per-trial offset. Working in metres rather than
+        // in units of the base wavelength is what lets the bands below each
+        // divide by their own wavelength and still move together per trial.
+        let mx = x * self.rot_cos - z * self.rot_sin + self.offset_x * wavelength;
+        let mz = x * self.rot_sin + z * self.rot_cos + self.offset_z * wavelength;
+
+        // Domain warp: displace the sample point by a coarse vector field
+        // before evaluating anything. Applied in metres, so every band is
+        // warped by the same displacement and they stay registered.
+        let (gx, gz, jxx, jxz, jzx, jzz) = if self.warp != 0.0 {
+            let (px, pz) = (mx * inv_w, mz * inv_w);
+            let (wx, wxu, wxv) = noise::perlin_d(
+                self.seed ^ WARP_SEED_X,
+                px * WARP_FREQUENCY + WARP_OFFSET_X,
+                pz * WARP_FREQUENCY + WARP_OFFSET_Z,
+            );
+            let (wz, wzu, wzv) = noise::perlin_d(
+                self.seed ^ WARP_SEED_Z,
+                px * WARP_FREQUENCY + WARP_OFFSET_Z,
+                pz * WARP_FREQUENCY + WARP_OFFSET_X,
+            );
+            let g = self.warp * WARP_FREQUENCY;
+            // Jacobian of the warped position with respect to the unwarped one.
+            // The `wavelength` factors cancel: the displacement is
+            // `warp * wavelength * w`, and `w`'s derivative carries `inv_w`.
+            (
+                mx + self.warp * wavelength * wx,
+                mz + self.warp * wavelength * wz,
+                1.0 + g * wxu,
+                g * wxv,
+                g * wzu,
+                1.0 + g * wzv,
+            )
+        } else {
+            (mx, mz, 1.0, 0.0, 0.0, 1.0)
+        };
+
+        // --- Band 1: the landscape. ---
+        let (base, base_dx, base_dz) =
+            fbm(self.seed, gx * inv_w, gz * inv_w, self.octaves, self.lacunarity, self.gain);
+        let mut h = self.amplitude * base;
+        let mut dx = self.amplitude * base_dx * inv_w;
+        let mut dz = self.amplitude * base_dz * inv_w;
+
+        // --- Band 3: how savage the ground is here. ---
+        // `m` runs 0 (calm) to 1 (savage) and is slow. Computed before the
+        // detail band because it scales it, and before the terracing because it
+        // can also mask that.
+        let (m, mdx, mdz) = if self.modulation > 0.0 {
+            let mw = 1.0 / self.modulation_wavelength.max(1e-3);
+            let (v, vdx, vdz) = noise::perlin_d(
+                self.seed ^ MODULATION_SEED,
+                gx * mw + MODULATION_OFFSET_X,
+                gz * mw + MODULATION_OFFSET_Z,
+            );
+            // `smootherstep` of the noise, so the transition between calm and
+            // savage is gradual and its derivative vanishes at both ends.
+            let (s, ds) = smootherstep(0.5 + 0.5 * v);
+            let k = self.modulation;
+            (1.0 - k + k * s, k * ds * 0.5 * vdx * mw, k * ds * 0.5 * vdz * mw)
+        } else {
+            (1.0, 0.0, 0.0)
+        };
+
+        // --- Band 2: detail at organism scale, scaled by the modulation. ---
+        if self.detail_amplitude > 0.0 {
+            let dw = 1.0 / self.detail_wavelength.max(1e-3);
+            let (det, det_dx, det_dz) = fbm(
+                self.seed ^ DETAIL_SEED,
+                gx * dw,
+                gz * dw,
+                self.detail_octaves,
+                self.lacunarity,
+                self.gain,
+            );
+            h += self.detail_amplitude * m * det;
+            dx += self.detail_amplitude * (mdx * det + m * det_dx * dw);
+            dz += self.detail_amplitude * (mdz * det + m * det_dz * dw);
+        }
+
+        // --- Band 4: cliffs. ---
+        if self.step > 0.0 {
+            let riser = self.riser.clamp(1e-3, 1.0);
+            let t = h / self.step;
+            let floor = t.floor();
+            let (s, ds) = smootherstep((t - floor - 0.5) / riser + 0.5);
+            let scale = ds / riser;
+            let (terraced, tdx, tdz) = ((floor + s) * self.step, dx * scale, dz * scale);
+            if self.terrace_mask {
+                // Blend hills into badlands, weighted by the same slow field
+                // that drives the detail: terraced where `m` is high, smooth
+                // where it is low. `gap * dm` is the blend weight's own
+                // contribution, and dropping it is the easiest way to get a
+                // normal that does not match the surface.
+                let gap = terraced - h;
+                dx = dx + m * (tdx - dx) + mdx * gap;
+                dz = dz + m * (tdz - dz) + mdz * gap;
+                h += m * gap;
+            } else {
+                h = terraced;
+                dx = tdx;
+                dz = tdz;
+            }
+        }
+
+        // Out through the warp and the rotation. `jxx..jzz` is transposed here
+        // because a gradient is a covector.
+        let wx = dx * jxx + dz * jzx;
+        let wz = dx * jxz + dz * jzz;
+        (h, wx * self.rot_cos + wz * self.rot_sin, wz * self.rot_cos - wx * self.rot_sin)
+    }
+
+    /// The largest height this field can produce, in metres.
+    ///
+    /// Exact rather than measured: each octave of gradient noise is bounded by
+    /// one, so each band is bounded by the sum of its octave weights.
+    /// Terracing cannot exceed it either — quantising a value moves it by less
+    /// than one step, and the bound already covers that.
+    pub fn height_bound(&self) -> Real {
+        let band = |octaves: u32, gain: Real| {
+            let mut total = 0.0;
+            let mut weight = 1.0;
+            for _ in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
+                total += weight;
+                weight *= gain.abs();
+            }
+            total
+        };
+        let g = self.gain.abs();
+        self.amplitude.abs() * band(self.octaves, g)
+            + self.detail_amplitude.abs() * band(self.detail_octaves, g)
+            + self.step.abs()
+    }
+
+    /// The gradient of this field with terracing switched off, at the 90th
+    /// percentile of a sample of it.
+    ///
+    /// Ninetieth rather than median because that is where the thin walls are:
+    /// a riser compresses a terrace's whole height change into `riser` of its
+    /// span, so it is steepest, and therefore narrowest, exactly where the
+    /// underlying ground was already steep. Measured rather than derived — an
+    /// analytic estimate summing the octaves' contributions came out five times
+    /// wrong against the field it was estimating, because the gradient of
+    /// fractional Brownian motion is dominated by its finest octave in a way
+    /// that is easy to get backwards.
+    ///
+    /// Sampled on a coarse, deliberately awkward grid. This runs once per config
+    /// load, not per step.
+    pub fn smooth_gradient(&self) -> Real {
+        let smooth = FractalField { step: 0.0, ..*self };
+        let mut g = Vec::with_capacity(21 * 21);
+        for a in -10..11 {
+            for b in -10..11 {
+                let (_, dx, dz) =
+                    smooth.height_and_gradient(a as Real * 3.7 + 0.31, b as Real * 4.3 - 0.17);
+                g.push((dx * dx + dz * dz).sqrt());
+            }
+        }
+        g.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        g[(g.len() * 9) / 10]
+    }
+
+    /// How wide this field's terrace risers are, in metres.
+    ///
+    /// This is the number that decides whether a cliff is physics or a bug. A
+    /// body moving at `v` covers `v * dt` per step, and a wall it crosses in one
+    /// step is a wall the solver meets as a single enormous penetration — or
+    /// tunnels through entirely. `Config::validate` uses this.
+    ///
+    /// The riser occupies `step * riser` of height, so on ground of gradient `g`
+    /// it occupies `step * riser / g` of horizontal distance. Checked against
+    /// `examples/terrain_probe.rs`, which measures the walls the field actually
+    /// contains: this predicts 150 mm for the shipped settings and the probe
+    /// finds a median of 160.
+    pub fn riser_width(&self) -> Real {
+        if self.step <= 0.0 {
+            return Real::INFINITY;
+        }
+        self.step * self.riser / self.smooth_gradient().max(1e-3)
+    }
+}
+
+/// Fractional Brownian motion: octaves of gradient noise, each finer and
+/// shallower than the last. Returns the value and its gradient in the
+/// coordinates it was given.
+#[inline]
+fn fbm(
+    seed: u64,
+    x: Real,
+    z: Real,
+    octaves: u32,
+    lacunarity: Real,
+    gain: Real,
+) -> (Real, Real, Real) {
+    let mut sum = 0.0;
+    let mut dx = 0.0;
+    let mut dz = 0.0;
+    let mut frequency = 1.0;
+    let mut weight = 1.0;
+    for o in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
+        let step = (o + 1) as Real;
+        let (n, nu, nv) = noise::perlin_d(
+            seed.wrapping_add((o as u64).wrapping_mul(OCTAVE_SEED_STRIDE)),
+            x * frequency + step * OCTAVE_OFFSET_X,
+            z * frequency + step * OCTAVE_OFFSET_Z,
+        );
+        sum += weight * n;
+        dx += weight * frequency * nu;
+        dz += weight * frequency * nv;
+        frequency *= lacunarity;
+        weight *= gain;
+    }
+    (sum, dx, dz)
+}
+
+/// `6t^5 - 15t^4 + 10t^3` clamped to `[0, 1]`, and its derivative.
+///
+/// Zero first derivative at both ends, so anything built by blending with it
+/// stays continuously differentiable where the pieces meet — which is what
+/// keeps the terrace risers and the badlands mask from putting creases in the
+/// surface normal.
+#[inline]
+fn smootherstep(t: Real) -> (Real, Real) {
+    if t <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if t >= 1.0 {
+        return (1.0, 0.0);
+    }
+    let t2 = t * t;
+    (t2 * t * (t * (t * 6.0 - 15.0) + 10.0), 30.0 * t2 * (t - 1.0) * (t - 1.0))
 }
 
 /// A `u64` that survives a round trip through JavaScript. See
-/// [`TerrainModel::Fractal::seed`].
+/// [`FractalField::seed`].
 mod seed_as_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -185,6 +510,14 @@ const WARP_OFFSET_Z: Real = -1.749;
 /// changing the seed moves the warp too.
 const WARP_SEED_X: u64 = 0x5741_5250_5f58_0001;
 const WARP_SEED_Z: u64 = 0x5741_5250_5f5a_0001;
+/// Sub-seeds for the bands that were added after the first. Distinct from the
+/// base seed so that a band is not a rescaled copy of the landscape under it.
+const DETAIL_SEED: u64 = 0x4445_5441_494c_0001;
+const MODULATION_SEED: u64 = 0x4d4f_4455_4c41_5445;
+/// Offsets keeping the modulation field off the lattice at the origin, for the
+/// same reason as [`OCTAVE_OFFSET_X`].
+const MODULATION_OFFSET_X: Real = 7.13;
+const MODULATION_OFFSET_Z: Real = -2.71;
 /// Separation between octaves, so no two octaves are the same field rescaled.
 const OCTAVE_SEED_STRIDE: u64 = 0x4f43_5441_5645_0001;
 
@@ -247,82 +580,41 @@ impl TerrainModel {
                 let dhdz = -amplitude * k * sx * sz - amplitude * k * sx2 * sz2;
                 (h, vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y))
             }
-            TerrainModel::Fractal {
-                seed,
-                amplitude,
-                wavelength,
-                octaves,
-                lacunarity,
-                gain,
-                warp,
-                offset_x,
-                offset_z,
-                rot_sin,
-                rot_cos,
-            } => {
-                let inv_w = 1.0 / wavelength.max(1e-3);
-
-                // World space to field space: rotate, scale to units of one
-                // wavelength, then translate. Field space is where the octave
-                // frequencies and the warp strength are all measured.
-                let px = (x * rot_cos - z * rot_sin) * inv_w + offset_x;
-                let pz = (x * rot_sin + z * rot_cos) * inv_w + offset_z;
-
-                // Domain warp: displace the sample point by a coarse vector
-                // field before evaluating. This is what turns uniform fBm into
-                // something with ridges and basins.
-                let (qx, qz, jxx, jxz, jzx, jzz) = if warp != 0.0 {
-                    let (wx, wxu, wxv) = noise::perlin_d(
-                        seed ^ WARP_SEED_X,
-                        px * WARP_FREQUENCY + WARP_OFFSET_X,
-                        pz * WARP_FREQUENCY + WARP_OFFSET_Z,
-                    );
-                    let (wz, wzu, wzv) = noise::perlin_d(
-                        seed ^ WARP_SEED_Z,
-                        px * WARP_FREQUENCY + WARP_OFFSET_Z,
-                        pz * WARP_FREQUENCY + WARP_OFFSET_X,
-                    );
-                    let g = warp * WARP_FREQUENCY;
-                    // Jacobian of `q` with respect to `p`, needed below to carry
-                    // the gradient back out through the warp.
-                    (px + warp * wx, pz + warp * wz, 1.0 + g * wxu, g * wxv, g * wzu, 1.0 + g * wzv)
-                } else {
-                    (px, pz, 1.0, 0.0, 0.0, 1.0)
-                };
-
-                // Fractional Brownian motion: octaves of the same field, each
-                // finer and shallower than the last.
-                let mut sum = 0.0;
-                let mut dq_x = 0.0;
-                let mut dq_z = 0.0;
-                let mut frequency = 1.0;
-                let mut weight = 1.0;
-                for o in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
-                    let step = (o + 1) as Real;
-                    let (n, nu, nv) = noise::perlin_d(
-                        seed.wrapping_add((o as u64).wrapping_mul(OCTAVE_SEED_STRIDE)),
-                        qx * frequency + step * OCTAVE_OFFSET_X,
-                        qz * frequency + step * OCTAVE_OFFSET_Z,
-                    );
-                    sum += weight * n;
-                    dq_x += weight * frequency * nu;
-                    dq_z += weight * frequency * nv;
-                    frequency *= lacunarity;
-                    weight *= gain;
-                }
-
-                // Chain rule, outward: noise -> warped domain -> field space ->
-                // world. `jxx..jzz` is the warp Jacobian, transposed here
-                // because the gradient is a covector.
-                let dp_x = dq_x * jxx + dq_z * jzx;
-                let dp_z = dq_x * jxz + dq_z * jzz;
-                let scale = amplitude * inv_w;
-                let dhdx = scale * (dp_x * rot_cos + dp_z * rot_sin);
-                let dhdz = scale * (dp_z * rot_cos - dp_x * rot_sin);
-
-                (amplitude * sum, vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y))
+            TerrainModel::Fractal(f) => {
+                let (h, dhdx, dhdz) = f.height_and_gradient(x, z);
+                (h, vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y))
             }
         }
+    }
+
+    /// How level the ground is within `radius` of `(x, z)`, as the smallest `y`
+    /// component of the surface normal found there: 1 is a flat plateau, 0 is a
+    /// vertical face.
+    ///
+    /// Used to choose somewhere fair to set an organism down. On smooth ground
+    /// this is a formality; on terraced ground it is not, because an organism
+    /// spawned straddling a riser starts half inside a wall, and what the solver
+    /// does about that is not a fair test of a gait.
+    ///
+    /// Nine samples — the centre and a ring of eight — which is enough to catch
+    /// a riser crossing the footprint and cheap enough to run a dozen times per
+    /// trial.
+    pub fn levelness_near(&self, x: Real, z: Real, radius: Real) -> Real {
+        const RING: [(Real, Real); 8] = [
+            (1.0, 0.0),
+            (0.707_106_77, 0.707_106_77),
+            (0.0, 1.0),
+            (-0.707_106_77, 0.707_106_77),
+            (-1.0, 0.0),
+            (-0.707_106_77, -0.707_106_77),
+            (0.0, -1.0),
+            (0.707_106_77, -0.707_106_77),
+        ];
+        let mut worst = self.normal_at(x, z).y;
+        for (dx, dz) in RING {
+            worst = worst.min(self.normal_at(x + dx * radius, z + dz * radius).y);
+        }
+        worst
     }
 
     /// The largest height this model can produce, in metres.
@@ -335,15 +627,7 @@ impl TerrainModel {
         match *self {
             TerrainModel::Flat { height } => height.abs(),
             TerrainModel::Rough { amplitude, .. } => 1.5 * amplitude.abs(),
-            TerrainModel::Fractal { amplitude, octaves, gain, .. } => {
-                let mut total = 0.0;
-                let mut weight = 1.0;
-                for _ in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
-                    total += weight;
-                    weight *= gain.abs();
-                }
-                amplitude.abs() * total
-            }
+            TerrainModel::Fractal(f) => f.height_bound(),
         }
     }
 }
@@ -508,6 +792,9 @@ struct PairContact {
     depth: Real,
     k_n: Real,
     pn: Real,
+    /// Accumulated *positional* normal impulse, kept apart from `pn` so the two
+    /// halves of the solve each converge against their own history.
+    pn_bias: Real,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -527,6 +814,8 @@ struct Contact {
     pn: Real,
     pt1: Real,
     pt2: Real,
+    /// Accumulated positional normal impulse. See [`World::bias_lin`].
+    pn_bias: Real,
     /// Restitution target captured before solving.
     bounce: Real,
 }
@@ -539,6 +828,24 @@ pub struct World {
     /// Per-body inverse inertia in world coordinates, refreshed once per step
     /// rather than once per solver iteration.
     inv_inertia: Vec<Mat3>,
+    /// Positional correction, held as a velocity that never becomes momentum.
+    ///
+    /// Every constraint here has two jobs: stop bodies moving into each other,
+    /// and undo the overlap they are already in. The second used to be done by
+    /// adding a Baumgarte bias straight into `lin_vel`, which works and is also
+    /// a motor: the velocity it injects to separate two bodies is still there
+    /// after they have separated. An organism whose own parts kept
+    /// re-penetrating collected `max_correction_speed` every step and kept it,
+    /// and evolution found that long before it found walking — champions that
+    /// crossed twenty-six metres with their motors switched off.
+    ///
+    /// So the correction is accumulated here instead, used only to displace
+    /// bodies in [`Self::integrate_positions`], and discarded at the end of the
+    /// step. Bodies still separate; separating no longer pays. This is Catto's
+    /// split impulse, and it is why `solve_*` below each have a velocity half
+    /// and a position half that look almost the same.
+    bias_lin: Vec<Vec3>,
+    bias_ang: Vec<Vec3>,
     prep: Vec<JointPrep>,
     contacts: Vec<Contact>,
     pair_contacts: Vec<PairContact>,
@@ -582,6 +889,8 @@ impl World {
             joints,
             params,
             inv_inertia: vec![Mat3::ZERO; n],
+            bias_lin: vec![Vec3::ZERO; n],
+            bias_ang: vec![Vec3::ZERO; n],
             prep: vec![JointPrep::default(); j],
             contacts: Vec::with_capacity(n * 8),
             pair_contacts: Vec::new(),
@@ -611,6 +920,15 @@ impl World {
         self.build_pair_contacts();
         self.prepare_joints(dt);
         self.apply_tendons(dt);
+
+        // The positional correction starts each step from nothing. It is a
+        // property of the overlap that exists right now, not a quantity a body
+        // is allowed to carry from one step to the next — carrying it is
+        // exactly what made it a motor. See [`Self::bias_lin`].
+        for i in 0..self.bodies.len() {
+            self.bias_lin[i] = Vec3::ZERO;
+            self.bias_ang[i] = Vec3::ZERO;
+        }
 
         for _ in 0..self.params.iterations {
             self.solve_joints(dt);
@@ -800,15 +1118,46 @@ impl World {
         }
     }
 
+    /// Move bodies by their velocity *plus* the step's positional correction.
+    ///
+    /// The correction displaces and is then dropped: it never reaches
+    /// `lin_vel`, so a body that has been pushed out of an overlap is left
+    /// exactly as fast as it was before. It is clamped on the same terms as the
+    /// individual constraint biases that produced it, because a pathological
+    /// mutated body can pile up dozens of overlapping contacts and their
+    /// corrections all point the same way.
     fn integrate_positions(&mut self, dt: Real) {
         let max_v = self.params.max_linear_speed;
         let max_w = self.params.max_angular_speed;
-        for b in self.bodies.iter_mut() {
+        let max_corr = self.params.max_correction_speed;
+        for (i, b) in self.bodies.iter_mut().enumerate() {
             clamp_speed(&mut b.lin_vel, max_v);
             clamp_speed(&mut b.ang_vel, max_w);
-            b.pos += b.lin_vel * dt;
-            b.orient = b.orient.integrate(b.ang_vel, dt);
+            let mut bias_lin = self.bias_lin[i];
+            let mut bias_ang = self.bias_ang[i];
+            clamp_speed(&mut bias_lin, max_corr);
+            clamp_speed(&mut bias_ang, max_corr * 4.0);
+            b.pos += (b.lin_vel + bias_lin) * dt;
+            b.orient = b.orient.integrate(b.ang_vel + bias_ang, dt);
         }
+    }
+
+    /// Velocity of a body-fixed point under the positional correction alone.
+    #[inline]
+    fn bias_point_velocity(&self, i: usize, r: Vec3) -> Vec3 {
+        self.bias_lin[i] + self.bias_ang[i].cross(r)
+    }
+
+    /// The positional-correction counterpart of [`RigidBody::apply_impulse`].
+    #[inline]
+    fn apply_bias_impulse(&mut self, i: usize, r: Vec3, impulse: Vec3) {
+        self.bias_lin[i] += impulse * self.bodies[i].inv_mass;
+        self.bias_ang[i] += self.inv_inertia[i].mul_vec(r.cross(impulse));
+    }
+
+    #[inline]
+    fn apply_bias_angular_impulse(&mut self, i: usize, impulse: Vec3) {
+        self.bias_ang[i] += self.inv_inertia[i].mul_vec(impulse);
     }
 
     fn refresh_inertia(&mut self) {
@@ -910,6 +1259,7 @@ impl World {
                     depth,
                     k_n: k,
                     pn: 0.0,
+                    pn_bias: 0.0,
                 });
             }
         }
@@ -931,23 +1281,42 @@ impl World {
             let inv_ia = self.inv_inertia[ia];
             let inv_ib = self.inv_inertia[ib];
 
+            // Velocity half: stop the parts driving further into each other.
+            // The normal points from a to b, so separating means vn > 0.
             let relative =
                 self.bodies[ib].point_velocity(c.r_b) - self.bodies[ia].point_velocity(c.r_a);
             let vn = relative.dot(c.normal);
-            let bias = clamp((c.depth - slop).max(0.0) * beta * inv_dt, 0.0, max_corr);
-
-            // The normal points from a to b, so separating means vn > 0.
-            let mut lambda = (bias - vn) / c.k_n;
+            let mut lambda = -vn / c.k_n;
             let old = c.pn;
             let new = (old + lambda).max(0.0);
             lambda = new - old;
             self.pair_contacts[i].pn = new;
-            if lambda == 0.0 {
-                continue;
+            if lambda != 0.0 {
+                let impulse = c.normal * lambda;
+                self.bodies[ia].apply_impulse(c.r_a, -impulse, &inv_ia);
+                self.bodies[ib].apply_impulse(c.r_b, impulse, &inv_ib);
             }
-            let impulse = c.normal * lambda;
-            self.bodies[ia].apply_impulse(c.r_a, -impulse, &inv_ia);
-            self.bodies[ib].apply_impulse(c.r_b, impulse, &inv_ib);
+
+            // Position half. This is the one that mattered: shoving overlapping
+            // limbs apart at up to `max_correction_speed` and *keeping* the
+            // velocity was a rocket any sprawling body could fire, and the
+            // whole population found it.
+            let bias = clamp((c.depth - slop).max(0.0) * beta * inv_dt, 0.0, max_corr);
+            if bias > 0.0 {
+                let vb = (self.bias_point_velocity(ib, c.r_b)
+                    - self.bias_point_velocity(ia, c.r_a))
+                .dot(c.normal);
+                let mut lb = (bias - vb) / c.k_n;
+                let old_b = c.pn_bias;
+                let new_b = (old_b + lb).max(0.0);
+                lb = new_b - old_b;
+                self.pair_contacts[i].pn_bias = new_b;
+                if lb != 0.0 {
+                    let impulse = c.normal * lb;
+                    self.apply_bias_impulse(ia, c.r_a, -impulse);
+                    self.apply_bias_impulse(ib, c.r_b, impulse);
+                }
+            }
         }
     }
 
@@ -974,10 +1343,21 @@ impl World {
                 // their arithmetic, and this is the innermost loop in the
                 // simulator — up to eight points per body per step.
                 let (ground, normal) = terrain.sample(corner.x, corner.z);
-                let depth = ground - corner.y;
-                if depth <= 0.0 {
+                let drop = ground - corner.y;
+                if drop <= 0.0 {
                     continue;
                 }
+                // `drop` is how far the point is below the surface *vertically*,
+                // but the contact is resolved along the surface normal, and on a
+                // slope those are not the same distance: the vertical measure
+                // overstates the true perpendicular penetration by 1/cos(slope)
+                // — 1.4x at 45 degrees, 7x at 82. Since the positional
+                // correction is proportional to depth, leaving it uncorrected
+                // makes every steep face push about seven times too hard, and
+                // the steeper the ground the harder it shoves. `normal.y` is
+                // exactly that cosine, and the conversion is exact for a
+                // locally flat surface.
+                let depth = drop * normal.y;
                 let tangent1 = normal.any_perpendicular();
                 let tangent2 = normal.cross(tangent1);
                 let r = corner - body.pos;
@@ -1000,6 +1380,7 @@ impl World {
                     pn: 0.0,
                     pt1: 0.0,
                     pt2: 0.0,
+                    pn_bias: 0.0,
                     bounce,
                 });
             }
@@ -1018,17 +1399,32 @@ impl World {
             let bi = c.body as usize;
             let inv_i = self.inv_inertia[bi];
 
-            // Normal.
-            let correction = clamp(beta * (c.depth - slop).max(0.0) * inv_dt, 0.0, max_corr);
-            let target = correction + c.bounce;
+            // Normal, velocity half: stop the body moving into the ground, and
+            // bounce it if the impact was hard enough. No positional term —
+            // that is the job of the bias half below, and mixing the two is
+            // what used to make the ground a motor.
             let vn = self.bodies[bi].point_velocity(c.r).dot(c.normal);
-            let mut lambda = (target - vn) / c.k_n;
+            let mut lambda = (c.bounce - vn) / c.k_n;
             let new_pn = (c.pn + lambda).max(0.0);
             lambda = new_pn - c.pn;
             self.contacts[ci].pn = new_pn;
             if lambda != 0.0 {
                 let p = c.normal * lambda;
                 self.bodies[bi].apply_impulse(c.r, p, &inv_i);
+            }
+
+            // Normal, position half: separate what is already overlapping,
+            // into a velocity that only ever displaces.
+            let correction = clamp(beta * (c.depth - slop).max(0.0) * inv_dt, 0.0, max_corr);
+            if correction > 0.0 {
+                let vb = self.bias_point_velocity(bi, c.r).dot(c.normal);
+                let mut lb = (correction - vb) / c.k_n;
+                let new_pb = (c.pn_bias + lb).max(0.0);
+                lb = new_pb - c.pn_bias;
+                self.contacts[ci].pn_bias = new_pb;
+                if lb != 0.0 {
+                    self.apply_bias_impulse(bi, c.r, c.normal * lb);
+                }
             }
 
             // Friction, clamped to the Coulomb cone around the normal impulse
@@ -1113,16 +1509,24 @@ impl World {
             let inv_ib = self.inv_inertia[ib];
 
             // --- Point-to-point: the anchors must coincide. ---
+            // Velocity half: hold the anchors moving together.
+            let v_rel = self.bodies[ib].point_velocity(p.rb) - self.bodies[ia].point_velocity(p.ra);
+            let impulse = p.k_point.solve(-v_rel);
+            self.bodies[ia].apply_impulse(p.ra, -impulse, &inv_ia);
+            self.bodies[ib].apply_impulse(p.rb, impulse, &inv_ib);
+
+            // Position half: pull apart anchors that have already drifted. A
+            // joint stretched every step by a limb it cannot hold would
+            // otherwise be a motor in exactly the way self-collision was.
             let anchor_a = self.bodies[ia].pos + p.ra;
             let anchor_b = self.bodies[ib].pos + p.rb;
             let error = anchor_b - anchor_a;
             let mut bias = error * (-beta * inv_dt);
             clamp_speed(&mut bias, max_corr);
-
-            let v_rel = self.bodies[ib].point_velocity(p.rb) - self.bodies[ia].point_velocity(p.ra);
-            let impulse = p.k_point.solve(bias - v_rel);
-            self.bodies[ia].apply_impulse(p.ra, -impulse, &inv_ia);
-            self.bodies[ib].apply_impulse(p.rb, impulse, &inv_ib);
+            let vb_rel = self.bias_point_velocity(ib, p.rb) - self.bias_point_velocity(ia, p.ra);
+            let bias_impulse = p.k_point.solve(bias - vb_rel);
+            self.apply_bias_impulse(ia, p.ra, -bias_impulse);
+            self.apply_bias_impulse(ib, p.rb, bias_impulse);
 
             // --- Angular. ---
             match j.kind {
@@ -1130,16 +1534,20 @@ impl World {
                     // Drive the relative rotation back to the rest pose. Bodies
                     // start axis-aligned, so the rest relative rotation is the
                     // identity and the error is just the relative quaternion.
+                    let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
+                    let ang_impulse = p.k_ang.solve(-w_rel);
+                    self.bodies[ia].apply_angular_impulse(-ang_impulse, &inv_ia);
+                    self.bodies[ib].apply_angular_impulse(ang_impulse, &inv_ib);
+
                     let q_rel = self.bodies[ib].orient.mul(self.bodies[ia].orient.conjugate());
                     let sign = if q_rel.w < 0.0 { -1.0 } else { 1.0 };
                     let err = q_rel.vec() * (2.0 * sign);
                     let mut ang_bias = err * (-beta * inv_dt);
                     clamp_speed(&mut ang_bias, max_corr * 4.0);
-
-                    let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
-                    let ang_impulse = p.k_ang.solve(ang_bias - w_rel);
-                    self.bodies[ia].apply_angular_impulse(-ang_impulse, &inv_ia);
-                    self.bodies[ib].apply_angular_impulse(ang_impulse, &inv_ib);
+                    let wb_rel = self.bias_ang[ib] - self.bias_ang[ia];
+                    let bias_impulse = p.k_ang.solve(ang_bias - wb_rel);
+                    self.apply_bias_angular_impulse(ia, -bias_impulse);
+                    self.apply_bias_angular_impulse(ib, bias_impulse);
                 }
                 JointKind::Hinge => {
                     // Remove the two rotational degrees of freedom that are not
@@ -1151,15 +1559,21 @@ impl World {
                             continue;
                         }
                         let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
+                        let lambda = -w_rel.dot(t) / k;
+                        let imp = t * lambda;
+                        self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);
+                        self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
+
                         let target = clamp(
                             -beta * inv_dt * misalign.dot(t),
                             -max_corr * 4.0,
                             max_corr * 4.0,
                         );
-                        let lambda = (target - w_rel.dot(t)) / k;
-                        let imp = t * lambda;
-                        self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);
-                        self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
+                        let wb_rel = self.bias_ang[ib] - self.bias_ang[ia];
+                        let lb = (target - wb_rel.dot(t)) / k;
+                        let imp_b = t * lb;
+                        self.apply_bias_angular_impulse(ia, -imp_b);
+                        self.apply_bias_angular_impulse(ib, imp_b);
                     }
 
                     self.solve_hinge_limit(i, dt);
@@ -1187,25 +1601,35 @@ impl World {
 
         // Sign of the direction in which the joint is over-rotated.
         let dir = if sin_theta >= 0.0 { 1.0 } else { -1.0 };
-        // Overshoot measured in cosine rather than radians: monotone in |theta|
-        // over the half-turn a hinge limit can occupy, and free of `acos`.
+
+        // Velocity half: stop the joint rotating further past its limit. It is
+        // allowed to come back on its own; it is not allowed to keep going.
+        let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
+        let rate = dir * w_rel.dot(p.axis_w);
+        if rate > 0.0 {
+            let lambda = -rate / p.k_axis;
+            let imp = p.axis_w * (lambda * dir);
+            self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);
+            self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
+        }
+
+        // Position half: unwind the overshoot that already happened. Overshoot
+        // is measured in cosine rather than radians — monotone in |theta| over
+        // the half-turn a hinge limit can occupy, and free of `acos`.
         let overshoot = j.cos_limit - cos_theta;
         let push_back = -clamp(
             self.params.baumgarte * overshoot / dt,
             0.0,
             self.params.max_correction_speed * 4.0,
         );
-
-        // Relative rotation rate in the violating direction.
-        let w_rel = self.bodies[ib].ang_vel - self.bodies[ia].ang_vel;
-        let rate = dir * w_rel.dot(p.axis_w);
-        if rate <= push_back {
-            return; // already recovering fast enough
+        let wb_rel = self.bias_ang[ib] - self.bias_ang[ia];
+        let bias_rate = dir * wb_rel.dot(p.axis_w);
+        if bias_rate > push_back {
+            let lb = (push_back - bias_rate) / p.k_axis;
+            let imp = p.axis_w * (lb * dir);
+            self.apply_bias_angular_impulse(ia, -imp);
+            self.apply_bias_angular_impulse(ib, imp);
         }
-        let lambda = (push_back - rate) / p.k_axis;
-        let imp = p.axis_w * (lambda * dir);
-        self.bodies[ia].apply_angular_impulse(-imp, &inv_ia);
-        self.bodies[ib].apply_angular_impulse(imp, &inv_ib);
     }
 
     /// A passive spring and damper across the hinge: a tendon.
@@ -1921,63 +2345,89 @@ mod tests {
         assert!(before.x.is_nan() || before.x == w.bodies[0].pos.x);
     }
 
-    // ------------------------------------------------------------------ terrain
+    /// Self-collision must not be a motor.
+    ///
+    /// This is the shape of the bug that inflated every result in this project
+    /// for two months, reduced to forty lines: three parts in a chain, folded
+    /// so the two ends overlap. A pair of loose boxes cannot show it — shoved
+    /// apart, they separate once and stop. A folded chain is a *cycle*: the
+    /// joints pull the ends back into each other every step, self-collision
+    /// shoves them apart again, and when the shove was added straight into
+    /// `lin_vel` the pair became an engine that never ran down. Evolved
+    /// champions crossed twenty-six metres with their motors switched off, and
+    /// no test in the suite objected.
+    ///
+    /// Nothing here is meant to do work: no motor, no tendon, and the
+    /// measurement starts after the chain has settled on flat ground, so there
+    /// is not even potential energy left to spend. On the solver this replaced,
+    /// it crawls 2.74 m per 7.5 s and keeps doing it indefinitely.
+    ///
+    /// It is not zero now, and the honest reason is that split impulse stops
+    /// the correction becoming *momentum* without stopping it becoming
+    /// *displacement*: the ground is immovable, so a body in an internal cycle
+    /// can still ratchet against it a fraction of a millimetre at a time. The
+    /// residue is 0.46 m per 7.5 s here and unmeasurable on real organisms —
+    /// the champions that exploited the old behaviour now travel nothing at
+    /// all. The bound below is set to catch a regression toward the old
+    /// behaviour, not to certify zero.
+    #[test]
+    fn self_collision_is_not_a_motor() {
+        let dt = 1.0 / 120.0;
+        let mut worst: Real = 0.0;
+        for fold in 1..10 {
+            let reach = 0.30 - fold as Real * 0.028;
+            let bodies: Vec<RigidBody> = (0..3)
+                .map(|i| {
+                    let angle = i as Real * 1.9;
+                    let (s, c) = dsincos(angle);
+                    RigidBody::box_body(
+                        vec3(reach * c, 1.0 + i as Real * 0.05, reach * s),
+                        vec3(0.12, 0.12, 0.12),
+                        1000.0,
+                    )
+                })
+                .collect();
+            let joints: Vec<Joint> = (0..2)
+                .map(|i| {
+                    let mid = (bodies[i].pos + bodies[i + 1].pos) * 0.5;
+                    Joint::fixed(
+                        i as u16,
+                        i as u16 + 1,
+                        mid - bodies[i].pos,
+                        mid - bodies[i + 1].pos,
+                    )
+                })
+                .collect();
+            let params = WorldParams { self_collision: true, ..WorldParams::default() };
+            let mut w = World::new(bodies, joints, params);
 
-    /// The fractal variant's parameters as a struct, purely so that the tests
-    /// below can vary one of them at a time with `..`, which an enum variant
-    /// does not allow.
-    #[derive(Clone, Copy)]
-    struct Frac {
-        seed: u64,
-        amplitude: Real,
-        wavelength: Real,
-        octaves: u32,
-        lacunarity: Real,
-        gain: Real,
-        warp: Real,
-        offset_x: Real,
-        offset_z: Real,
-        rot_sin: Real,
-        rot_cos: Real,
+            // Let it fall and settle; everything after this starts from rest.
+            for _ in 0..240 {
+                w.step(dt);
+            }
+            assert!(!w.diverged, "fold {fold}: diverged while settling");
+            let (x0, z0) = (w.bodies[0].pos.x, w.bodies[0].pos.z);
+            for _ in 0..900 {
+                w.step(dt);
+            }
+            assert!(!w.diverged, "fold {fold}: diverged");
+            let (dx, dz) = (w.bodies[0].pos.x - x0, w.bodies[0].pos.z - z0);
+            worst = worst.max((dx * dx + dz * dz).sqrt());
+        }
+        assert!(worst < 1.0, "a motorless folded chain crawled {worst} m in 7.5 s");
     }
 
-    impl Frac {
-        /// The settings `experiments/fractal-animals.toml` ships with.
-        fn seeded(seed: u64) -> Frac {
-            Frac {
-                seed,
-                amplitude: 0.25,
-                wavelength: 6.0,
-                octaves: 4,
-                lacunarity: 2.0,
-                gain: 0.5,
-                warp: 0.3,
-                offset_x: 0.0,
-                offset_z: 0.0,
-                rot_sin: 0.0,
-                rot_cos: 1.0,
-            }
-        }
+    // ------------------------------------------------------------------ terrain
 
-        fn model(self) -> TerrainModel {
-            TerrainModel::Fractal {
-                seed: self.seed,
-                amplitude: self.amplitude,
-                wavelength: self.wavelength,
-                octaves: self.octaves,
-                lacunarity: self.lacunarity,
-                gain: self.gain,
-                warp: self.warp,
-                offset_x: self.offset_x,
-                offset_z: self.offset_z,
-                rot_sin: self.rot_sin,
-                rot_cos: self.rot_cos,
-            }
-        }
+    /// The shipped landscape band with one seed changed. Everything after band
+    /// one is off in `FractalField::default()`, so a case that varies one field
+    /// with `..` varies exactly that.
+    fn frac(seed: u64) -> FractalField {
+        FractalField { seed, wavelength: 6.0, ..FractalField::default() }
     }
 
     fn fractal(seed: u64) -> TerrainModel {
-        Frac::seeded(seed).model()
+        TerrainModel::Fractal(frac(seed))
     }
 
     /// `sample` exists to halve the terrain work on the contact path. It is only
@@ -1993,8 +2443,8 @@ mod tests {
             TerrainModel::Rough { amplitude: 0.25, wavelength: 6.0 },
             fractal(0),
             fractal(0xABCD_EF01),
-            Frac { warp: 0.0, ..Frac::seeded(9) }.model(),
-            Frac { octaves: 1, ..Frac::seeded(9) }.model(),
+            TerrainModel::Fractal(FractalField { warp: 0.0, ..frac(9) }),
+            TerrainModel::Fractal(FractalField { octaves: 1, ..frac(9) }),
         ];
         for m in models {
             for a in -40..40 {
@@ -2024,14 +2474,14 @@ mod tests {
             fractal(0),
             fractal(1),
             fractal(0xDEAD_BEEF),
-            Frac { warp: 0.0, ..Frac::seeded(2) }.model(),
-            Frac { warp: 0.9, ..Frac::seeded(3) }.model(),
-            Frac { octaves: 1, ..Frac::seeded(4) }.model(),
-            Frac { octaves: 6, ..Frac::seeded(5) }.model(),
-            Frac { lacunarity: 2.7, gain: 0.65, ..Frac::seeded(6) }.model(),
-            Frac { wavelength: 1.5, amplitude: 0.05, ..Frac::seeded(7) }.model(),
-            Frac { rot_sin: 0.6, rot_cos: 0.8, ..Frac::seeded(8) }.model(),
-            Frac { offset_x: 12.5, offset_z: -7.25, ..Frac::seeded(9) }.model(),
+            TerrainModel::Fractal(FractalField { warp: 0.0, ..frac(2) }),
+            TerrainModel::Fractal(FractalField { warp: 0.9, ..frac(3) }),
+            TerrainModel::Fractal(FractalField { octaves: 1, ..frac(4) }),
+            TerrainModel::Fractal(FractalField { octaves: 6, ..frac(5) }),
+            TerrainModel::Fractal(FractalField { lacunarity: 2.7, gain: 0.65, ..frac(6) }),
+            TerrainModel::Fractal(FractalField { wavelength: 1.5, amplitude: 0.05, ..frac(7) }),
+            TerrainModel::Fractal(FractalField { rot_sin: 0.6, rot_cos: 0.8, ..frac(8) }),
+            TerrainModel::Fractal(FractalField { offset_x: 12.5, offset_z: -7.25, ..frac(9) }),
         ];
         let mut worst = 0.0f64;
         for m in variants {
@@ -2052,6 +2502,158 @@ mod tests {
         // octave is a fraction of a metre, not a wrong derivative. A sign error
         // or a dropped warp term lands orders of magnitude above this.
         assert!(worst < 2e-2, "worst gradient error {worst}");
+    }
+
+    /// The bands that were added after the first, each varied on its own, and
+    /// then all at once. Terracing is the one that will break: it multiplies
+    /// the gradient by `1/riser`, so a factor dropped there is a normal that
+    /// disagrees with the surface by a factor of eight.
+    fn banded() -> FractalField {
+        FractalField {
+            seed: 0x5EED_0001,
+            amplitude: 3.0,
+            wavelength: 25.0,
+            octaves: 5,
+            detail_amplitude: 0.35,
+            detail_wavelength: 3.0,
+            modulation: 0.9,
+            step: 0.8,
+            riser: 0.12,
+            terrace_mask: true,
+            ..FractalField::default()
+        }
+    }
+
+    #[test]
+    fn every_band_has_an_exact_gradient() {
+        let h = 1e-3;
+        let variants: [(&str, FractalField); 9] = [
+            ("landscape only", FractalField { detail_amplitude: 0.0, ..banded() }),
+            ("detail, unmodulated", FractalField { modulation: 0.0, step: 0.0, ..banded() }),
+            ("detail, modulated", FractalField { step: 0.0, ..banded() }),
+            ("terraced, unmasked", FractalField { terrace_mask: false, ..banded() }),
+            ("terraced, masked", banded()),
+            ("terraced, sheer", FractalField { riser: 0.05, ..banded() }),
+            ("terraced, shallow", FractalField { riser: 0.9, ..banded() }),
+            ("terraced, no warp", FractalField { warp: 0.0, ..banded() }),
+            (
+                "everything, moved",
+                FractalField {
+                    offset_x: 3.5,
+                    offset_z: -7.25,
+                    rot_sin: 0.6,
+                    rot_cos: 0.8,
+                    ..banded()
+                },
+            ),
+        ];
+        for (label, f) in variants {
+            let mut worst = 0.0f64;
+            for a in -60..60 {
+                for b in -60..60 {
+                    let (x, z) = (a as Real * 0.317, b as Real * 0.211);
+                    let (_, dx, dz) = f.height_and_gradient(x, z);
+                    let fdx = (f.height_and_gradient(x + h, z).0
+                        - f.height_and_gradient(x - h, z).0)
+                        / (2.0 * h);
+                    let fdz = (f.height_and_gradient(x, z + h).0
+                        - f.height_and_gradient(x, z - h).0)
+                        / (2.0 * h);
+                    // A riser is a genuinely steep, genuinely narrow feature, so
+                    // a central difference straddling one is measuring the
+                    // secant of a cliff rather than its tangent. Compare
+                    // relative to the local scale instead of absolutely.
+                    let scale = 1.0 + dx.abs().max(dz.abs()) as f64;
+                    worst = worst.max((dx - fdx).abs() as f64 / scale);
+                    worst = worst.max((dz - fdz).abs() as f64 / scale);
+                }
+            }
+            assert!(worst < 0.05, "{label}: worst relative gradient error {worst}");
+        }
+    }
+
+    /// Terracing exists to make cliffs, and the mask exists to put them
+    /// somewhere rather than everywhere. Both claims are measurable.
+    #[test]
+    fn terracing_makes_cliffs_and_leaves_the_ground_crossable() {
+        let smooth = FractalField { step: 0.0, ..banded() };
+        let terraced = FractalField { terrace_mask: false, ..banded() };
+
+        let slopes = |f: &FractalField| {
+            let mut v: Vec<Real> = Vec::with_capacity(240 * 240);
+            for a in -120..120 {
+                for b in -120..120 {
+                    let (_, dx, dz) = f.height_and_gradient(a as Real * 0.19, b as Real * 0.23);
+                    v.push((dx * dx + dz * dz).sqrt().atan().to_degrees());
+                }
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+
+        let s = slopes(&smooth);
+        let t = slopes(&terraced);
+        let at = |v: &[Real], q: f64| v[((v.len() - 1) as f64 * q) as usize];
+
+        // Smooth fractional Brownian motion has one steepness and applies it
+        // everywhere: scaling it up cannot make a cliff.
+        assert!(at(&s, 1.0) < 65.0, "smooth fBm reached {} degrees", at(&s, 1.0));
+        // Terracing puts most of the plane flat and the difficulty in the rest.
+        assert!(at(&t, 0.5) < 5.0, "terraced median slope {} is not a plateau", at(&t, 0.5));
+        assert!(at(&t, 0.99) > 70.0, "terraced p99 slope {} is not a cliff", at(&t, 0.99));
+        // And it stays crossable: the ground must not become a wall everywhere.
+        let walkable = t.iter().filter(|v| **v < 40.0).count() as Real / t.len() as Real;
+        assert!(walkable > 0.80, "only {:.0}% of terraced ground is walkable", walkable * 100.0);
+    }
+
+    /// How much the *character* of the ground varies from place to place.
+    ///
+    /// Measured as the spread of mean slope across 12 m tiles, which is the
+    /// metric that matters: a tile on the flank of a big hill has enormous
+    /// relief and may still be billiard-smooth, so relief per tile answers a
+    /// different question and answers it misleadingly. Measuring relief instead
+    /// is what produced the claim — repeated in this file's history, the README
+    /// and both plan documents — that domain warping does nothing for
+    /// heterogeneity. It does; the metric could not see it.
+    ///
+    /// Measured on this field, warp 0 to 1 takes the spread from 0.09 to 0.18,
+    /// and on the shipped landscape band from 0.04 to 0.11. The mask is still
+    /// the strongest single lever and they compose.
+    #[test]
+    fn the_bands_each_make_the_ground_more_heterogeneous() {
+        let spread = |f: &FractalField| {
+            let mut tiles = Vec::new();
+            for tx in -5..5 {
+                for tz in -5..5 {
+                    let mut sum = 0.0;
+                    for a in 0..24 {
+                        for b in 0..24 {
+                            let (_, dx, dz) = f.height_and_gradient(
+                                tx as Real * 12.0 + a as Real * 0.5,
+                                tz as Real * 12.0 + b as Real * 0.5,
+                            );
+                            sum += (dx * dx + dz * dz).sqrt().atan().to_degrees();
+                        }
+                    }
+                    tiles.push(sum / 576.0);
+                }
+            }
+            let mean = tiles.iter().sum::<Real>() / tiles.len() as Real;
+            let var = tiles.iter().map(|t| (t - mean).powi(2)).sum::<Real>() / tiles.len() as Real;
+            var.sqrt() / mean
+        };
+
+        let plain = spread(&FractalField { modulation: 0.0, step: 0.0, warp: 0.0, ..banded() });
+        let warped = spread(&FractalField { modulation: 0.0, step: 0.0, warp: 1.0, ..banded() });
+        let modulated = spread(&FractalField { step: 0.0, ..banded() });
+        let masked = spread(&banded());
+
+        assert!(warped > plain * 1.5, "warp: {plain} -> {warped}");
+        assert!(modulated > plain * 1.2, "modulation: {plain} -> {modulated}");
+        assert!(masked > plain * 2.0, "mask: {plain} -> {masked}");
+        // The mask is the strongest single lever, which is why it is the one
+        // the shipped experiment turns on.
+        assert!(masked > warped, "the mask ({masked}) should beat warp ({warped}) alone");
     }
 
     #[test]
@@ -2111,8 +2713,9 @@ mod tests {
     #[test]
     fn a_rigid_motion_moves_the_field() {
         let base = fractal(5);
-        let shifted = Frac { offset_x: 3.7, offset_z: -2.1, ..Frac::seeded(5) }.model();
-        let turned = Frac { rot_sin: 0.6, rot_cos: 0.8, ..Frac::seeded(5) }.model();
+        let shifted =
+            TerrainModel::Fractal(FractalField { offset_x: 3.7, offset_z: -2.1, ..frac(5) });
+        let turned = TerrainModel::Fractal(FractalField { rot_sin: 0.6, rot_cos: 0.8, ..frac(5) });
         let mut moved = 0;
         for i in 1..200 {
             let (x, z) = (i as Real * 0.23, i as Real * 0.17);
@@ -2144,7 +2747,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_fractal_field_stays_finite() {
-        let m = TerrainModel::Fractal {
+        let m = TerrainModel::Fractal(FractalField {
             seed: 0,
             amplitude: 0.0,
             wavelength: 0.0,
@@ -2152,11 +2755,19 @@ mod tests {
             lacunarity: 0.0,
             gain: 0.0,
             warp: 0.0,
+            detail_amplitude: 0.0,
+            detail_wavelength: 0.0,
+            detail_octaves: 0,
+            modulation: 0.0,
+            modulation_wavelength: 0.0,
+            step: 0.0,
+            riser: 0.0,
+            terrace_mask: true,
             offset_x: 0.0,
             offset_z: 0.0,
             rot_sin: 0.0,
             rot_cos: 0.0,
-        };
+        });
         let (h, n) = m.sample(1.0, -1.0);
         assert_eq!(h, 0.0);
         assert_eq!(n, Vec3::Y);
