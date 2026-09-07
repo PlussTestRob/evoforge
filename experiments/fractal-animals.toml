@@ -1,0 +1,153 @@
+# Fractal animals: `animals.toml`, run on ground that is actually ground.
+#
+# Everything about the genome, the body and the fitness function is copied from
+# `animals.toml` unchanged, so that the one thing that differs between the two
+# runs is the world. What differs is `[environment]`.
+#
+# What was wrong with the old ground
+#   `terrain = "rough"` is two octaves of a sine field. It repeats every 1.6 m,
+#   it has no seed, and it has features at one scale only — a 13 cm ripple with
+#   a 10 degree median slope. Every organism in every trial of every experiment
+#   met the identical surface, which is memorisable in principle: an organism
+#   can be selected for one particular hill rather than for coping with hills.
+#
+# What this is instead
+#   Four octaves of seeded gradient noise over a warped domain: aperiodic, keyed
+#   on the experiment seed, and slid and turned under the organism between
+#   trials so that no two trials share a feature. Measured with
+#   `examples/terrain_probe.rs`, these settings give 0.62 m of relief with a
+#   median slope of 9.9 degrees — about as steep underfoot as the old ground,
+#   but with hills to climb rather than a ripple to cross. The tail is what
+#   differs most: 19 degrees at the 90th percentile against 15.8, and 46 degrees
+#   at the steepest against 21.
+#
+# What this is honestly not
+#   It is still a height field: single-valued, smooth, no overhangs and no gaps.
+#   That is exactly what a wheel is good at, so this alone is not expected to
+#   settle wheels against legs. Raising the amplitude makes the ground steeper,
+#   not a different kind of problem. What defeats a wheel is a discontinuity at
+#   or above its own radius, and that needs discrete obstacles. Run this first
+#   and see whether smooth ground was enough before building them.
+
+[experiment]
+name = "fractal-animals"
+# The same seed as animals.toml, deliberately. Every random stream in an
+# experiment derives from this, so with it held fixed the two runs start from
+# the identical founding population and mutate identically, and the only thing
+# that differs between them is the ground. `terrain_seed = 0` derives the
+# landscape from this too.
+seed = 20260906
+output_dir = "runs"
+
+[evolution]
+population_size = 100
+generations = 100
+elite_count = 2
+tournament_size = 4
+crossover_rate = 0.7
+immigrant_rate = 0.02
+
+[body]
+min_parts = 2
+max_parts = 8
+min_half_extent = 0.05
+max_half_extent = 0.20
+density = 1000.0
+min_joint_limit = 0.3
+max_joint_limit = 1.4
+max_motor_speed = 6.0
+max_motor_torque = 200.0
+hinge_probability = 0.85
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+taper_top_scale = 0.45
+joint_endurance = 150.0
+min_drive = 0.2
+muscle_stress = 12000.0
+tendon_frequency = 6.0
+tendon_damping = 0.5
+pair_probability = 0.45
+max_repeat = 3
+
+[brain]
+hidden = 12
+init_sigma = 0.8
+weight_limit = 8.0
+
+[mutation]
+weight_rate = 0.08
+weight_sigma = 0.25
+weight_reset_rate = 0.05
+size_rate = 0.05
+size_sigma = 0.03
+attach_rate = 0.05
+attach_sigma = 0.15
+joint_limit_rate = 0.05
+joint_limit_sigma = 0.2
+joint_kind_rate = 0.02
+joint_axis_rate = 0.03
+motor_rate = 0.05
+motor_sigma = 0.15
+caution_rate = 0.08
+caution_sigma = 0.12
+pair_rate = 0.05
+repeat_rate = 0.04
+shape_rate = 0.04
+add_part_rate = 0.06
+remove_part_rate = 0.05
+
+[simulation]
+duration = 8.0
+control_hz = 20.0
+solver_iterations = 12
+settle_time = 0.5
+trials = 3
+start_jitter = 0.5
+aggregate = "mean"
+steer = true
+steer_spread = 0.9
+
+[environment]
+terrain = "fractal"
+# 0 derives the landscape from experiment.seed. Set it to compare two
+# experiments on identical ground.
+terrain_seed = 0
+# Relief runs to about 2.5x this: 0.62 m peak to trough.
+terrain_amplitude = 0.25
+# Largest feature, metres. The finest of the four octaves is an eighth of it,
+# 0.375 m, which is about the size of an organism's largest part.
+terrain_wavelength = 3.0
+terrain_octaves = 4
+terrain_lacunarity = 2.0
+terrain_gain = 0.5
+# Bends the field into ridges and basins. Measured effect is on the tail of the
+# slope distribution, not on how uniform the ground is — see the note on
+# `terrain_warp` in src/config.rs.
+terrain_warp = 0.6
+# Slide and turn the landscape between trials, so a gait cannot be tuned to one
+# hill. This is the half of the change that `start_jitter` cannot do: half a
+# metre on a three-metre feature is the same hill from slightly along it.
+terrain_per_trial = true
+self_collision = true
+gravity = 9.81
+friction = 0.9
+restitution = 0.0
+linear_damping = 0.02
+angular_damping = 0.05
+
+[fitness]
+objective = "heading"
+energy_penalty = 0.0
+upright_bonus = 0.2
+air_bonus = 0.0
+height_bonus = 0.0
+
+[recording]
+top_n = 4
+random_samples = 3
+record_hz = 30.0
+every_generations = 10
+store_genomes = true
+
+[checkpoint]
+every_generations = 25
+on_finish = true

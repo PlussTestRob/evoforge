@@ -6,6 +6,7 @@
 //! upgrade path.
 
 pub mod body;
+pub mod noise;
 pub mod shape;
 pub mod world;
 

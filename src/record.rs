@@ -62,7 +62,13 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 /// * `5` — a trace records the terrain it ran on, and parts can be mirrored,
 ///   repeated and reflected. All of it defaults on read to what a v4 artefact
 ///   meant: flat ground and one unmirrored copy of each part.
-pub const ARTIFACT_FORMAT: u32 = 5;
+/// * `6` — terrain gained a third kind, `fractal`, and a trace gained the
+///   `terrain_check` samples a viewer uses to prove it is drawing the same
+///   ground. `Trace::terrain` is a tagged enum, so a v5 reader meeting a
+///   `fractal` trace cannot interpret it; the viewer says so and falls back to a
+///   flat plane rather than drawing a plausible lie. Absent samples mean flat
+///   ground, which is what every v5 artefact without them meant.
+pub const ARTIFACT_FORMAT: u32 = 6;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

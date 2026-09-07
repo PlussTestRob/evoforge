@@ -11,6 +11,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { initLibrary } from './library.js';
+import { terrainHeight, finestFeature, terrainCheck, seedPair } from './terrain.js';
 
 const POSE_STRIDE = 7;
 
@@ -69,47 +70,53 @@ ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
-// The rolling-ground height field, mirroring TerrainModel::Rough in
-// src/physics/world.rs. Kept in step with it by eye; if a replay ever looks like
-// it is floating or sunk, this is the first thing to check.
-function terrainHeight(terrain, x, z) {
-  if (!terrain || terrain.kind !== 'rough') return terrain?.height ?? 0;
-  const k = (Math.PI * 2) / Math.max(terrain.wavelength, 1e-3);
-  const a = terrain.amplitude;
-  return (
-    a * Math.sin(k * x) * Math.cos(k * z) +
-    0.5 * a * Math.sin(2 * k * x + 1.7) * Math.cos(2 * k * z + 0.9)
-  );
-}
+// ------------------------------------------------------------------- terrain
+//
+// The height field itself lives in `terrain.js`, so that it can be checked
+// against the simulator without a browser. See `viewer/terrain_check.mjs`.
 
 /** Reshape the ground to match the terrain a replay actually ran on. */
 function shapeGround(terrain) {
-  const rough = terrain && terrain.kind === 'rough';
-  // Rolling ground needs several segments per wavelength or the relief is
-  // aliased away; a smaller sheet at much higher resolution beats a huge flat
-  // one, and organisms never travel far enough to reach its edge.
-  const span = rough ? ROUGH_SPAN : GROUND_SPAN;
-  const segments = rough
-    ? Math.min(700, Math.ceil((span / Math.max(terrain.wavelength, 0.1)) * 12))
+  const kind = (terrain && terrain.kind) || 'flat';
+  const shaped = kind === 'rough' || kind === 'fractal';
+  // Shaped ground needs several segments per feature or the relief aliases
+  // away, and it is the *finest* octave that has to be resolved, not the
+  // nominal wavelength. This is where the single-scale field caught me out
+  // once, and a four-octave one has eight times as far to fall.
+  //
+  // The cap is a real limit, not a formality. At the shipped fractal settings
+  // the finest octave is 0.375 m across, and resolving it properly would ask
+  // for 1900 segments: 3.6 million vertices, and — measured in node — some
+  // eight seconds of hashing, for a ripple three centimetres deep. The cap
+  // spends 780 ms on 361k vertices instead and smooths that ripple away.
+  // Everything an organism can actually climb is drawn.
+  const span = shaped ? ROUGH_SPAN : GROUND_SPAN;
+  const segments = shaped
+    ? Math.min(MAX_GROUND_SEGMENTS, Math.ceil((span / finestFeature(terrain)) * 8))
     : 1;
   const next = new THREE.PlaneGeometry(span, span, segments, segments);
-  if (rough) {
+  if (shaped) {
+    // Resolve the seed once rather than per vertex; it costs a BigInt parse.
+    const seed = kind === 'fractal' ? seedPair(terrain.seed) : null;
     // PlaneGeometry lies in XY until it is rotated, so its local y is world -z.
     const pos = next.attributes.position;
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i);
       const z = -pos.getY(i);
-      pos.setZ(i, terrainHeight(terrain, x, z));
+      pos.setZ(i, terrainHeight(terrain, x, z, seed));
     }
     next.computeVertexNormals();
   }
   ground.geometry.dispose();
   ground.geometry = next;
-  grid.visible = !rough; // a flat grid over rolling ground reads as a mistake
+  grid.visible = !shaped; // a flat grid over shaped ground reads as a mistake
 }
 
 const GROUND_SPAN = 200;
 const ROUGH_SPAN = 90;
+const MAX_GROUND_SEGMENTS = 600;
+/** `TerrainModel`'s variants. Anything else came from a newer evoforge. */
+const KNOWN_TERRAIN = new Set(['flat', 'rough', 'fractal']);
 const grid = new THREE.GridHelper(80, 80, 0x8b96a8, 0x5b6474); // 1 m cells
 grid.position.y = 0.002;
 grid.material.transparent = true;
@@ -329,6 +336,21 @@ function load(json, sourceName) {
   shapeGround(json.trace.terrain);
   buildMeshes(json.trace.bodies);
   fillHud(json);
+
+  // The poses are read off disk and are always right. The ground is recomputed
+  // here, and might not be — so say so, loudly, rather than drawing a plausible
+  // landscape that is not the one the organism ran on.
+  const drift = terrainCheck(json.trace.terrain, json.trace.terrain_check);
+  const kind = (json.trace.terrain && json.trace.terrain.kind) || 'flat';
+  if (drift) {
+    showError(`${sourceName}: ${drift}`);
+  } else if (!KNOWN_TERRAIN.has(kind)) {
+    showError(
+      `${sourceName}: terrain "${kind}" was recorded by a newer evoforge than this ` +
+      `viewer knows about. The organism is drawn on a flat plane instead, so it ` +
+      `will look like it is walking on nothing.`,
+    );
+  }
 
   // Shade the measured span of the timeline; everything before measure_start_t
   // is the settling drop, where the controller is held off.

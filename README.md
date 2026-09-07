@@ -352,6 +352,9 @@ cargo build --release
 # tendons, self-collision, rough ground, repeated trials, commanded headings.
 ./target/release/evo run experiments/animals.toml
 
+# The same, on seeded fractal terrain that differs in every trial.
+./target/release/evo run experiments/fractal-animals.toml
+
 # Measure throughput and its scaling across cores.
 ./target/release/evo bench experiments/first-walkers.toml
 
@@ -515,6 +518,62 @@ against `directed-walkers` — and it does not yet produce quadrupeds: sixty
 generations reached 22 m of commanded travel with an organism that is still
 mostly rolling, upright for under two seconds of eight. The machinery is there;
 what it needs is compute and tuning, not more rules.
+
+### Ground that is actually ground
+
+`terrain = "rough"` is two octaves of a sine field. It repeats every wavelength,
+it has no seed, and it has features at one scale only, so every organism in
+every trial of every experiment meets the same 13 cm ripple — memorisable in
+principle, and not much like a landscape.
+
+`terrain = "fractal"` is four octaves of seeded gradient noise over a warped
+domain: aperiodic, keyed on the experiment seed, and slid and turned under the
+organism between trials so no two trials share a hill. There is no
+transcendental anywhere in it — integer hashing and polynomial arithmetic only —
+which makes it a *better* reproducibility story than the sine field, not a
+worse one, and its gradient is still exact, so contacts get the slope's own
+normal rather than a finite-difference guess.
+
+```toml
+[environment]
+terrain = "fractal"
+terrain_seed = 0          # 0 derives the landscape from experiment.seed
+terrain_amplitude = 0.25  # relief runs to about 2.5x this
+terrain_wavelength = 3.0  # largest feature, metres
+terrain_octaves = 4       # finest is wavelength / lacunarity^(octaves-1)
+terrain_lacunarity = 2.0
+terrain_gain = 0.5
+terrain_warp = 0.6        # bends the field into ridges and basins
+terrain_per_trial = true  # move the landscape between trials
+```
+
+`experiments/fractal-animals.toml` is `animals.toml` with exactly that changed.
+Measured with `cargo run --release --example terrain_probe`, those settings give
+0.62 m of relief against the old 0.13 m, at about the same median slope (9.9
+degrees against 10.3) but with a far longer tail: 46 degrees at the steepest
+against 21.
+
+Two things it is honestly not. It is **not heterogeneous** — the domain warp is
+usually sold as making some regions flat and others broken, and measurement says
+otherwise: relief per 12 m tile varies by 10% of its mean whether the warp is
+off or at full strength, because warping a stationary field with a stationary
+displacement leaves it stationary. And it is **still a height field**:
+single-valued and smooth, with no overhangs, walls or gaps, which is exactly
+what a wheel is good at. Raising the amplitude makes the ground steeper, not a
+different kind of problem. What defeats a wheel is a discontinuity at or above
+its own radius — discrete obstacles — and whether that is needed is a question
+for after this has run, not before.
+
+The viewer mirrors the height field in JavaScript rather than being shipped a
+sampled patch with every replay. That is cheap and it can drift, so every
+non-flat trace records the physics' own height at sixteen points and the viewer
+checks itself against them on load, saying so loudly if they disagree. The same
+check runs offline:
+
+```bash
+cargo run --release --example terrain_samples > samples.json
+node viewer/terrain_check.mjs samples.json
+```
 
 ### Rewarding a jump
 

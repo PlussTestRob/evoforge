@@ -203,7 +203,7 @@ money on compute:
 | Seam | Today | Replace with |
 |---|---|---|
 | `physics::World::step` | sequential impulses | Featherstone ABA |
-| `physics::TerrainModel` | `Flat`, behind `height_at`/`normal_at` | heightfield, obstacles |
+| `physics::TerrainModel` | `Flat`, `Rough`, `Fractal`, behind `height_at`/`normal_at`/`sample` | discrete obstacles |
 | `fitness::Objective` | three variants over `Metrics` | anything that reads `Metrics` |
 | `genome::crossover` | slot-aligned uniform | morphological crossover |
 | `brain` | one hidden layer, fixed size | recurrent, or evolved topology |

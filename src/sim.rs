@@ -43,6 +43,10 @@ const MAX_START_YAW: Real = 0.35;
 const MAX_START_TILT: Real = 0.2;
 const MAX_START_OFFSET: Real = 0.5;
 
+/// How far a per-trial terrain shift can slide the landscape, in units of its
+/// own largest feature. Wide enough that two trials share no feature at all.
+const TERRAIN_SHIFT_SPAN: Real = 64.0;
+
 pub const CLOCK_HZ: Real = 1.0;
 
 /// One recorded instant: body poses at a point in time.
@@ -67,6 +71,19 @@ pub struct Trace {
     /// physics used rather than assuming a flat one.
     #[serde(default = "flat_ground")]
     pub terrain: crate::physics::TerrainModel,
+    /// Ground heights at a fixed handful of points, as flat `x, z, height`
+    /// triples. Empty for flat ground, where there is nothing to get wrong.
+    ///
+    /// The viewer mirrors the height field in JavaScript rather than being
+    /// shipped a sampled patch — a patch costs tens of kilobytes per replay,
+    /// and the mirror is a few dozen lines. The risk a mirror carries is drift:
+    /// get the hash subtly wrong and the viewer draws a different world, with
+    /// organisms apparently floating above ground that looks plausible. These
+    /// samples are what turns that from a silent failure into a loud one. See
+    /// `terrainCheck` in `viewer/terrain.js`, and `viewer/terrain_check.mjs` for
+    /// the same check run offline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terrain_check: Vec<Real>,
     pub frames: Vec<Frame>,
     /// Joints that failed during the run, as `(body detached, time)`. Empty for
     /// any experiment whose joints cannot break, and omitted from the JSON
@@ -79,6 +96,48 @@ pub struct Trace {
 /// the only kind that existed then.
 fn flat_ground() -> crate::physics::TerrainModel {
     crate::physics::TerrainModel::Flat { height: 0.0 }
+}
+
+/// Where the viewer's mirror of the height field is checked, in metres.
+///
+/// Deliberately awkward coordinates: on a lattice point every octave of gradient
+/// noise is exactly zero, so a grid of round numbers would agree between two
+/// completely different implementations. Sixteen points, spread over both signs
+/// and several wavelengths, is enough that no plausible mistake survives.
+const TERRAIN_CHECK_POINTS: [(Real, Real); 16] = [
+    (0.0, 0.0),
+    (0.37, -0.91),
+    (-1.23, 0.58),
+    (2.71, 2.09),
+    (-3.17, -2.72),
+    (5.55, -0.13),
+    (-6.31, 4.41),
+    (8.09, -7.63),
+    (-9.81, -5.27),
+    (11.37, 9.02),
+    (-13.66, 3.19),
+    (15.11, -11.48),
+    (-17.29, -14.06),
+    (19.73, 16.85),
+    (-21.42, 8.37),
+    (23.98, -19.51),
+];
+
+/// Ground heights at [`TERRAIN_CHECK_POINTS`], as flat `x, z, height` triples.
+///
+/// Empty for flat ground: a viewer that cannot draw a plane correctly has
+/// larger problems than drift.
+fn terrain_check(terrain: crate::physics::TerrainModel) -> Vec<Real> {
+    if matches!(terrain, crate::physics::TerrainModel::Flat { .. }) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(TERRAIN_CHECK_POINTS.len() * 3);
+    for (x, z) in TERRAIN_CHECK_POINTS {
+        out.push(x);
+        out.push(z);
+        out.push(terrain.height_at(x, z));
+    }
+    out
 }
 
 /// A joint failing mid-run, recorded so a viewer can mark the moment a limb
@@ -127,7 +186,9 @@ pub fn evaluate_with(
     ws: &mut EvalWorkspace,
 ) -> EvalResult {
     let trials = cfg.simulation.trials.max(1);
-    if trials == 1 && cfg.simulation.start_jitter <= 0.0 {
+    // The canonical start, when nothing varies between trials. Terrain that
+    // moves per trial varies even at one trial, so it takes the loop below.
+    if trials == 1 && cfg.simulation.start_jitter <= 0.0 && !terrain_varies(cfg) {
         return run_trial(genome, cfg, record, ws, None);
     }
 
@@ -141,8 +202,11 @@ pub fn evaluate_with(
     let mut first_trace = None;
     for trial in 0..trials {
         let mut rng = Rng::new(derive_seed(&[cfg.experiment.seed, TRIAL_STREAM, trial as u64]));
-        let start = perturbation(&mut rng, cfg.simulation.start_jitter);
+        let mut start = perturbation(&mut rng, cfg.simulation.start_jitter);
         let heading = commanded_heading(&mut rng, cfg);
+        // Drawn last, and only when it is used, so that adding it left every
+        // stream every existing experiment had exactly where it was.
+        start.terrain = terrain_shift(&mut rng, cfg);
         let r = run_trial_towards(genome, cfg, record && trial == 0, ws, Some(start), heading);
         total += r.fitness;
         worst = worst.min(r.fitness);
@@ -174,7 +238,33 @@ fn perturbation(rng: &mut Rng, jitter: Real) -> phenotype::StartPerturbation {
         yaw: rng.signed() * MAX_START_YAW * jitter,
         tilt: rng.signed() * MAX_START_TILT * jitter,
         offset: vec3(rng.signed(), 0.0, rng.signed()) * (MAX_START_OFFSET * jitter),
+        terrain: phenotype::TerrainShift::NONE,
     }
+}
+
+/// Whether the ground itself differs from trial to trial.
+fn terrain_varies(cfg: &Config) -> bool {
+    cfg.environment.terrain == crate::config::Terrain::Fractal && cfg.environment.terrain_per_trial
+}
+
+/// How far along the landscape this trial is run, and at what bearing.
+///
+/// Half a metre of `start_jitter` on ground whose largest feature is six metres
+/// across is the same hill seen from slightly along it; an organism can still be
+/// selected for that hill. Sliding the field by tens of wavelengths and turning
+/// it through a full circle gives each trial ground it has not seen, so what
+/// survives is coping with ground in general.
+///
+/// Draws nothing unless it is used, which is what leaves every stream in every
+/// existing experiment exactly where it was.
+fn terrain_shift(rng: &mut Rng, cfg: &Config) -> phenotype::TerrainShift {
+    if !terrain_varies(cfg) {
+        return phenotype::TerrainShift::NONE;
+    }
+    let offset_x = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
+    let offset_z = rng.range(-TERRAIN_SHIFT_SPAN, TERRAIN_SHIFT_SPAN);
+    let (sin, cos) = crate::math::dsincos(rng.range(0.0, crate::math::TAU));
+    phenotype::TerrainShift { offset_x, offset_z, sin, cos }
 }
 
 /// The direction this trial asks the organism to travel.
@@ -268,6 +358,7 @@ fn run_trial_towards(
         frames: Vec::with_capacity((total_steps / record_interval) as usize + 2),
         breaks: Vec::new(),
         terrain: pheno.world.params.terrain,
+        terrain_check: terrain_check(pheno.world.params.terrain),
     });
 
     // How hard this organism drives its motors. With joint damage off, caution is
@@ -718,6 +809,141 @@ mod tests {
             seen.windows(2).any(|w| w[0].to_bits() != w[1].to_bits()),
             "every trial produced an identical score: {seen:?}"
         );
+    }
+
+    fn fractal_config() -> Config {
+        let mut cfg = repeated_config();
+        cfg.environment.terrain = crate::config::Terrain::Fractal;
+        cfg.environment.terrain_amplitude = 0.25;
+        cfg.environment.terrain_wavelength = 6.0;
+        cfg
+    }
+
+    /// The point of layer 2: each trial is run on a different piece of the
+    /// landscape, so a gait tuned to one hill is not a gait.
+    #[test]
+    fn each_trial_gets_its_own_piece_of_the_landscape() {
+        let cfg = fractal_config();
+        assert!(cfg.environment.terrain_per_trial);
+        let mut seen = Vec::new();
+        for trial in 0..4u64 {
+            let mut rng = Rng::new(derive_seed(&[cfg.experiment.seed, TRIAL_STREAM, trial]));
+            let mut start = perturbation(&mut rng, cfg.simulation.start_jitter);
+            let _ = commanded_heading(&mut rng, &cfg);
+            start.terrain = terrain_shift(&mut rng, &cfg);
+            assert_ne!(start.terrain, phenotype::TerrainShift::NONE, "trial {trial} unmoved");
+            seen.push(start.terrain);
+        }
+        for (i, a) in seen.iter().enumerate() {
+            for b in &seen[i + 1..] {
+                assert_ne!(a, b, "two trials drew the same landscape");
+            }
+        }
+    }
+
+    /// The shift is drawn from the trial index and the experiment seed and
+    /// nothing else, so every organism still meets the same set of worlds.
+    #[test]
+    fn the_terrain_shift_is_a_pure_function_of_the_trial() {
+        let cfg = fractal_config();
+        let draw = |trial: u64, cfg: &Config| {
+            let mut rng = Rng::new(derive_seed(&[cfg.experiment.seed, TRIAL_STREAM, trial]));
+            let _ = perturbation(&mut rng, cfg.simulation.start_jitter);
+            let _ = commanded_heading(&mut rng, cfg);
+            terrain_shift(&mut rng, cfg)
+        };
+        assert_eq!(draw(2, &cfg), draw(2, &cfg));
+        let mut moved = cfg.clone();
+        moved.experiment.seed += 1;
+        assert_ne!(draw(2, &cfg), draw(2, &moved));
+    }
+
+    /// Compatibility discipline: the shift is drawn *after* everything that
+    /// existed before it, and only when it is used. Every terrain but `fractal`
+    /// — and `fractal` with the feature off — must therefore leave the trial
+    /// stream exactly where it was, or every recorded experiment stops
+    /// reproducing.
+    #[test]
+    fn a_terrain_that_does_not_move_draws_nothing() {
+        let mut cfg = repeated_config();
+        for terrain in [
+            crate::config::Terrain::Flat,
+            crate::config::Terrain::Rough,
+            crate::config::Terrain::Fractal,
+        ] {
+            cfg.environment.terrain = terrain;
+            cfg.environment.terrain_per_trial = false;
+            let mut rng = Rng::new(1234);
+            assert_eq!(terrain_shift(&mut rng, &cfg), phenotype::TerrainShift::NONE);
+            // The stream is untouched: the very next draw is the first draw.
+            let mut fresh = Rng::new(1234);
+            assert_eq!(rng.next_u64(), fresh.next_u64());
+        }
+    }
+
+    /// Moving the ground has to change what happens on it, or layer 2 is
+    /// bookkeeping.
+    #[test]
+    fn a_moved_landscape_changes_the_outcome() {
+        let cfg = fractal_config();
+        let g = random_genome(&cfg, 31);
+        let mut ws = EvalWorkspace::new(&cfg);
+        let flat_start = phenotype::StartPerturbation::default();
+        let base = run_trial(&g, &cfg, false, &mut ws, Some(flat_start)).fitness;
+        let moved = run_trial(
+            &g,
+            &cfg,
+            false,
+            &mut ws,
+            Some(phenotype::StartPerturbation {
+                terrain: phenotype::TerrainShift {
+                    offset_x: 19.0,
+                    offset_z: -23.0,
+                    sin: 0.6,
+                    cos: 0.8,
+                },
+                ..flat_start
+            }),
+        )
+        .fitness;
+        assert_ne!(base.to_bits(), moved.to_bits(), "the landscape did not move");
+    }
+
+    /// A single-trial fractal experiment still varies its ground, so it takes
+    /// the trial loop rather than the canonical-start fast path.
+    #[test]
+    fn one_trial_on_moving_ground_still_takes_the_trial_path() {
+        let mut cfg = fractal_config();
+        cfg.simulation.trials = 1;
+        cfg.simulation.start_jitter = 0.0;
+        let g = random_genome(&cfg, 8);
+        let varied = evaluate(&g, &cfg, false).fitness;
+        cfg.environment.terrain_per_trial = false;
+        let fixed = evaluate(&g, &cfg, false).fitness;
+        assert_ne!(varied.to_bits(), fixed.to_bits());
+    }
+
+    /// A trace has to carry enough for the viewer to prove it is drawing the
+    /// same ground the physics used.
+    #[test]
+    fn a_trace_records_samples_of_the_ground_it_ran_on() {
+        let mut cfg = fractal_config();
+        cfg.recording.record_hz = 10.0;
+        let g = random_genome(&cfg, 12);
+        let trace = evaluate(&g, &cfg, true).trace.expect("recorded");
+        assert_eq!(trace.terrain_check.len(), TERRAIN_CHECK_POINTS.len() * 3);
+        for s in trace.terrain_check.chunks(3) {
+            assert_eq!(s[2], trace.terrain.height_at(s[0], s[1]));
+        }
+        // The samples describe the ground this *trial* ran on, moved and all.
+        assert!(trace.terrain_check.chunks(3).any(|s| s[2] != 0.0));
+
+        // Flat ground has nothing to check, and the field is left out entirely.
+        cfg.environment.terrain = crate::config::Terrain::Flat;
+        let flat = evaluate(&g, &cfg, true).trace.expect("recorded");
+        assert!(flat.terrain_check.is_empty());
+        let json = serde_json::to_string(&flat).unwrap();
+        assert!(!json.contains("terrain_check"));
     }
 
     /// A steered experiment gives the controller the command and scores what it

@@ -40,9 +40,10 @@
 //! newly-mutated limbs would otherwise cause.
 
 use crate::genome::JointKind;
-use crate::math::{clamp, dcos, dsin, vec3, Mat3, Real, Vec3, TAU};
+use crate::math::{clamp, dcos, dsin, dsincos, vec3, Mat3, Real, Vec3, TAU};
 
 use super::body::RigidBody;
+use super::noise;
 
 /// Ground model.
 ///
@@ -71,7 +72,121 @@ pub enum TerrainModel {
         /// Distance between crests, metres.
         wavelength: Real,
     },
+    /// Seeded fractal landscape: octaves of hashed gradient noise over a warped
+    /// domain.
+    ///
+    /// What [`Rough`](TerrainModel::Rough) is not: it repeats every wavelength,
+    /// it has no seed, and it has features at one scale only, so every organism
+    /// in every trial meets the same memorisable ripple. This field is
+    /// aperiodic, keyed on a seed, moved per trial, and built at four or more
+    /// scales at once — which is what makes ground look and behave like ground.
+    ///
+    /// Still analytic, still exactly differentiable, and now with no
+    /// transcendental in it at all: integer hashing and polynomial arithmetic
+    /// only. See [`noise`](super::noise) for the construction and
+    /// [`Self::sample`] for the chain rule through the warp.
+    ///
+    /// Two honest limits, both measured rather than assumed — see
+    /// `examples/terrain_probe.rs`:
+    ///
+    /// * **It is not heterogeneous.** The domain warp is usually sold as making
+    ///   some regions flat and others broken. It does not: relief per 12 m tile
+    ///   varies by 10% of its mean whether the warp is off or at full strength,
+    ///   because warping a stationary field with a stationary displacement
+    ///   leaves it stationary. The warp earns its place on the slope tail, not
+    ///   on regional variation.
+    /// * **It is still a height field**, so it is single-valued and smooth: no
+    ///   overhangs, no vertical walls, no gaps. Smooth undulation is exactly
+    ///   what a wheel is good at, and raising `amplitude` makes the ground
+    ///   *steeper* rather than a different kind of problem. What defeats a
+    ///   wheel is a discontinuity at or above its own radius, and that needs
+    ///   discrete obstacles, not a better height field.
+    Fractal {
+        /// Field identity. Two seeds give unrelated landscapes.
+        ///
+        /// Written to JSON as a decimal *string*: JavaScript's only number is a
+        /// double, so a bare `u64` above 2^53 comes back off by a few — and a
+        /// seed off by a few is a different landscape entirely. The viewer has
+        /// to reproduce this exactly.
+        #[serde(with = "seed_as_string")]
+        seed: u64,
+        /// Scale of the whole field, metres. Peak-to-trough runs to about
+        /// `2.5 * amplitude` in practice; see [`Self::height_bound`] for the
+        /// hard limit.
+        amplitude: Real,
+        /// Size of the largest feature, metres.
+        wavelength: Real,
+        /// How many octaves are summed. Each one is `lacunarity` times finer
+        /// and `gain` times shallower than the last.
+        octaves: u32,
+        lacunarity: Real,
+        gain: Real,
+        /// Domain warp strength, in units of `wavelength`. Zero is plain fBm —
+        /// uniform, and recognisably so. Raising it bends the field into
+        /// ridges and valleys, and is what produces the heterogeneity above.
+        warp: Real,
+        /// Rigid motion of the field under the world, so that a trial can be
+        /// run on a different piece of the same landscape. Identity is
+        /// `(0, 0, sin 0, cos 0)`.
+        offset_x: Real,
+        offset_z: Real,
+        rot_sin: Real,
+        rot_cos: Real,
+    },
 }
+
+/// A `u64` that survives a round trip through JavaScript. See
+/// [`TerrainModel::Fractal::seed`].
+mod seed_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(v)
+    }
+
+    /// Accepts a number as well as a string, so that a trace hand-edited into
+    /// the obvious shape still loads.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Text(String),
+            Number(u64),
+        }
+        match Either::deserialize(d)? {
+            Either::Number(n) => Ok(n),
+            Either::Text(s) => s.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Hardest limit on the octave loop, and therefore on the cost of one sample.
+/// Beyond about six octaves the finest is far below the size of any body part
+/// and only costs time. `Config::validate` enforces the same bound.
+pub const MAX_TERRAIN_OCTAVES: u32 = 8;
+
+/// Per-octave displacement in field space.
+///
+/// Perlin noise is exactly zero at every lattice point, and with an integer
+/// `lacunarity` every octave shares a lattice point at the origin — which is
+/// where every organism spawns. Without these offsets the spawn point would sit
+/// in a dead flat dimple whatever the seed, and the flatness would not show up
+/// in any aggregate statistic.
+const OCTAVE_OFFSET_X: Real = 0.513_7;
+const OCTAVE_OFFSET_Z: Real = 0.942_1;
+
+/// The warp field is sampled at half the base frequency: it has to be coarser
+/// than what it is warping, or it merely adds noise instead of shaping it.
+const WARP_FREQUENCY: Real = 0.5;
+const WARP_OFFSET_X: Real = 3.311;
+const WARP_OFFSET_Z: Real = -1.749;
+
+/// Sub-seeds for the two warp components, mixed with the field seed so that
+/// changing the seed moves the warp too.
+const WARP_SEED_X: u64 = 0x5741_5250_5f58_0001;
+const WARP_SEED_Z: u64 = 0x5741_5250_5f5a_0001;
+/// Separation between octaves, so no two octaves are the same field rescaled.
+const OCTAVE_SEED_STRIDE: u64 = 0x4f43_5441_5645_0001;
 
 impl TerrainModel {
     #[inline]
@@ -83,6 +198,7 @@ impl TerrainModel {
                 amplitude * (dsin(k * x) * dcos(k * z))
                     + 0.5 * amplitude * (dsin(2.0 * k * x + 1.7) * dcos(2.0 * k * z + 0.9))
             }
+            TerrainModel::Fractal { .. } => self.sample(x, z).0,
         }
     }
 
@@ -99,6 +215,134 @@ impl TerrainModel {
                 let dhdz = -amplitude * k * dsin(k * x) * dsin(k * z)
                     - amplitude * k * dsin(2.0 * k * x + 1.7) * dsin(2.0 * k * z + 0.9);
                 vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y)
+            }
+            TerrainModel::Fractal { .. } => self.sample(x, z).1,
+        }
+    }
+
+    /// Height and surface normal at one point, together.
+    ///
+    /// Every contact needs both, and for all three models they share nearly all
+    /// of their arithmetic — so asking for them separately does the work twice
+    /// on the hottest path in the simulator. Callers with both in hand should
+    /// prefer this to a `height_at` followed by a `normal_at`.
+    ///
+    /// Bit-identical to calling the two separately, for every model. That is
+    /// what keeps the goldens where they are.
+    #[inline]
+    pub fn sample(&self, x: Real, z: Real) -> (Real, Vec3) {
+        match *self {
+            TerrainModel::Flat { height } => (height, Vec3::Y),
+            TerrainModel::Rough { amplitude, wavelength } => {
+                // `dsin` and `dcos` are both projections of `dsincos`, so taking
+                // the pairs once is the same arithmetic in the same order — and
+                // half the trig.
+                let k = TAU / wavelength.max(1e-3);
+                let (sx, cx) = dsincos(k * x);
+                let (sz, cz) = dsincos(k * z);
+                let (sx2, cx2) = dsincos(2.0 * k * x + 1.7);
+                let (sz2, cz2) = dsincos(2.0 * k * z + 0.9);
+                let h = amplitude * (sx * cz) + 0.5 * amplitude * (sx2 * cz2);
+                let dhdx = amplitude * k * cx * cz + amplitude * k * cx2 * cz2;
+                let dhdz = -amplitude * k * sx * sz - amplitude * k * sx2 * sz2;
+                (h, vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y))
+            }
+            TerrainModel::Fractal {
+                seed,
+                amplitude,
+                wavelength,
+                octaves,
+                lacunarity,
+                gain,
+                warp,
+                offset_x,
+                offset_z,
+                rot_sin,
+                rot_cos,
+            } => {
+                let inv_w = 1.0 / wavelength.max(1e-3);
+
+                // World space to field space: rotate, scale to units of one
+                // wavelength, then translate. Field space is where the octave
+                // frequencies and the warp strength are all measured.
+                let px = (x * rot_cos - z * rot_sin) * inv_w + offset_x;
+                let pz = (x * rot_sin + z * rot_cos) * inv_w + offset_z;
+
+                // Domain warp: displace the sample point by a coarse vector
+                // field before evaluating. This is what turns uniform fBm into
+                // something with ridges and basins.
+                let (qx, qz, jxx, jxz, jzx, jzz) = if warp != 0.0 {
+                    let (wx, wxu, wxv) = noise::perlin_d(
+                        seed ^ WARP_SEED_X,
+                        px * WARP_FREQUENCY + WARP_OFFSET_X,
+                        pz * WARP_FREQUENCY + WARP_OFFSET_Z,
+                    );
+                    let (wz, wzu, wzv) = noise::perlin_d(
+                        seed ^ WARP_SEED_Z,
+                        px * WARP_FREQUENCY + WARP_OFFSET_Z,
+                        pz * WARP_FREQUENCY + WARP_OFFSET_X,
+                    );
+                    let g = warp * WARP_FREQUENCY;
+                    // Jacobian of `q` with respect to `p`, needed below to carry
+                    // the gradient back out through the warp.
+                    (px + warp * wx, pz + warp * wz, 1.0 + g * wxu, g * wxv, g * wzu, 1.0 + g * wzv)
+                } else {
+                    (px, pz, 1.0, 0.0, 0.0, 1.0)
+                };
+
+                // Fractional Brownian motion: octaves of the same field, each
+                // finer and shallower than the last.
+                let mut sum = 0.0;
+                let mut dq_x = 0.0;
+                let mut dq_z = 0.0;
+                let mut frequency = 1.0;
+                let mut weight = 1.0;
+                for o in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
+                    let step = (o + 1) as Real;
+                    let (n, nu, nv) = noise::perlin_d(
+                        seed.wrapping_add((o as u64).wrapping_mul(OCTAVE_SEED_STRIDE)),
+                        qx * frequency + step * OCTAVE_OFFSET_X,
+                        qz * frequency + step * OCTAVE_OFFSET_Z,
+                    );
+                    sum += weight * n;
+                    dq_x += weight * frequency * nu;
+                    dq_z += weight * frequency * nv;
+                    frequency *= lacunarity;
+                    weight *= gain;
+                }
+
+                // Chain rule, outward: noise -> warped domain -> field space ->
+                // world. `jxx..jzz` is the warp Jacobian, transposed here
+                // because the gradient is a covector.
+                let dp_x = dq_x * jxx + dq_z * jzx;
+                let dp_z = dq_x * jxz + dq_z * jzz;
+                let scale = amplitude * inv_w;
+                let dhdx = scale * (dp_x * rot_cos + dp_z * rot_sin);
+                let dhdz = scale * (dp_z * rot_cos - dp_x * rot_sin);
+
+                (amplitude * sum, vec3(-dhdx, 1.0, -dhdz).normalize_or(Vec3::Y))
+            }
+        }
+    }
+
+    /// The largest height this model can produce, in metres.
+    ///
+    /// Exact rather than measured: each octave of gradient noise is bounded by
+    /// one, so the sum is bounded by the sum of the octave weights. Used to
+    /// document what an `amplitude` setting actually buys, and asserted against
+    /// in the tests.
+    pub fn height_bound(&self) -> Real {
+        match *self {
+            TerrainModel::Flat { height } => height.abs(),
+            TerrainModel::Rough { amplitude, .. } => 1.5 * amplitude.abs(),
+            TerrainModel::Fractal { amplitude, octaves, gain, .. } => {
+                let mut total = 0.0;
+                let mut weight = 1.0;
+                for _ in 0..octaves.min(MAX_TERRAIN_OCTAVES) {
+                    total += weight;
+                    weight *= gain.abs();
+                }
+                amplitude.abs() * total
             }
         }
     }
@@ -726,12 +970,14 @@ impl World {
             let under = terrain.normal_at(body.pos.x, body.pos.z);
             let (points, count) = body.ground_points(under);
             for &corner in &points[..count] {
-                let ground = terrain.height_at(corner.x, corner.z);
+                // One sample for both: height and normal share nearly all of
+                // their arithmetic, and this is the innermost loop in the
+                // simulator — up to eight points per body per step.
+                let (ground, normal) = terrain.sample(corner.x, corner.z);
                 let depth = ground - corner.y;
                 if depth <= 0.0 {
                     continue;
                 }
-                let normal = terrain.normal_at(corner.x, corner.z);
                 let tangent1 = normal.any_perpendicular();
                 let tangent2 = normal.cross(tangent1);
                 let r = corner - body.pos;
@@ -1673,5 +1919,251 @@ mod tests {
         let before = w.bodies[0].pos;
         w.step(1.0 / 120.0);
         assert!(before.x.is_nan() || before.x == w.bodies[0].pos.x);
+    }
+
+    // ------------------------------------------------------------------ terrain
+
+    /// The fractal variant's parameters as a struct, purely so that the tests
+    /// below can vary one of them at a time with `..`, which an enum variant
+    /// does not allow.
+    #[derive(Clone, Copy)]
+    struct Frac {
+        seed: u64,
+        amplitude: Real,
+        wavelength: Real,
+        octaves: u32,
+        lacunarity: Real,
+        gain: Real,
+        warp: Real,
+        offset_x: Real,
+        offset_z: Real,
+        rot_sin: Real,
+        rot_cos: Real,
+    }
+
+    impl Frac {
+        /// The settings `experiments/fractal-animals.toml` ships with.
+        fn seeded(seed: u64) -> Frac {
+            Frac {
+                seed,
+                amplitude: 0.25,
+                wavelength: 6.0,
+                octaves: 4,
+                lacunarity: 2.0,
+                gain: 0.5,
+                warp: 0.3,
+                offset_x: 0.0,
+                offset_z: 0.0,
+                rot_sin: 0.0,
+                rot_cos: 1.0,
+            }
+        }
+
+        fn model(self) -> TerrainModel {
+            TerrainModel::Fractal {
+                seed: self.seed,
+                amplitude: self.amplitude,
+                wavelength: self.wavelength,
+                octaves: self.octaves,
+                lacunarity: self.lacunarity,
+                gain: self.gain,
+                warp: self.warp,
+                offset_x: self.offset_x,
+                offset_z: self.offset_z,
+                rot_sin: self.rot_sin,
+                rot_cos: self.rot_cos,
+            }
+        }
+    }
+
+    fn fractal(seed: u64) -> TerrainModel {
+        Frac::seeded(seed).model()
+    }
+
+    /// `sample` exists to halve the terrain work on the contact path. It is only
+    /// allowed to do that if it is the *same* arithmetic, bit for bit — the
+    /// goldens depend on that for `Rough`, and the gradient test below depends
+    /// on it for `Fractal`.
+    #[test]
+    fn sample_agrees_bitwise_with_height_and_normal_taken_separately() {
+        let models = [
+            TerrainModel::Flat { height: 0.0 },
+            TerrainModel::Flat { height: -0.7 },
+            TerrainModel::Rough { amplitude: 0.05, wavelength: 1.6 },
+            TerrainModel::Rough { amplitude: 0.25, wavelength: 6.0 },
+            fractal(0),
+            fractal(0xABCD_EF01),
+            Frac { warp: 0.0, ..Frac::seeded(9) }.model(),
+            Frac { octaves: 1, ..Frac::seeded(9) }.model(),
+        ];
+        for m in models {
+            for a in -40..40 {
+                for b in -40..40 {
+                    let (x, z) = (a as Real * 0.313, b as Real * 0.271);
+                    let (h, n) = m.sample(x, z);
+                    assert_eq!(h.to_bits(), m.height_at(x, z).to_bits(), "height at {x},{z}");
+                    let want = m.normal_at(x, z);
+                    assert_eq!(
+                        (n.x.to_bits(), n.y.to_bits(), n.z.to_bits()),
+                        (want.x.to_bits(), want.y.to_bits(), want.z.to_bits()),
+                        "normal at {x},{z}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The normal is the analytic gradient of the height, and the contact solver
+    /// trusts it completely. Central differences over the *assembled* field —
+    /// warp, octaves, rotation and all — are the independent check that the
+    /// chain rule was carried through correctly.
+    #[test]
+    fn the_fractal_normal_is_the_gradient_of_its_own_height() {
+        let h = 5e-3;
+        let variants = [
+            fractal(0),
+            fractal(1),
+            fractal(0xDEAD_BEEF),
+            Frac { warp: 0.0, ..Frac::seeded(2) }.model(),
+            Frac { warp: 0.9, ..Frac::seeded(3) }.model(),
+            Frac { octaves: 1, ..Frac::seeded(4) }.model(),
+            Frac { octaves: 6, ..Frac::seeded(5) }.model(),
+            Frac { lacunarity: 2.7, gain: 0.65, ..Frac::seeded(6) }.model(),
+            Frac { wavelength: 1.5, amplitude: 0.05, ..Frac::seeded(7) }.model(),
+            Frac { rot_sin: 0.6, rot_cos: 0.8, ..Frac::seeded(8) }.model(),
+            Frac { offset_x: 12.5, offset_z: -7.25, ..Frac::seeded(9) }.model(),
+        ];
+        let mut worst = 0.0f64;
+        for m in variants {
+            for a in -25..25 {
+                for b in -25..25 {
+                    let (x, z) = (a as Real * 0.731, b as Real * 0.917);
+                    let n = m.normal_at(x, z);
+                    // Recover the gradient the normal encodes.
+                    let (dhdx, dhdz) = (-n.x / n.y, -n.z / n.y);
+                    let fdx = (m.height_at(x + h, z) - m.height_at(x - h, z)) / (2.0 * h);
+                    let fdz = (m.height_at(x, z + h) - m.height_at(x, z - h)) / (2.0 * h);
+                    worst = worst.max((dhdx - fdx).abs() as f64);
+                    worst = worst.max((dhdz - fdz).abs() as f64);
+                }
+            }
+        }
+        // What is left is finite-difference truncation over a field whose finest
+        // octave is a fraction of a metre, not a wrong derivative. A sign error
+        // or a dropped warp term lands orders of magnitude above this.
+        assert!(worst < 2e-2, "worst gradient error {worst}");
+    }
+
+    #[test]
+    fn fractal_heights_respect_the_amplitude_bound() {
+        for seed in [0u64, 3, 0x1234_5678_9ABC_DEF0] {
+            let m = fractal(seed);
+            let bound = m.height_bound();
+            let mut peak = Real::NEG_INFINITY;
+            let mut trough = Real::INFINITY;
+            for a in -150..150 {
+                for b in -150..150 {
+                    let y = m.height_at(a as Real * 0.41, b as Real * 0.37);
+                    assert!(y.is_finite(), "not finite");
+                    assert!(y.abs() <= bound, "{y} exceeds the bound {bound}");
+                    peak = peak.max(y);
+                    trough = trough.min(y);
+                }
+            }
+            // Relief runs to roughly 2.5x amplitude in practice, well inside the
+            // 3.75x the bound allows. If this ever fails low, the field has gone
+            // flat and every organism is on a plain.
+            let relief = peak - trough;
+            assert!(relief > 0.5 * 0.25, "suspiciously flat: {relief}");
+        }
+    }
+
+    /// Every octave of Perlin noise is exactly zero at every lattice point, and
+    /// with an integer lacunarity they all share one at the origin. Organisms
+    /// spawn at the origin, so a dead flat dimple there would be present in
+    /// every trial and invisible in every aggregate.
+    #[test]
+    fn the_origin_is_not_a_flat_spot() {
+        for seed in [0u64, 1, 2, 3, 99] {
+            let m = fractal(seed);
+            let n = m.normal_at(0.0, 0.0);
+            assert!(n.y < 0.9999, "origin is flat for seed {seed}: {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_fractal_field_is_deterministic_and_seed_dependent() {
+        let a = fractal(11);
+        let b = fractal(12);
+        let mut differ = 0;
+        for i in 0..500 {
+            let (x, z) = (i as Real * 0.19, i as Real * -0.07);
+            assert_eq!(a.height_at(x, z).to_bits(), a.height_at(x, z).to_bits());
+            if a.height_at(x, z) != b.height_at(x, z) {
+                differ += 1;
+            }
+        }
+        assert!(differ > 490, "seeds barely differ: {differ}/500");
+    }
+
+    /// Layer 2: a per-trial rigid motion has to move the ground the organism
+    /// meets, or it is not closing the memorisation hole it exists to close.
+    #[test]
+    fn a_rigid_motion_moves_the_field() {
+        let base = fractal(5);
+        let shifted = Frac { offset_x: 3.7, offset_z: -2.1, ..Frac::seeded(5) }.model();
+        let turned = Frac { rot_sin: 0.6, rot_cos: 0.8, ..Frac::seeded(5) }.model();
+        let mut moved = 0;
+        for i in 1..200 {
+            let (x, z) = (i as Real * 0.23, i as Real * 0.17);
+            if base.height_at(x, z) != shifted.height_at(x, z)
+                && base.height_at(x, z) != turned.height_at(x, z)
+            {
+                moved += 1;
+            }
+        }
+        assert!(moved > 190, "field did not move: {moved}/199");
+        // A rotation about the origin leaves the origin where it was.
+        assert_eq!(base.height_at(0.0, 0.0), turned.height_at(0.0, 0.0));
+    }
+
+    /// Aperiodicity is the whole point of replacing the sine field. Sampling a
+    /// full wavelength apart should find different ground.
+    #[test]
+    fn the_fractal_field_does_not_repeat() {
+        let m = fractal(21);
+        let mut same = 0;
+        for i in 1..300 {
+            let x = i as Real * 0.3;
+            if (m.height_at(x, 0.0) - m.height_at(x + 6.0, 0.0)).abs() < 1e-4 {
+                same += 1;
+            }
+        }
+        assert!(same < 15, "field looks periodic: {same}/299 samples coincide");
+    }
+
+    #[test]
+    fn a_degenerate_fractal_field_stays_finite() {
+        let m = TerrainModel::Fractal {
+            seed: 0,
+            amplitude: 0.0,
+            wavelength: 0.0,
+            octaves: 0,
+            lacunarity: 0.0,
+            gain: 0.0,
+            warp: 0.0,
+            offset_x: 0.0,
+            offset_z: 0.0,
+            rot_sin: 0.0,
+            rot_cos: 0.0,
+        };
+        let (h, n) = m.sample(1.0, -1.0);
+        assert_eq!(h, 0.0);
+        assert_eq!(n, Vec3::Y);
+        // Nor a long way from the origin, where the lattice index saturates.
+        for x in [1e4, -1e4, 1e12, -1e12] {
+            let (h, n) = fractal(4).sample(x, x);
+            assert!(h.is_finite() && n.y.is_finite(), "blew up at {x}");
+        }
     }
 }

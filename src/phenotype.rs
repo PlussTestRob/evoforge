@@ -78,11 +78,38 @@ pub struct Phenotype {
 }
 
 /// Where a copy of a part sits, and which side of the midline it is on.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Mount {
     body: usize,
     /// `+1` right, `-1` left, `0` on the midline.
     side: Real,
+}
+
+/// The copies of one part. There are never more than two — a mirrored pair, or
+/// the single inherited side of an already-paired parent — so this is a fixed
+/// array rather than a `Vec`.
+///
+/// It is fixed for a reason. Expression runs once per trial per organism, which
+/// is millions of times in a run, and a `Vec` here meant an allocation per part
+/// plus a clone per part on top of it. On a twelve-thread machine that much
+/// allocator traffic stops being free: threads block on the heap rather than
+/// working, and the cores go quiet.
+#[derive(Clone, Copy, Debug, Default)]
+struct Mounts {
+    slots: [Mount; 2],
+    count: u8,
+}
+
+impl Mounts {
+    fn push(&mut self, m: Mount) {
+        debug_assert!((self.count as usize) < self.slots.len());
+        self.slots[self.count as usize] = m;
+        self.count += 1;
+    }
+
+    fn as_slice(&self) -> &[Mount] {
+        &self.slots[..self.count as usize]
+    }
 }
 
 /// Reflection across the sagittal plane.
@@ -268,6 +295,42 @@ pub struct StartPerturbation {
     /// Horizontal displacement of the whole body, metres. On rolling ground this
     /// also changes the terrain underneath it.
     pub offset: Vec3,
+    /// Where this trial's slice of the landscape is taken from. Identity for
+    /// every terrain but `fractal`, and for that one too unless
+    /// `environment.terrain_per_trial` is set.
+    pub terrain: TerrainShift,
+}
+
+/// A rigid motion of the fractal landscape under the world.
+///
+/// Moving the *organism* is not enough to stop a gait being tuned to one hill:
+/// `start_jitter` shifts the start by at most half a metre, which on ground with
+/// a six-metre wavelength is the same hill seen from slightly along. Sliding and
+/// turning the field itself gives each trial genuinely different ground, at no
+/// cost beyond two multiplies per sample.
+///
+/// Identity is the default, and identity means bit-for-bit the unmoved field:
+/// `rot_cos = 1`, everything else zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainShift {
+    /// Translation in units of one wavelength, applied in field space.
+    pub offset_x: Real,
+    pub offset_z: Real,
+    /// Rotation about the world origin, as its sine and cosine. Stored rather
+    /// than the angle so that no trigonometry happens per sample.
+    pub sin: Real,
+    pub cos: Real,
+}
+
+impl TerrainShift {
+    pub const NONE: TerrainShift =
+        TerrainShift { offset_x: 0.0, offset_z: 0.0, sin: 0.0, cos: 1.0 };
+}
+
+impl Default for TerrainShift {
+    fn default() -> Self {
+        TerrainShift::NONE
+    }
 }
 
 /// Express `genome`, optionally setting it down perturbed.
@@ -286,19 +349,24 @@ pub fn build_with_start(
     // Geometric centres, not centres of mass: the attachment rules below are
     // written about the box a part is inscribed in, and for a taper the two
     // differ. The conversion happens once, where each body is constructed.
-    let mut centres: Vec<Vec3> = Vec::new();
-    let mut shapes: Vec<Shape> = Vec::new();
-    let mut bodies: Vec<RigidBody> = Vec::new();
-    let mut joints: Vec<Joint> = Vec::new();
-    let mut body_slots: Vec<u8> = Vec::new();
-    let mut joint_slots: Vec<u8> = Vec::new();
-    let mut joint_drive: Vec<Real> = Vec::new();
+    // Upper bound on how many bodies this genome can express: every part
+    // mirrored, and every one of those a full chain of segments. Reserving it up
+    // front turns each of these into one allocation instead of a run of
+    // doubling reallocations, on a path that runs once per trial per organism.
+    let cap = n * 2 * (cfg.body.max_repeat.max(1) as usize);
+    let mut centres: Vec<Vec3> = Vec::with_capacity(cap);
+    let mut shapes: Vec<Shape> = Vec::with_capacity(cap);
+    let mut bodies: Vec<RigidBody> = Vec::with_capacity(cap);
+    let mut joints: Vec<Joint> = Vec::with_capacity(cap);
+    let mut body_slots: Vec<u8> = Vec::with_capacity(cap);
+    let mut joint_slots: Vec<u8> = Vec::with_capacity(cap);
+    let mut joint_drive: Vec<Real> = Vec::with_capacity(cap);
 
     // A part no longer maps to one body. A paired part appears twice, mirrored;
     // a repeated part appears as a chain. `mounts[i]` records where part i's
     // children attach — one entry per copy, carrying the body index and which
     // side of the midline that copy sits on.
-    let mut mounts: Vec<Vec<Mount>> = vec![Vec::new(); n];
+    let mut mounts: Vec<Mounts> = vec![Mounts::default(); n];
 
     let mut root = carve(genome.parts[0].shape, genome.parts[0].half_extents, top_scale);
     if paired_allowed {
@@ -314,22 +382,29 @@ pub fn build_with_start(
     for i in 1..n {
         let part = &genome.parts[i];
         let parent_index = part.parent as usize;
-        let parent_mounts = mounts[parent_index].clone();
+        let parent_mounts = mounts[parent_index];
+        let parent = parent_mounts.as_slice();
 
         // Which copies of this part exist, and on which side each sits.
         //
         // A part hanging off an already-paired parent inherits its parent's side
         // rather than pairing again — that is what makes a segment part of *a*
         // limb rather than the start of four of them.
-        let sides: Vec<(Mount, Real)> = if parent_mounts.len() > 1 {
-            parent_mounts.iter().map(|m| (*m, m.side)).collect()
+        let mut sides: [(Mount, Real); 2] = Default::default();
+        let side_count = if parent.len() > 1 {
+            sides[0] = (parent[0], parent[0].side);
+            sides[1] = (parent[1], parent[1].side);
+            2
         } else if paired_allowed && part.paired {
-            vec![(parent_mounts[0], 1.0), (parent_mounts[0], -1.0)]
+            sides[0] = (parent[0], 1.0);
+            sides[1] = (parent[0], -1.0);
+            2
         } else {
-            vec![(parent_mounts[0], parent_mounts[0].side)]
+            sides[0] = (parent[0], parent[0].side);
+            1
         };
 
-        for (parent_mount, side) in sides {
+        for &(parent_mount, side) in &sides[..side_count] {
             let mut attach_to = parent_mount.body;
             let segments = if cfg.body.max_repeat > 1 { part.repeat.max(1) } else { 1 };
 
@@ -478,7 +553,8 @@ pub fn build_with_start(
         }
     }
 
-    let terrain = cfg_terrain(cfg);
+    let shift = start.map_or(TerrainShift::NONE, |s| s.terrain);
+    let terrain = cfg_terrain(cfg, shift);
     let mut deepest = Real::NEG_INFINITY;
     for body in &bodies {
         let (points, count) = body.ground_points(Vec3::Y);
@@ -507,7 +583,7 @@ pub fn build_with_start(
     }
 
     Phenotype {
-        world: World::new(bodies, joints, world_params(cfg)),
+        world: World::new(bodies, joints, world_params_on(cfg, shift)),
         body_slots,
         joint_slots,
         joint_drive,
@@ -517,20 +593,47 @@ pub fn build_with_start(
     }
 }
 
-fn cfg_terrain(cfg: &Config) -> TerrainModel {
+/// Stream tag for terrain seeds derived from `experiment.seed`.
+const TERRAIN_STREAM: u64 = 0x5445_5252_4149_4e01;
+
+fn cfg_terrain(cfg: &Config, shift: TerrainShift) -> TerrainModel {
     match cfg.environment.terrain {
         crate::config::Terrain::Flat => TerrainModel::Flat { height: 0.0 },
         crate::config::Terrain::Rough => TerrainModel::Rough {
             amplitude: cfg.environment.terrain_amplitude,
             wavelength: cfg.environment.terrain_wavelength,
         },
+        crate::config::Terrain::Fractal => TerrainModel::Fractal {
+            // A seed of zero means "give me a landscape for this experiment";
+            // anything else names one, so two experiments can be compared on
+            // identical ground.
+            seed: match cfg.environment.terrain_seed {
+                0 => crate::rng::derive_seed(&[cfg.experiment.seed, TERRAIN_STREAM]),
+                s => s,
+            },
+            amplitude: cfg.environment.terrain_amplitude,
+            wavelength: cfg.environment.terrain_wavelength,
+            octaves: cfg.environment.terrain_octaves,
+            lacunarity: cfg.environment.terrain_lacunarity,
+            gain: cfg.environment.terrain_gain,
+            warp: cfg.environment.terrain_warp,
+            offset_x: shift.offset_x,
+            offset_z: shift.offset_z,
+            rot_sin: shift.sin,
+            rot_cos: shift.cos,
+        },
     }
 }
 
 pub fn world_params(cfg: &Config) -> WorldParams {
+    world_params_on(cfg, TerrainShift::NONE)
+}
+
+/// The world this config describes, with the landscape moved as `shift` says.
+pub fn world_params_on(cfg: &Config, shift: TerrainShift) -> WorldParams {
     WorldParams {
         gravity: vec3(0.0, -cfg.environment.gravity, 0.0),
-        terrain: cfg_terrain(cfg),
+        terrain: cfg_terrain(cfg, shift),
         friction: cfg.environment.friction,
         restitution: cfg.environment.restitution,
         iterations: cfg.simulation.solver_iterations,
@@ -776,6 +879,77 @@ mod tests {
                 "seed {seed}: lowest corner at {lowest}"
             );
         }
+    }
+
+    /// The same drop test again, over ground that is neither flat nor level.
+    ///
+    /// `build` samples the terrain under *every* corner rather than once under
+    /// the root, and on a fractal field that is the difference between resting
+    /// on the surface and being buried in the next hill. Sitting the wrong way
+    /// up would be free fitness or an instant faceplant, and neither is a fair
+    /// test of a gait.
+    #[test]
+    fn an_organism_sits_on_fractal_ground_too() {
+        let mut cfg = shaped_cfg();
+        cfg.environment.terrain = crate::config::Terrain::Fractal;
+        cfg.environment.terrain_amplitude = 0.25;
+        cfg.environment.terrain_wavelength = 6.0;
+        let layout = cfg.brain_layout();
+        for seed in 0..100 {
+            let mut rng = Rng::new(seed);
+            let g = Genome::random(&mut rng, &cfg.body, &cfg.brain, &layout);
+            // Include the perturbed path, which moves the organism *and* the
+            // ground under it.
+            let start = StartPerturbation {
+                yaw: 0.3,
+                tilt: -0.15,
+                offset: vec3(0.4, 0.0, -0.3),
+                terrain: TerrainShift { offset_x: 7.5, offset_z: -3.25, sin: 0.6, cos: 0.8 },
+            };
+            for p in [build(&g, &cfg), build_with_start(&g, &cfg, Some(start))] {
+                let gap = p.world.ground_clearance();
+                assert!(
+                    (gap - SPAWN_CLEARANCE).abs() < 1e-4,
+                    "seed {seed}: closest point {gap} above the ground"
+                );
+            }
+        }
+    }
+
+    /// A per-trial shift has to reach the world the organism is actually built
+    /// into, not just the copy the spawn drop consulted.
+    #[test]
+    fn a_terrain_shift_reaches_the_built_world() {
+        let mut cfg = cfg();
+        cfg.environment.terrain = crate::config::Terrain::Fractal;
+        let g = Genome::random(&mut Rng::new(4), &cfg.body, &cfg.brain, &cfg.brain_layout());
+        let shift = TerrainShift { offset_x: 11.0, offset_z: -6.0, sin: 0.6, cos: 0.8 };
+        let moved = build_with_start(
+            &g,
+            &cfg,
+            Some(StartPerturbation { terrain: shift, ..Default::default() }),
+        );
+        assert_eq!(moved.world.params.terrain, cfg_terrain(&cfg, shift));
+        assert_ne!(moved.world.params.terrain, cfg_terrain(&cfg, TerrainShift::NONE));
+        // And the unperturbed build is still the unmoved field.
+        assert_eq!(build(&g, &cfg).world.params.terrain, cfg_terrain(&cfg, TerrainShift::NONE));
+    }
+
+    /// `terrain_seed = 0` means "a landscape for this experiment", so two seeds
+    /// must not get the same one; any other value names a specific landscape,
+    /// which is what makes two experiments comparable on identical ground.
+    #[test]
+    fn a_zero_terrain_seed_derives_from_the_experiment_seed() {
+        let mut a = cfg();
+        a.environment.terrain = crate::config::Terrain::Fractal;
+        a.experiment.seed = 1;
+        let mut b = a.clone();
+        b.experiment.seed = 2;
+        assert_ne!(cfg_terrain(&a, TerrainShift::NONE), cfg_terrain(&b, TerrainShift::NONE));
+
+        a.environment.terrain_seed = 77;
+        b.environment.terrain_seed = 77;
+        assert_eq!(cfg_terrain(&a, TerrainShift::NONE), cfg_terrain(&b, TerrainShift::NONE));
     }
 
     #[test]

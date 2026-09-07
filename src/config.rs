@@ -153,6 +153,24 @@ impl Config {
         if self.environment.terrain_wavelength <= 0.0 {
             bad("environment.terrain_wavelength must be positive")?;
         }
+        if self.environment.terrain_octaves < 1
+            || self.environment.terrain_octaves > crate::physics::world::MAX_TERRAIN_OCTAVES
+        {
+            bad("environment.terrain_octaves must be within [1, 8]")?;
+        }
+        // Below one, an "octave" would be *coarser* than the one before it, and
+        // `terrain_wavelength` would stop describing the largest feature.
+        if self.environment.terrain_lacunarity < 1.0 {
+            bad("environment.terrain_lacunarity must be at least 1")?;
+        }
+        // At a gain of one every octave contributes its full amplitude and the
+        // field is dominated by its finest, which is noise rather than terrain.
+        if !(0.0..=1.0).contains(&self.environment.terrain_gain) {
+            bad("environment.terrain_gain must be within [0, 1]")?;
+        }
+        if self.environment.terrain_warp < 0.0 {
+            bad("environment.terrain_warp must not be negative")?;
+        }
         if self.body.tendon_frequency < 0.0 || self.body.tendon_damping < 0.0 {
             bad("body.tendon_frequency and body.tendon_damping must not be negative")?;
         }
@@ -576,6 +594,8 @@ pub enum Terrain {
     Flat,
     /// Rolling ground. See [`crate::physics::TerrainModel::Rough`].
     Rough,
+    /// Seeded fractal landscape. See [`crate::physics::TerrainModel::Fractal`].
+    Fractal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -589,11 +609,55 @@ pub struct EnvironmentCfg {
     /// being a cloud of overlapping blocks: limbs have to be somewhere the torso
     /// is not, which is the most basic thing that makes an animal an animal.
     pub self_collision: bool,
-    /// Height of the rolling ground's crests above its troughs, metres. Only
-    /// consulted when `terrain = "rough"`.
+    /// Scale of the ground's relief, metres. Only consulted when the terrain is
+    /// not flat.
+    ///
+    /// Peak-to-trough is about `2.5 * terrain_amplitude` for both `rough` and
+    /// `fractal`. Steepness is set by the *ratio* of amplitude to wavelength,
+    /// not by amplitude alone: doubling one and doubling the other leaves the
+    /// slope distribution where it was.
     pub terrain_amplitude: Real,
-    /// Distance between crests, metres.
+    /// Distance between crests, metres. For `fractal` this is the size of the
+    /// *largest* feature; each further octave is `terrain_lacunarity` times
+    /// finer.
     pub terrain_wavelength: Real,
+    /// Which fractal landscape to generate. `0` derives one from
+    /// `experiment.seed`, so two experiments with different seeds get different
+    /// ground; any other value names a specific landscape, which is what to use
+    /// when comparing two experiments on identical terrain. Only consulted when
+    /// `terrain = "fractal"`.
+    pub terrain_seed: u64,
+    /// How many octaves of noise are summed. One is a single smooth scale; four
+    /// spans a factor of eight in feature size, which is about where ground
+    /// starts reading as landscape rather than as a pattern.
+    pub terrain_octaves: u32,
+    /// Frequency step between octaves. Two is the conventional choice — each
+    /// octave half the size of the last.
+    pub terrain_lacunarity: Real,
+    /// Amplitude step between octaves. Below 0.5 the fine detail vanishes;
+    /// above it the ground gets rougher at every scale at once.
+    pub terrain_gain: Real,
+    /// Domain warp strength, in units of `terrain_wavelength`. Zero is plain
+    /// fractional Brownian motion.
+    ///
+    /// Warping bends the field into ridges and basins rather than blobs, which
+    /// is what makes it read as landscape. What it does *not* do, despite the
+    /// usual claim, is make the ground heterogeneous: measured with
+    /// `examples/terrain_probe.rs`, the spread of relief across 12 m tiles sits
+    /// at 10% of the mean whether warp is 0 or 1, because warping a stationary
+    /// field with a stationary displacement leaves it stationary. What it
+    /// genuinely buys is the tail of the slope distribution — at amplitude 0.25
+    /// and wavelength 6, the steepest slope anywhere goes from 19 degrees at 0
+    /// to 29 at 1, with the median unmoved at 5.
+    pub terrain_warp: Real,
+    /// Whether each trial slides and turns the landscape underneath the
+    /// organism.
+    ///
+    /// Without this every organism in every trial of the whole experiment meets
+    /// the same surface, which is memorisable in principle — an organism can be
+    /// selected for a gait that suits one particular hill. With it, coping with
+    /// ground in general is the only thing that survives.
+    pub terrain_per_trial: bool,
     /// Downward acceleration magnitude, m/s^2.
     pub gravity: Real,
     pub friction: Real,
@@ -609,6 +673,12 @@ impl Default for EnvironmentCfg {
             self_collision: false,
             terrain_amplitude: 0.06,
             terrain_wavelength: 1.5,
+            terrain_seed: 0,
+            terrain_octaves: 4,
+            terrain_lacunarity: 2.0,
+            terrain_gain: 0.5,
+            terrain_warp: 0.3,
+            terrain_per_trial: true,
             gravity: 9.81,
             friction: 0.8,
             restitution: 0.0,
@@ -873,12 +943,26 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     f.u8(match cfg.environment.terrain {
         Terrain::Flat => 0,
         Terrain::Rough => 1,
+        Terrain::Fractal => 2,
     });
     // Folded in only for the terrain that uses them, so a flat experiment keeps
     // the digest it had before rolling ground existed.
-    if cfg.environment.terrain == Terrain::Rough {
+    if cfg.environment.terrain == Terrain::Rough || cfg.environment.terrain == Terrain::Fractal {
         f.real(cfg.environment.terrain_amplitude);
         f.real(cfg.environment.terrain_wavelength);
+    }
+    // And the fractal knobs only for the fractal, so a `rough` experiment keeps
+    // the digest it had before this terrain existed. `experiment.seed` is
+    // already part of the digest, so a derived terrain seed needs no extra
+    // fold — but an explicit one is not otherwise represented anywhere.
+    if cfg.environment.terrain == Terrain::Fractal {
+        f.tag(b"fractal");
+        f.u64(cfg.environment.terrain_seed);
+        f.u32(cfg.environment.terrain_octaves);
+        f.real(cfg.environment.terrain_lacunarity);
+        f.real(cfg.environment.terrain_gain);
+        f.real(cfg.environment.terrain_warp);
+        f.bool(cfg.environment.terrain_per_trial);
     }
     f.real(cfg.environment.gravity);
     f.real(cfg.environment.friction);
@@ -987,7 +1071,15 @@ mod tests {
 
     #[test]
     fn bundled_experiments_validate() {
-        for name in ["first-walkers.toml", "directed-walkers.toml"] {
+        for name in [
+            "first-walkers.toml",
+            "directed-walkers.toml",
+            "animals.toml",
+            "fractal-animals.toml",
+            "brittle-walkers.toml",
+            "jumpers.toml",
+            "shaped-walkers.toml",
+        ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("experiments").join(name);
             Config::load(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
@@ -1098,6 +1190,74 @@ mod tests {
             tweak(&mut b);
             assert_ne!(a.evolution_digest(), b.evolution_digest());
         }
+    }
+
+    /// The compatibility rule this repository lives by: a feature that is off
+    /// must leave the digest exactly where it was, or every run directory
+    /// started before it stops being resumable.
+    #[test]
+    fn the_fractal_knobs_are_invisible_until_the_fractal_terrain_is_chosen() {
+        for terrain in [Terrain::Flat, Terrain::Rough] {
+            let mut a = Config::default();
+            a.environment.terrain = terrain;
+            for tweak in [
+                |c: &mut Config| c.environment.terrain_seed = 12345,
+                |c: &mut Config| c.environment.terrain_octaves = 7,
+                |c: &mut Config| c.environment.terrain_lacunarity = 2.5,
+                |c: &mut Config| c.environment.terrain_gain = 0.75,
+                |c: &mut Config| c.environment.terrain_warp = 0.0,
+                |c: &mut Config| c.environment.terrain_per_trial = false,
+            ] {
+                let mut b = a.clone();
+                tweak(&mut b);
+                assert_eq!(a.digest(), b.digest(), "{terrain:?} noticed a fractal knob");
+            }
+        }
+
+        // And on the fractal terrain every one of them counts.
+        let mut a = Config::default();
+        a.environment.terrain = Terrain::Fractal;
+        for tweak in [
+            |c: &mut Config| c.environment.terrain_seed = 12345,
+            |c: &mut Config| c.environment.terrain_octaves = 7,
+            |c: &mut Config| c.environment.terrain_lacunarity = 2.5,
+            |c: &mut Config| c.environment.terrain_gain = 0.75,
+            |c: &mut Config| c.environment.terrain_warp = 0.0,
+            |c: &mut Config| c.environment.terrain_per_trial = false,
+            |c: &mut Config| c.environment.terrain_amplitude = 0.3,
+            |c: &mut Config| c.environment.terrain_wavelength = 9.0,
+        ] {
+            let mut b = a.clone();
+            tweak(&mut b);
+            assert_ne!(a.digest(), b.digest());
+        }
+
+        // The three terrains are three different experiments even at identical
+        // amplitude and wavelength.
+        let mut rough = Config::default();
+        rough.environment.terrain = Terrain::Rough;
+        assert_ne!(rough.digest(), a.digest());
+        assert_ne!(Config::default().digest(), rough.digest());
+    }
+
+    #[test]
+    fn validation_catches_bad_fractal_terrain() {
+        for (field, value) in [
+            ("terrain_octaves", "0"),
+            ("terrain_octaves", "9"),
+            ("terrain_lacunarity", "0.5"),
+            ("terrain_gain", "1.5"),
+            ("terrain_gain", "-0.1"),
+            ("terrain_warp", "-1.0"),
+        ] {
+            let toml = format!("[environment]\nterrain = \"fractal\"\n{field} = {value}\n");
+            let err = Config::from_toml_str(&toml).expect_err("{field} = {value} should fail");
+            assert!(err.to_string().contains(field), "{field} = {value}: {err}");
+        }
+        // And the defaults are inside every one of those bounds.
+        let mut ok = Config::default();
+        ok.environment.terrain = Terrain::Fractal;
+        ok.validate().unwrap();
     }
 
     #[test]
