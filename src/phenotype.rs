@@ -59,6 +59,19 @@ impl BodySpec {
 }
 
 /// An expressed organism, ready to simulate.
+/// A range sensor as built: which body carries it, and where it looks in that
+/// body's own frame.
+///
+/// The sensor has no existence apart from the body — it moves with it, rotates
+/// with it, and is aimed by whatever drives that body's joint. The controller
+/// slot is `body_slots[body]`, so nothing here needs its own indexing.
+#[derive(Clone, Copy, Debug)]
+pub struct SensorMount {
+    pub body: u16,
+    /// Unit direction in the carrying body's local frame.
+    pub dir: Vec3,
+}
+
 pub struct Phenotype {
     pub world: World,
     /// Controller slot for each body, parallel to `world.bodies`.
@@ -74,6 +87,9 @@ pub struct Phenotype {
     pub slot_bodies: Vec<u8>,
     /// How many joints answer to each slot, indexed by slot.
     pub slot_joints: Vec<u8>,
+    /// Every range sensor this body carries. Empty in an experiment without
+    /// sensors, and empty for an organism that evolved none.
+    pub sensors: Vec<SensorMount>,
     pub total_mass: Real,
 }
 
@@ -376,6 +392,13 @@ pub fn build_with_start(
     shapes.push(root);
     bodies.push(RigidBody::new(root.com_offset(), root, density));
     body_slots.push(genome.parts[0].slot);
+    let mut sensors: Vec<SensorMount> = Vec::new();
+    if genome.parts[0].sensor {
+        sensors.push(SensorMount {
+            body: (bodies.len() - 1) as u16,
+            dir: sensor_dir_of(&genome.parts[0]),
+        });
+    }
     // The root straddles the midline, so it has no side of its own.
     mounts[0].push(Mount { body: 0, side: 0.0 });
 
@@ -470,6 +493,15 @@ pub fn build_with_start(
                 // which is why `Shape::ground_points` rotates it.
                 bodies.push(RigidBody::new(centre + shape.com_offset(), shape, density));
                 body_slots.push(part.slot);
+                if part.sensor {
+                    // Both halves of a mirrored pair carry one, and both feed the
+                    // same slot — their readings are averaged there, exactly as
+                    // the pair's joint angles are.
+                    sensors.push(SensorMount {
+                        body: (bodies.len() - 1) as u16,
+                        dir: sensor_dir_of(part),
+                    });
+                }
 
                 joints.push(Joint {
                     body_a: attach_to as u16,
@@ -589,8 +621,15 @@ pub fn build_with_start(
         joint_drive,
         slot_bodies,
         slot_joints,
+        sensors,
         total_mass,
     }
+}
+
+/// A sensor's aim, normalised, falling back to forward-and-down for a gene whose
+/// direction has degenerated to nothing.
+fn sensor_dir_of(part: &crate::genome::PartGene) -> Vec3 {
+    part.sensor_dir.normalize_or(vec3(1.0, -0.5, 0.0).normalize_or(Vec3::X))
 }
 
 /// Stream tag for terrain seeds derived from `experiment.seed`.

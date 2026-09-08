@@ -130,6 +130,19 @@ pub struct PartGene {
     /// attach to the last segment, so a chain extends rather than branching.
     #[serde(default = "one")]
     pub repeat: u8,
+    /// Whether this part carries a range sensor.
+    ///
+    /// A sensor is not a fitting bolted to a part — it *is* carried by a part,
+    /// which has mass, hangs off a joint and is aimed by whatever drives that
+    /// joint. Perception therefore costs what any other limb costs, and a long
+    /// stalk that can sweep a wide arc is heavy and destabilising. Evolution
+    /// pays for looking.
+    #[serde(default)]
+    pub sensor: bool,
+    /// Direction the sensor faces, in the part's own frame. Normalised on use,
+    /// so mutation may perturb the components freely.
+    #[serde(default)]
+    pub sensor_dir: Vec3,
     /// Which face of the parent this part attaches to (0..6, see
     /// [`crate::phenotype::FACES`]). Meaningless for part 0.
     pub attach_face: u8,
@@ -215,6 +228,8 @@ impl Genome {
                 paired: random_paired(rng, limits),
                 antiphase: random_antiphase(rng, limits),
                 repeat: random_repeat(rng, limits),
+                sensor: random_sensor(rng, limits),
+                sensor_dir: random_sensor_dir(rng, limits),
                 attach_face: rng.below(6) as u8,
                 attach_u: rng.range(-0.7, 0.7),
                 attach_v: rng.range(-0.7, 0.7),
@@ -345,6 +360,31 @@ impl Genome {
 /// Draw a caution disposition, but only for an experiment whose joints can
 /// break. Same discipline as [`random_shape`]: a feature that is switched off
 /// must not move the random stream.
+/// Whether a freshly drawn part carries a sensor.
+///
+/// Draws *nothing* when the experiment has no sensors, which is what makes the
+/// feature exactly off: the random stream is identical to the one an experiment
+/// drew before sensors existed, so every earlier result reproduces bit for bit.
+fn random_sensor(rng: &mut Rng, limits: &BodyLimits) -> bool {
+    if limits.sensor_probability <= 0.0 {
+        return false;
+    }
+    rng.unit() < limits.sensor_probability
+}
+
+/// Where a freshly drawn sensor points, in its part's frame.
+///
+/// Biased forward and downward — the direction terrain is in — so that a new
+/// sensor starts somewhere useful rather than facing the sky. Evolution moves it
+/// from there.
+fn random_sensor_dir(rng: &mut Rng, limits: &BodyLimits) -> Vec3 {
+    if limits.sensor_probability <= 0.0 {
+        return Vec3::ZERO;
+    }
+    vec3(1.0 + rng.signed() * 0.3, -0.5 + rng.signed() * 0.4, rng.signed() * 0.5)
+        .normalize_or(vec3(1.0, -0.5, 0.0).normalize_or(Vec3::X))
+}
+
 fn random_caution(rng: &mut Rng, limits: &BodyLimits) -> Real {
     if limits.joint_endurance > 0.0 {
         rng.unit()
@@ -448,6 +488,29 @@ pub fn mutate(
             p.shape = random_shape(rng, limits);
         }
 
+        // Guarded on the experiment having sensors before `chance` is called, so
+        // a sensorless run consumes no randomness here and keeps the stream it
+        // had before sensing existed.
+        if limits.sensor_probability > 0.0 {
+            if rng.chance(params.sensor_rate) {
+                p.sensor = !p.sensor;
+                if p.sensor && p.sensor_dir.length_sq() < 1e-6 {
+                    p.sensor_dir = random_sensor_dir(rng, limits);
+                }
+            }
+            if p.sensor && rng.chance(params.sensor_rate) {
+                // Aim drifts by perturbing the raw components; normalisation
+                // happens where it is used, so no angle can wrap or degenerate.
+                let s = params.sensor_dir_sigma;
+                p.sensor_dir = vec3(
+                    p.sensor_dir.x + rng.normal_scaled(s),
+                    p.sensor_dir.y + rng.normal_scaled(s),
+                    p.sensor_dir.z + rng.normal_scaled(s),
+                )
+                .normalize_or(vec3(1.0, -0.5, 0.0).normalize_or(Vec3::X));
+            }
+        }
+
         if limits.pair_probability > 0.0 && rng.chance(params.pair_rate) {
             // One operator flips both halves of the body-plan decision: whether
             // the part is a pair at all, and how a pair is driven.
@@ -515,6 +578,8 @@ fn add_random_part(genome: &mut Genome, rng: &mut Rng, limits: &BodyLimits, layo
         paired: random_paired(rng, limits),
         antiphase: random_antiphase(rng, limits),
         repeat: random_repeat(rng, limits),
+        sensor: random_sensor(rng, limits),
+        sensor_dir: random_sensor_dir(rng, limits),
         attach_face: rng.below(6) as u8,
         attach_u: rng.range(-0.7, 0.7),
         attach_v: rng.range(-0.7, 0.7),

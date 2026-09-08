@@ -467,7 +467,13 @@ fn run_trial_towards(
 
         if should_apply_control(step, settle_steps, control_interval) {
             let measured_t = (step - settle_steps) as Real * dt;
-            apply_control(&mut pheno, &layout, &genome.weights, ws, measured_t, drive, heading);
+            apply_control(
+                &mut pheno,
+                &layout,
+                &genome.weights,
+                ws,
+                &ControlContext { t: measured_t, drive, heading, sensor: &cfg.sensor },
+            );
         }
 
         if let Some(tr) = trace.as_mut() {
@@ -566,21 +572,33 @@ fn run_trial_towards(
 }
 
 /// Gather sensors, run the controller, and write motor targets.
+/// What the world is asking of the organism on this control tick, and what its
+/// senses are made of. Grouped because they travel together and are constant for
+/// the tick, unlike the organism's own state.
+struct ControlContext<'a> {
+    /// Seconds since the measured window opened, for the pacemaker clocks.
+    t: Real,
+    /// The organism's own throttle on how hard motors are driven.
+    drive: Real,
+    /// The direction it has been told to travel: an instruction, fixed for the
+    /// trial, not something it perceives.
+    heading: Vec3,
+    sensor: &'a crate::config::SensorCfg,
+}
+
 fn apply_control(
     pheno: &mut Phenotype,
     layout: &crate::brain::BrainLayout,
     weights: &[Real],
     ws: &mut EvalWorkspace,
-    t: Real,
-    drive: Real,
-    heading: Vec3,
+    ctx: &ControlContext,
 ) {
     let s = &mut ws.scratch;
     s.clear_inputs();
 
     s.inputs[input::BIAS] = 1.0;
-    s.inputs[input::CLOCK_A] = triangle(t * CLOCK_HZ);
-    s.inputs[input::CLOCK_B] = triangle(t * CLOCK_HZ + 0.25);
+    s.inputs[input::CLOCK_A] = triangle(ctx.t * CLOCK_HZ);
+    s.inputs[input::CLOCK_B] = triangle(ctx.t * CLOCK_HZ + 0.25);
 
     let root = &pheno.world.bodies[0];
     s.inputs[input::UP_Y] = root.orient.rotate(Vec3::Y).y;
@@ -595,8 +613,55 @@ fn apply_control(
     // command is always +X and telling the controller so would be nine tenths of
     // a wasted weight.
     if layout.is_steered() {
-        s.inputs[input::COMMAND_X] = heading.x;
-        s.inputs[input::COMMAND_Z] = heading.z;
+        s.inputs[input::COMMAND_X] = ctx.heading.x;
+        s.inputs[input::COMMAND_Z] = ctx.heading.z;
+    }
+
+    // Range sensing. Each carrying body casts a fan in the plane containing its
+    // aim and its own local up, so the fan tilts with the part and an organism
+    // that can move that part can sweep it.
+    //
+    // Readings are *added* into the slot's channels and divided by how many
+    // bodies answer to that slot, which is the same averaging the joint angles
+    // below use: a mirrored pair sees with one pair of eyes, not two.
+    if layout.senses_range() {
+        let rays = layout.sensor_inputs;
+        let range = ctx.sensor.range;
+        let spread = ctx.sensor.spread;
+        for mount in &pheno.sensors {
+            let body = &pheno.world.bodies[mount.body as usize];
+            let slot = pheno.body_slots[mount.body as usize] as usize;
+            let n = pheno.slot_bodies[slot].max(1) as Real;
+            let base = layout.sensor_input_base(slot);
+
+            let aim = body.orient.rotate(mount.dir);
+            // Fan within the plane of the aim and the body's own up axis, so a
+            // rolling body rolls its fan with it. Gram-Schmidt, with a fallback
+            // for a sensor pointing straight along that axis.
+            let up = body.orient.rotate(Vec3::Y);
+            let perp = up - aim * aim.dot(up);
+            let perp = perp.normalize_or({
+                let x = body.orient.rotate(Vec3::X);
+                (x - aim * aim.dot(x)).normalize_or(Vec3::Y)
+            });
+
+            let origin = body.pos;
+            for r in 0..rays {
+                // Offsets straddle the aim: one ray is the aim itself when the
+                // count is odd. Linear rather than angular, which is what keeps
+                // the fan free of transcendentals.
+                let offset = r as Real - (rays as Real - 1.0) * 0.5;
+                let dir = (aim + perp * (offset * spread)).normalize_or(aim);
+                // Nothing found reads zero, which is also what an absent sensor
+                // reads — so a blind slot and a slot seeing open sky agree, and
+                // neither disturbs a freshly initialised network.
+                let reading = match pheno.world.params.terrain.raycast(origin, dir, range) {
+                    Some(d) => 1.0 - clamp(d / range, 0.0, 1.0),
+                    None => 0.0,
+                };
+                s.inputs[base + r] += reading / n;
+            }
+        }
     }
 
     // A slot can own more than one joint and more than one body: a mirrored
@@ -640,7 +705,7 @@ fn apply_control(
     for (j, &slot) in pheno.joint_slots.iter().enumerate() {
         let sign = pheno.joint_drive[j];
         let joint = &mut pheno.world.joints[j];
-        joint.motor_target = s.outputs[slot as usize] * joint.motor_speed_max * drive * sign;
+        joint.motor_target = s.outputs[slot as usize] * joint.motor_speed_max * ctx.drive * sign;
     }
 }
 
@@ -844,6 +909,130 @@ mod tests {
             assert!(m.net_gain > 0.0 && m.net_loss == 0.0, "{m:?}");
         } else if net < -1e-4 {
             assert!(m.net_loss > 0.0 && m.net_gain == 0.0, "{m:?}");
+        }
+    }
+
+    fn sensing_config() -> Config {
+        let mut cfg = quick_config();
+        cfg.body.sensor_probability = 1.0; // every part carries one
+        cfg.sensor.rays = 3;
+        cfg.sensor.range = 4.0;
+        cfg
+    }
+
+    /// The layout must grow by exactly one input per ray per slot, and the
+    /// sensor channels must sit *after* the proprioceptive ones so that adding
+    /// them never moves an input that already existed.
+    #[test]
+    fn sensors_add_inputs_without_moving_the_existing_ones() {
+        let blind = quick_config().brain_layout();
+        let seeing = sensing_config().brain_layout();
+        assert_eq!(seeing.sensor_inputs, 3);
+        assert_eq!(seeing.slot_inputs, blind.slot_inputs + 3);
+        assert_eq!(seeing.global_inputs, blind.global_inputs, "sensing is not a global sense");
+        for slot in 0..blind.max_slots {
+            assert_eq!(
+                seeing.sensor_input_base(slot),
+                seeing.slot_input_base(slot) + blind.slot_inputs,
+                "slot {slot}: sensor channels must follow the proprioceptive ones"
+            );
+        }
+    }
+
+    /// Off is exact, not approximately off.
+    ///
+    /// An experiment that declares no sensors must draw the identical random
+    /// stream and evaluate identically to one built before sensors existed. The
+    /// genome is the sensitive part: a sensor gene drawn unconditionally would
+    /// shift every later draw and silently invalidate every stored result.
+    #[test]
+    fn an_experiment_without_sensors_is_untouched_by_them() {
+        let cfg = quick_config();
+        assert_eq!(cfg.sensor_channels(), 0);
+        assert!(!cfg.brain_layout().senses_range());
+        for seed in 0..32 {
+            let g = random_genome(&cfg, seed);
+            assert!(
+                g.parts.iter().all(|p| !p.sensor && p.sensor_dir == crate::math::Vec3::ZERO),
+                "seed {seed}: a sensorless experiment drew a sensor gene"
+            );
+        }
+    }
+
+    /// A sensor pointing straight down from a resting body must measure the gap
+    /// beneath it, which `ground_clearance` computes by a completely different
+    /// route.
+    #[test]
+    fn a_downward_sensor_measures_the_ground_beneath_it() {
+        use crate::physics::TerrainModel;
+        let terrain = TerrainModel::Rough { amplitude: 0.2, wavelength: 3.0 };
+        for (x, z) in [(0.0, 0.0), (0.7, -1.3), (-2.2, 0.9)] {
+            let h = terrain.height_at(x, z);
+            let origin = crate::math::vec3(x, h + 0.75, z);
+            let d = terrain
+                .raycast(origin, crate::math::vec3(0.0, -1.0, 0.0), 4.0)
+                .expect("ground is below");
+            assert!((d - 0.75).abs() < 0.02, "at ({x}, {z}) the sensor read {d} for a 0.75 m gap");
+        }
+    }
+
+    /// A sensor is only worth having if it distinguishes situations. Facing a
+    /// rising slope must read differently from facing open air.
+    #[test]
+    fn a_sensor_reads_terrain_and_says_so() {
+        let cfg = sensing_config();
+        let layout = cfg.brain_layout();
+        let g = random_genome(&cfg, 3);
+        assert!(g.parts.iter().any(|p| p.sensor), "the fixture should carry a sensor");
+        let pheno = crate::phenotype::build(&g, &cfg);
+        assert!(!pheno.sensors.is_empty(), "a sensor gene produced no mount");
+        for m in &pheno.sensors {
+            assert!(
+                (m.dir.length() - 1.0).abs() < 1e-4,
+                "a mount direction must be normalised, got {:?}",
+                m.dir
+            );
+            assert!((m.body as usize) < pheno.world.bodies.len());
+        }
+        // Every mount answers to a slot that the layout has channels for.
+        for m in &pheno.sensors {
+            let slot = pheno.body_slots[m.body as usize] as usize;
+            assert!(layout.sensor_input_base(slot) + layout.sensor_inputs <= layout.inputs());
+        }
+    }
+
+    /// Sensor readings must be bounded, or a freshly initialised network is
+    /// saturated by them and the input is worse than useless.
+    #[test]
+    fn sensor_readings_stay_within_the_unit_range() {
+        let cfg = sensing_config();
+        let layout = cfg.brain_layout();
+        for seed in 0..12 {
+            let g = random_genome(&cfg, seed);
+            let mut ws = EvalWorkspace::new(&cfg);
+            let r = evaluate_with(&g, &cfg, false, &mut ws);
+            assert!(!r.metrics.diverged || r.fitness <= 0.0);
+            // Re-run the controller once against the settled organism and read
+            // the inputs it produced.
+            let pheno = crate::phenotype::build(&g, &cfg);
+            let mut pheno = pheno;
+            apply_control(
+                &mut pheno,
+                &layout,
+                &g.weights,
+                &mut ws,
+                &ControlContext { t: 0.0, drive: 1.0, heading: Vec3::X, sensor: &cfg.sensor },
+            );
+            for slot in 0..layout.max_slots {
+                let base = layout.sensor_input_base(slot);
+                for r in 0..layout.sensor_inputs {
+                    let v = ws.scratch.inputs[base + r];
+                    assert!(
+                        (0.0..=1.0).contains(&v),
+                        "seed {seed} slot {slot} ray {r}: reading {v} is outside [0, 1]"
+                    );
+                }
+            }
         }
     }
 

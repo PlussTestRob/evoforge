@@ -80,7 +80,12 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 ///   it scored before. Net gain and loss are also recoverable from a v7 record's
 ///   stored `start` and `end`, which is what lets `evo rescore` ask elevation
 ///   questions of runs that finished before the metric existed.
-pub const ARTIFACT_FORMAT: u32 = 8;
+/// * `9` — a part can carry a range sensor, recorded as a flag and a direction
+///   on `PartGene`. Both default to "no sensor" on read, so a v8 genome still
+///   describes the organism it always described. An experiment that declares no
+///   sensors draws no sensor gene and adds no controller input, so its results
+///   are unaffected in the stronger sense of being bit-identical.
+pub const ARTIFACT_FORMAT: u32 = 9;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

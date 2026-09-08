@@ -168,8 +168,27 @@ it.
 Sensors in the fuller sense — reporting something about the world *outside* the
 body, mounted on a particular part, described by the genome, and aimed by the
 controller when that part is on a moving limb — are Phase 3 of
-[ROADMAP.md](ROADMAP.md). Sensing is intended to become part of the evolved
-organism rather than an external channel handed to it.
+[ROADMAP.md](ROADMAP.md), planned in [SENSOR_PLAN.md](SENSOR_PLAN.md).
+
+**The rule that governs them: anything an organism knows about the world outside
+its own body must arrive through a sensor with a position and an orientation on
+that body.** World information is never handed to the controller as a free input,
+however much cheaper that would be to build.
+
+That is not fastidiousness. The question this project asks is what structure and
+control an environment selects for *when the organism has to perceive that
+environment to succeed in it*, and an organism given the answer is not answering
+it — it is executing a policy over a coordinate computed somewhere else. The
+shortcut is also invisible after the fact: a fitness curve produced by an
+organism that was told where the target is looks exactly like one produced by an
+organism that found it.
+
+The line between a sense and an instruction is whether it changes during the
+trial. A commanded heading is fixed at the start and never revised, so it is a
+cue, like one given to a trained animal. A beacon's bearing, or the height of the
+ground ahead, updates continuously as the organism acts — that is perception, and
+it needs an organ. [ROADMAP.md](ROADMAP.md) audits the existing inputs against
+this rule, including the one that fails it.
 
 ## Neural Networks
 
@@ -921,6 +940,85 @@ with shapes, disabling it is exact rather than approximate. No randomness is
 spent on the caution gene, and the controller keeps its original input count, so
 the weight vector stays the length it always was and every earlier result
 reproduces bit for bit.
+
+### Positional correction, and why it is small
+
+`simulation.baumgarte` controls how much of a contact's penetration is corrected
+per step. It defaults to **0.05**, which is low, and the reason is worth knowing
+before raising it.
+
+Correction is applied at the contact point, which is offset from the body's
+centre of mass, so it induces rotation as well as separation — and integrating
+that rotation moves the body. With few solver iterations contacts stay deeply
+penetrated, the correction stays large, and an organism that arranges to
+penetrate the ground rhythmically converts the correction into travel. It looks
+exactly like vibration-driven locomotion in a replay, and it is not.
+
+Measured on evolved champions at `baumgarte = 0.2`: they covered 2.72 m, and
+refining the solver from 12 iterations to 96 removed **94%** of it. At 0.05 they
+cover 0.36 m and refinement removes almost nothing. Raising `solver_iterations`
+fixes it too — 48 iterations costs 1.7x and 96 costs 2.8x — where lowering
+`baumgarte` costs 1.08x.
+
+The general test is `travel_survives_refining_the_solver`: distance that exists
+only at a coarse solve is the integrator propelling the organism. Runs made
+before this default changed record `baumgarte = 0.2` in their own `config.toml`,
+so they still resume and still reproduce — but their distances should be read as
+upper bounds. `examples/leak_probe.rs` will say how much of any given champion
+was real.
+
+### Sensing the ground
+
+A sensor is **carried by a part**, not bolted to one. The part has mass, hangs
+off a joint, and is aimed by whatever drives that joint — so an organism that
+grows a stalk can point it, using the same controller outputs that would
+otherwise swing a leg, and pays for it in weight and actuation exactly as it pays
+for any other limb. Perception is not free, and on a project about embodied
+evolution a weightless sensor would have been the anomaly.
+
+The first kind is a lidar-like range sense: a fan of rays cast against the
+terrain, each returning `1 - distance / range`, so 1 is a surface at the sensor
+and 0 is nothing within reach.
+
+```toml
+[body]
+sensor_probability = 0.35   # chance a part carries one; 0 disables sensing exactly
+
+[sensor]
+range = 4.0     # how far a ray reaches
+rays = 3        # readings per sensor, fanned about the aim
+spread = 0.35   # angular spread between adjacent rays
+
+[mutation]
+sensor_rate = 0.04
+sensor_dir_sigma = 0.15
+```
+
+`experiments/sensing-climbers.toml` combines this with the elevation terms below.
+
+**What one ray buys, and what two do.** Ground that rises ahead returns a
+*shorter* range than level ground; ground that falls away returns a longer one,
+or nothing. So a single ray already separates climbing from falling. Telling a
+gentle slope from a wall needs at least two, because one distance carries no
+gradient.
+
+The sensor deliberately does not classify anything. Whether a slope is climbable
+is a property of the body and controller meeting it — a small weak organism and a
+large strong one get different answers from the same ground, and neither can know
+which it is without trying. The sensor reports geometry; what that geometry means
+is for evolution to discover, per lineage.
+
+**Resolution is a stated physical property.** Rays march at a fixed 100 mm
+stride, refined by bisection, so terrain that rises above the ray and drops back
+within one stride is invisible. The stride is chosen against the terrace risers
+the fractal field produces, which measure about 152 mm. Resolution follows the
+stride rather than a step count, so a longer-sighted experiment does not quietly
+become blind to cliffs. Sensing costs about 23% of evaluation throughput at three
+rays.
+
+The default is `sensor_probability = 0`, and off is exact: no sensor gene is
+drawn, so the random stream is untouched, the controller keeps the input count it
+had, and every earlier result reproduces bit for bit.
 
 ### Scoring elevation, not just distance
 

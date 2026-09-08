@@ -1,0 +1,235 @@
+# Fractal animals: `animals.toml`, run on ground that is actually ground.
+#
+# Everything about the genome, the body and the fitness function is copied from
+# `animals.toml` unchanged, so that the one thing that differs between the two
+# runs is the world. What differs is `[environment]`.
+#
+# What was wrong with the old ground
+#   `terrain = "rough"` is two octaves of a sine field. It repeats every 1.6 m,
+#   it has no seed, and it has features at one scale only — a 13 cm ripple with
+#   a 10 degree median slope. Every organism in every trial of every experiment
+#   met the identical surface, which is memorisable in principle: an organism
+#   can be selected for one particular hill rather than for coping with hills.
+#
+# What this is instead
+#   Four bands of seeded gradient noise: hills 25 m across and 6 m deep, detail
+#   at the scale of an organism's own body, a slow field saying where the ground
+#   is calm and where it is savage, and terracing that turns the savage regions
+#   into plateaus separated by near-vertical risers. Aperiodic, keyed on the
+#   experiment seed, and slid and turned under the organism between trials so
+#   that no two trials share a feature.
+#
+#   One band could not do this. Fractional Brownian motion has a single
+#   steepness, set by amplitude over wavelength, and applies it at every scale
+#   it spans: scaled up it gives uniformly steep ground, never occasional
+#   cliffs. Ten metres of relief still tops out near 50 degrees with the median
+#   climbing in lockstep.
+#
+#   Measured with `cargo run --release --example terrain_probe`: 6.3 m of
+#   relief, median slope 8 degrees, 99th percentile 79, maximum 87, 93% of the
+#   plane walkable, and only 1 straight 20 m crossing in 400 that avoids meeting
+#   a wall. The difficulty is concentrated rather than spread, which is what
+#   leaves a fitness gradient to climb instead of a ceiling to hit everywhere.
+#
+# What this is honestly not
+#   Still a height field: single-valued, smooth, no overhangs and no gaps. The
+#   measured ceiling is about 88 degrees and the contact solver is unreliable
+#   above roughly 75. What defeats a wheel is a discontinuity at or above its
+#   own radius, and that needs discrete obstacles, which are not built.
+
+[experiment]
+name = "sensing-climbers"
+# The same seed as animals.toml, deliberately. Every random stream in an
+# experiment derives from this, so with it held fixed the two runs start from
+# the identical founding population and mutate identically, and the only thing
+# that differs between them is the ground. `terrain_seed = 0` derives the
+# landscape from this too.
+seed = 20260906
+output_dir = "runs"
+
+[evolution]
+population_size = 100
+generations = 100
+elite_count = 2
+tournament_size = 4
+crossover_rate = 0.7
+immigrant_rate = 0.02
+
+[body]
+# Chance that a newly drawn part carries a range sensor. Zero disables sensing
+# entirely and exactly.
+sensor_probability = 0.35
+min_parts = 2
+max_parts = 8
+min_half_extent = 0.05
+max_half_extent = 0.20
+density = 1000.0
+min_joint_limit = 0.3
+max_joint_limit = 1.4
+max_motor_speed = 6.0
+max_motor_torque = 200.0
+hinge_probability = 0.85
+shapes = ["box", "taper", "sphere", "capsule", "cylinder"]
+taper_top_scale = 0.45
+joint_endurance = 150.0
+min_drive = 0.2
+muscle_stress = 12000.0
+tendon_frequency = 6.0
+tendon_damping = 0.5
+pair_probability = 0.45
+max_repeat = 3
+
+[brain]
+hidden = 12
+init_sigma = 0.8
+weight_limit = 8.0
+
+[mutation]
+# Adding, removing and re-aiming a sensor. Aim drifts by perturbing the raw
+# direction components, so no angle can wrap or degenerate.
+sensor_rate = 0.04
+sensor_dir_sigma = 0.15
+weight_rate = 0.08
+weight_sigma = 0.25
+weight_reset_rate = 0.05
+size_rate = 0.05
+size_sigma = 0.03
+attach_rate = 0.05
+attach_sigma = 0.15
+joint_limit_rate = 0.05
+joint_limit_sigma = 0.2
+joint_kind_rate = 0.02
+joint_axis_rate = 0.03
+motor_rate = 0.05
+motor_sigma = 0.15
+caution_rate = 0.08
+caution_sigma = 0.12
+pair_rate = 0.05
+repeat_rate = 0.04
+shape_rate = 0.04
+add_part_rate = 0.06
+remove_part_rate = 0.05
+
+[simulation]
+duration = 8.0
+control_hz = 20.0
+solver_iterations = 12
+settle_time = 0.5
+trials = 3
+start_jitter = 0.5
+aggregate = "mean"
+steer = true
+steer_spread = 0.9
+
+[environment]
+terrain = "fractal"
+# 0 derives the landscape from experiment.seed. Set it to compare two
+# experiments on identical ground.
+terrain_seed = 0
+
+# Band 1 — the landscape. Big, smooth hills: about 6 m of relief across 25 m
+# features, which is ten times the length of an organism.
+terrain_amplitude = 3.0
+terrain_wavelength = 25.0
+terrain_octaves = 5
+terrain_lacunarity = 2.0
+terrain_gain = 0.5
+# Bends the field into ridges and basins: buys the tail of the slope
+# distribution, and roughly doubles how much the ground's character varies from
+# place to place. See the note on `terrain_warp` in src/config.rs.
+terrain_warp = 0.6
+
+# Band 2 — detail at organism scale, laid over the hills.
+terrain_detail_amplitude = 0.35
+terrain_detail_wavelength = 3.0
+terrain_detail_octaves = 4
+
+# Band 3 — where the ground is calm and where it is savage.
+terrain_modulation = 0.9
+terrain_modulation_wavelength = 35.0
+
+# Band 4 — cliffs. Quantising height to 0.8 m terraces with a narrow riser is
+# the only thing here that makes a genuinely sheer face.
+terrain_step = 0.8
+# The riser is steeper than the underlying slope by 1/this. Its floor is
+# physics: at 0.12 the walls come out about 150 mm wide, which a body at 3 m/s
+# crosses in six steps. `Config::validate` measures this and refuses anything
+# thinner than four steps — 0.03 here would be rejected.
+terrain_riser = 0.12
+# Terrace only the savage regions and blend back into hills elsewhere, so the
+# cliffs are somewhere rather than everywhere.
+terrain_terrace_mask = true
+
+# Slide and turn the landscape between trials, so a gait cannot be tuned to one
+# hill. Each trial also searches for a level patch to start on rather than
+# spawning an organism half inside a cliff.
+terrain_per_trial = true
+self_collision = true
+gravity = 9.81
+friction = 0.9
+restitution = 0.0
+linear_damping = 0.02
+angular_damping = 0.05
+
+[fitness]
+# Height kept is what this experiment asks for. The weights are an order of
+# magnitude apart because the quantities are: a champion on this terrain covers
+# roughly ten metres of ground per metre of height it gives up, so a per-metre
+# weight of 1 on distance and 10 on climb makes half a metre of gain worth about
+# as much as a whole run.
+#
+# The descent penalty is an instrument rather than a permanent fixture. Its job
+# is to make climbing the only way to score well; before it, no organism in
+# 15,000 had ever ended higher than it started.
+climb_bonus = 10.0
+descent_penalty = 8.0
+objective = "heading"
+energy_penalty = 0.0
+upright_bonus = 0.2
+air_bonus = 0.0
+height_bonus = 0.0
+
+[recording]
+top_n = 4
+random_samples = 3
+record_hz = 30.0
+every_generations = 10
+store_genomes = true
+
+[checkpoint]
+every_generations = 25
+on_finish = true
+
+# ---------------------------------------------------------------------------
+# Sensing.
+#
+# A sensor is not a fitting bolted to a part: it is carried by one. The part has
+# mass, hangs off a joint, and is aimed by whatever drives that joint — so an
+# organism that grows a stalk can point it, using the same controller outputs
+# that would otherwise swing a leg, and pays for it in weight and actuation
+# exactly as it pays for any other limb.
+#
+# `sensor_probability` is the only switch. At zero no sensor gene is drawn, no
+# controller input is added, and the experiment reproduces bit for bit whatever
+# it produced before sensing existed.
+
+[sensor]
+# How far a ray reaches. This is the difficulty knob: long sight makes
+# terrain-following easy, short sight makes it a matter of feeling the way.
+# Fixed rather than evolved, because a free range gene would simply be maximised.
+range = 4.0
+
+# One ray already separates rising ground from falling — ground that climbs
+# ahead returns a shorter range than level ground does. Telling a gentle slope
+# from a wall needs at least two, because one distance carries no gradient.
+# Three is the smallest fan that gives a centre reading as well as a gradient.
+#
+# What any of it *means* is for evolution to discover. Whether a slope can be
+# climbed is a property of the body and controller meeting it, not of the ground,
+# so the sensor reports geometry and nothing else.
+rays = 3
+
+# Angular spread between adjacent rays, applied as a linear offset perpendicular
+# to the aim. Small-angle by construction, which is what keeps the fan free of
+# transcendentals and therefore out of the determinism surface.
+spread = 0.35

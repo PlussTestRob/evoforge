@@ -104,6 +104,17 @@ decidable rather than arguable, and they carry forward into every phase below:
 | `drift_probe` | Is a bigger body genuinely better here, or is it collecting more free ride per part? |
 | `energy_probe` | Does a passive body ever end with more mechanical energy than it started with? |
 | `terrain_probe` | Is the ground actually crossable, and how is its difficulty distributed? |
+| `leak_probe` | Where does un-earned travel come from — internal forces, positional correction, or friction? |
+| `refine_probe` | Which subsystem loses its travel when the solver is refined? |
+| `friction_probe` | Does a resting body get the friction Coulomb says it is owed? |
+
+**Refinement is the sharpest test there is**, and it deserves naming separately.
+Real locomotion is a property of the equations, so solving them more accurately
+perturbs a trajectory without systematically abolishing the distance covered.
+Travel that exists only at a coarse solve is the integrator moving the organism.
+Measured once: refining 12 solver iterations to 96 removed **94%** of an evolved
+champion's travel, which is how the Baumgarte default was found to be propelling
+a whole population. `travel_survives_refining_the_solver` is the standing gate.
 
 They are observation instruments. Their output belongs in the description of a
 result, not in a penalty term.
@@ -204,12 +215,35 @@ in particular*.
   just far enough to fall off something, which is the clearest demonstration
   available that distance alone cannot ask the question we want.
 - **Beacons.** A target position in the world; the metric is closest approach, or
-  whether it was touched. **This is buildable before any sensor exists**: hand
-  the controller the beacon's relative position exactly as the commanded heading
-  is handed over now — an oracle. That decouples this phase from Phase 3
-  entirely, and it gives the sensor work its measurement, because the same task
-  run with the oracle and with a sensor is a direct read on what the sensor is
-  worth.
+  whether it was touched. **A beacon needs a sensor that can detect it**, and it
+  should wait for one rather than being handed to the controller as a free input.
+  An earlier draft of this roadmap proposed exactly that — the beacon's relative
+  position given the way the commanded heading is given — on the grounds that it
+  decoupled this phase from Phase 3. It does, and it also hollows the task out:
+  an organism told continuously where the target is has not found the target, and
+  what evolves is a policy for consuming a coordinate rather than anything that
+  could be called seeking. See *Sensing must be sensed*, below.
+
+  **A beacon is made detectable by being tall.** It stands high enough that a
+  ray clears the terrain and meets it, so visibility is a physical fact about
+  where the organism is standing rather than a fact about what the simulator
+  chose to tell it: a beacon behind a ridge is invisible until the ridge is
+  crested, and one across a valley is visible from the far rim. Beacon height
+  against terrain relief is then the difficulty knob, and the sensor's range is
+  the other. Detection is a *signature* the same ray returns alongside distance,
+  so no separate beacon sense exists and one organ perceives both ground and
+  target. Beacons need no collision — they are markers, not walls — so this does
+  not wait on the discrete-obstacle work. See [SENSOR_PLAN.md](SENSOR_PLAN.md).
+
+  **A beacon task and a large descent penalty are in direct conflict**, and the
+  weights have to be settled before either is run. On a landscape with 5.6 m of
+  relief roughly half of all beacons are below the organism, and at
+  `descent_penalty = 8` descending a single metre costs 8 fitness — more than the
+  best organism of the 45-generation penalty run scored in total. Every downhill
+  beacon would be correctly ignored. The resolution is not to raise the beacon
+  reward until it drowns the penalty out, but to notice that the penalty was
+  always a proxy for *falling* and that `net_loss` does not measure falling: it
+  charges a controlled walk downhill exactly what it charges a tumble.
 - **Multiple beacons.** How many can be reached in one run. Needs an ordering or
   consumption rule and a count in `Metrics`, and little else. It is the first
   task where an organism must do something, finish, and then do something
@@ -241,6 +275,52 @@ degrees).
 
 ## Phase 3 — sensors
 
+### Sensing must be sensed
+
+**Anything an organism knows about the world outside its own body must arrive
+through a sensor that has a position and an orientation on that body.**
+Information about the world is never handed to the controller as a free input.
+
+This is the whole point of the phase rather than a stylistic preference. The
+project's question is what physical structure and control an environment selects
+for *when the organism has to perceive that environment to succeed in it*. An
+organism given the answer directly is not solving that problem — it is executing
+a policy over a coordinate that something outside it computed, and whatever
+evolves says nothing about perception. Worse, the shortcut is invisible in the
+results: the fitness curve of an organism handed the answer looks exactly like
+the fitness curve of one that found it.
+
+The rule is cheap to state and easy to violate accidentally, because a free input
+is always the quickest way to make a task work. Two rules of thumb:
+
+* **If it changes as the organism moves, it is perception**, and needs an organ.
+  A beacon's bearing, the height of the ground ahead, the distance to an
+  obstacle: all of these update continuously as the organism acts, and all of
+  them need a sensor.
+* **If it is fixed for the whole trial, it is an instruction**, and may be given.
+  `COMMAND_X`/`COMMAND_Z` is the existing case: the experiment says "go that
+  way" once, at the start, and never revises it. That is a cue given to a trained
+  animal, not a sense.
+
+**An honest audit of the inputs that already exist**, because the rule is worth
+nothing if it is only applied to new work:
+
+| input | what it is | verdict |
+|---|---|---|
+| `BIAS`, `CLOCK_A`, `CLOCK_B` | an internal pacemaker | not a sense; fine |
+| `UP_Y`, `RIGHT_Y` | orientation with respect to gravity | vestibular; fine |
+| joint angle, ground contact, joint health | the body's own configuration | proprioception; fine |
+| `COMMAND_X`, `COMMAND_Z` | the commanded heading | an instruction, fixed per trial; fine |
+| `VEL_X`, `VEL_Y`, `VEL_Z` | world-frame velocity of the root | arguable — an animal senses acceleration and optic flow, not world-frame velocity |
+| `HEIGHT` | `root.pos.y`, absolute altitude | **fails the rule.** No organ reports altitude above an arbitrary datum. On flat ground it happens to equal clearance; on the fractal landscape it tells the organism where it is in the terrain, which is exactly the kind of free world knowledge this rule exists to stop. |
+
+`HEIGHT` is left as it is for now, deliberately: changing it alters the dynamics
+and moves every golden constant, so it is a versioned decision rather than a
+tidy-up. The honest options are to replace it with height above the ground
+directly beneath — still exteroception, but at least something an organ could
+measure — or to delete it and let a sensor supply it. Whichever is chosen, it
+should be chosen rather than inherited.
+
 **A distinction worth making before any of this is built.** The controller
 already has inputs, and they are all *proprioceptive*: a bias, two clock waves,
 two orientation components, three velocity components, height, and per joint an
@@ -267,7 +347,8 @@ no sensors must draw the identical random stream it drew before sensors existed.
 In order:
 
 - **Lidar-like.** A small fan of rays cast from a mounted part, returning
-  distance to the ground along each. Cheap, and well matched to what already
+  distance to the ground along each. Planned in
+  [SENSOR_PLAN.md](SENSOR_PLAN.md). Cheap, and well matched to what already
   exists: `TerrainModel` is one analytic function over an unbounded domain with
   an exact gradient, so a ray meets it by marching rather than by touching a
   mesh, and there is no transcendental anywhere in it — which keeps the

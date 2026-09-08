@@ -38,6 +38,7 @@ pub struct Config {
     pub simulation: SimulationCfg,
     pub environment: EnvironmentCfg,
     pub fitness: FitnessCfg,
+    pub sensor: SensorCfg,
     pub recording: RecordingCfg,
     pub checkpoint: CheckpointCfg,
 }
@@ -61,12 +62,34 @@ impl Config {
 
     /// The controller shape implied by this configuration.
     pub fn brain_layout(&self) -> BrainLayout {
-        BrainLayout::new_with(
+        BrainLayout::new_full(
             self.body.max_parts,
             self.brain.hidden,
             self.joints_can_break(),
             self.simulation.steer,
+            self.sensor_channels(),
         )
+    }
+
+    /// Whether organisms in this experiment may carry range sensors at all.
+    ///
+    /// Zero probability means no part ever draws a sensor gene, which is what
+    /// makes the feature exactly off rather than approximately off: the random
+    /// stream and the controller layout are both untouched.
+    #[inline]
+    pub fn uses_sensors(&self) -> bool {
+        self.body.sensor_probability > 0.0
+    }
+
+    /// Controller inputs each slot contributes for sensing, which is one range
+    /// reading per ray, or none at all.
+    #[inline]
+    pub fn sensor_channels(&self) -> usize {
+        if self.uses_sensors() {
+            self.sensor.rays
+        } else {
+            0
+        }
     }
 
     /// Whether this experiment lets joints wear out and limbs detach.
@@ -350,6 +373,20 @@ impl Config {
         {
             bad("mutation step sizes must be non-negative")?;
         }
+        if !(0.0..=1.0).contains(&self.body.sensor_probability) {
+            bad("body.sensor_probability must be within [0, 1]")?;
+        }
+        if self.uses_sensors() {
+            if self.sensor.rays == 0 || self.sensor.rays > 8 {
+                bad("sensor.rays must be between 1 and 8")?;
+            }
+            if self.sensor.range <= 0.0 {
+                bad("sensor.range must be positive")?;
+            }
+            if self.sensor.spread < 0.0 {
+                bad("sensor.spread must be non-negative")?;
+            }
+        }
         if self.fitness.energy_penalty < 0.0 || self.fitness.upright_bonus < 0.0 {
             bad("fitness energy_penalty and upright_bonus must be non-negative")?;
         }
@@ -434,6 +471,10 @@ impl Default for EvolutionCfg {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MutationParams {
+    /// Probability per part, per generation, that its sensor is added or removed.
+    pub sensor_rate: Real,
+    /// Standard deviation of the perturbation applied to a sensor's direction.
+    pub sensor_dir_sigma: Real,
     pub weight_rate: Real,
     pub weight_sigma: Real,
     /// Probability that a mutated weight is redrawn from scratch instead of
@@ -473,6 +514,8 @@ pub struct MutationParams {
 impl Default for MutationParams {
     fn default() -> Self {
         MutationParams {
+            sensor_rate: 0.03,
+            sensor_dir_sigma: 0.15,
             weight_rate: 0.08,
             weight_sigma: 0.25,
             weight_reset_rate: 0.05,
@@ -500,6 +543,12 @@ impl Default for MutationParams {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BodyLimits {
+    /// Chance that a newly drawn part carries a range sensor.
+    ///
+    /// Zero disables sensing entirely and exactly: no gene is drawn, no
+    /// controller input is added, and every result from before sensors existed
+    /// reproduces bit for bit.
+    pub sensor_probability: Real,
     pub min_parts: usize,
     pub max_parts: usize,
     pub min_half_extent: Real,
@@ -573,6 +622,7 @@ pub struct BodyLimits {
 impl Default for BodyLimits {
     fn default() -> Self {
         BodyLimits {
+            sensor_probability: 0.0,
             min_parts: 2,
             max_parts: 6,
             min_half_extent: 0.08,
@@ -681,7 +731,19 @@ impl Default for SimulationCfg {
             control_hz: 20.0,
             solver_iterations: 10,
             settle_time: 0.5,
-            baumgarte: 0.2,
+            // Deliberately small, and this is load-bearing.
+            //
+            // Positional correction is applied at a contact point offset from
+            // the centre of mass, so it induces rotation as well as separation,
+            // and integrating that rotation moves the body. With few solver
+            // iterations, contacts stay deeply penetrated, the correction stays
+            // large, and an organism that arranges to penetrate the ground in a
+            // rhythm converts the correction into travel. Measured on evolved
+            // champions: at beta = 0.2 they cover 2.72 m, of which refining the
+            // solver removes 94%; at 0.05 they cover 0.36 m and refinement
+            // removes almost nothing. Raising `solver_iterations` fixes it too,
+            // and costs 1.7x to 2.8x; this costs 1.08x.
+            baumgarte: 0.05,
             slop: 0.002,
             max_correction_speed: 2.0,
             max_linear_speed: 60.0,
@@ -869,6 +931,45 @@ pub enum Objective {
     /// to be steerable, which is a far stronger demand than being fast — and it
     /// is what forces a controllable body rather than a one-shot launcher.
     Heading,
+}
+
+/// Physical parameters of a range sensor, shared by every sensor in an
+/// experiment.
+///
+/// These are experiment constants rather than genes. `rays` in particular sets
+/// how many controller inputs a sensing slot contributes, so it has to be fixed
+/// across a population for the weight vector to keep a uniform length — which is
+/// what makes aligned crossover a one-liner.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SensorCfg {
+    /// How far a ray reaches, metres. Beyond it the sensor reports nothing.
+    ///
+    /// This is the difficulty knob: long sight makes terrain-following easy,
+    /// short sight makes it a matter of feeling the way. Fixed per experiment
+    /// rather than evolved, because a free range gene would simply be maximised.
+    pub range: Real,
+    /// Rays per sensor, fanned in the plane containing the sensor's direction
+    /// and its part's local up axis.
+    ///
+    /// One ray already separates rising ground from falling — ground that climbs
+    /// ahead returns a shorter range than level ground does. Telling a gentle
+    /// slope from a wall needs at least two, because a single distance carries no
+    /// gradient. What any of it *means* is for evolution to work out: whether a
+    /// slope can be climbed depends on the body and controller meeting it, not on
+    /// the ground.
+    pub rays: usize,
+    /// Angular spread between adjacent rays, radians, applied as a linear offset
+    /// perpendicular to the sensor's direction. Small-angle, and deliberately so:
+    /// it needs no transcendental and therefore adds nothing to the determinism
+    /// surface.
+    pub spread: Real,
+}
+
+impl Default for SensorCfg {
+    fn default() -> Self {
+        SensorCfg { range: 4.0, rays: 3, spread: 0.35 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1195,6 +1296,19 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
     f.real(cfg.environment.angular_damping);
     if cfg.environment.self_collision {
         f.tag(b"selfcollide");
+    }
+
+    // Guarded like shapes, tendons and breakable joints: an experiment with no
+    // sensors keeps the digest it had before sensing existed, and therefore stays
+    // resumable and comparable.
+    if cfg.uses_sensors() {
+        f.tag(b"sensor");
+        f.real(cfg.body.sensor_probability);
+        f.real(cfg.sensor.range);
+        f.usize(cfg.sensor.rays);
+        f.real(cfg.sensor.spread);
+        f.real(cfg.mutation.sensor_rate);
+        f.real(cfg.mutation.sensor_dir_sigma);
     }
 
     f.tag(b"fitness");

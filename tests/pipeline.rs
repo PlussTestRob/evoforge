@@ -243,3 +243,63 @@ fn a_run_directory_is_self_describing() {
     let replays = fs::read_dir(summary.dir.join(record::REPLAY_DIR)).unwrap().count();
     assert!(replays > 0);
 }
+
+/// Travel must survive refining the solver.
+///
+/// This is the standing guard against the whole family of bugs where an
+/// organism is propelled by discretisation rather than by physics. Real
+/// locomotion is a property of the equations, so solving them more accurately
+/// perturbs a trajectory but does not systematically abolish the distance
+/// covered. Anything that *only* works at a coarse step is the integrator
+/// moving the organism, and evolution finds it fast: it is what the
+/// self-collision conveyor was, and it is what a population of champions was
+/// living on when `simulation.baumgarte` still defaulted to 0.2.
+///
+/// Measured then: refining 12 solver iterations to 96 removed 94% of an evolved
+/// champion's travel. Measured now, over unevolved organisms, retention averages
+/// around 100% and never collapses. The threshold is set well below that and
+/// well above the failure, because individual trajectories genuinely do diverge
+/// under refinement — it is the *systematic* loss that indicts.
+#[test]
+fn travel_survives_refining_the_solver() {
+    use evoforge::genome::Genome;
+    use evoforge::rng::Rng;
+
+    let mut cfg = Config::load(&PathBuf::from("experiments/animals.toml")).expect("config");
+    cfg.simulation.trials = 1;
+    let layout = cfg.brain_layout();
+
+    let mut coarse_total = 0.0;
+    let mut fine_total = 0.0;
+    let mut counted = 0;
+    for seed in 0..24u64 {
+        let g = Genome::random(&mut Rng::new(seed), &cfg.body, &cfg.brain, &layout);
+
+        let mut coarse = cfg.clone();
+        coarse.simulation.solver_iterations = 12;
+        let dc = sim::evaluate(&g, &coarse, false).metrics.displacement;
+        // Organisms that barely move say nothing about refinement either way,
+        // and their ratios are noise.
+        if dc < 0.15 {
+            continue;
+        }
+
+        let mut fine = cfg.clone();
+        fine.simulation.solver_iterations = 96;
+        let df = sim::evaluate(&g, &fine, false).metrics.displacement;
+
+        coarse_total += dc;
+        fine_total += df;
+        counted += 1;
+    }
+
+    assert!(counted >= 8, "only {counted} organisms moved enough to judge");
+    let retained = fine_total / coarse_total;
+    assert!(
+        retained > 0.5,
+        "refining 12 solver iterations to 96 left only {:.0}% of the travel across {counted} \
+         organisms. Distance that exists only at a coarse solve is the integrator propelling \
+         the organism, not the organism moving.",
+        retained * 100.0
+    );
+}

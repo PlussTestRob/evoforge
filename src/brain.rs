@@ -36,6 +36,16 @@ pub const GLOBAL_INPUTS_WITH_COMMAND: usize = 11;
 /// a (cos, sin) pair plus a ground-contact flag.
 pub const INPUTS_PER_SLOT: usize = 3;
 
+/// Controller inputs a sensing slot contributes *per ray*: one normalised range.
+///
+/// A separate constant because it is the unit the layout is sized in, and
+/// because a later sensor kind wanting range *and* a signature — which is what
+/// beacons will need — raises this for the whole experiment rather than making
+/// the layout depend on which sensors a genome happens to carry. A per-genome
+/// layout would destroy the uniform weight-vector length that makes aligned
+/// crossover a one-liner.
+pub const CHANNELS_PER_RAY: usize = 1;
+
 /// Inputs per slot when joint health is enabled: the three above plus the
 /// joint's remaining health.
 ///
@@ -56,10 +66,16 @@ pub struct BrainLayout {
     pub max_slots: usize,
     pub hidden: usize,
     /// Inputs each slot contributes: [`INPUTS_PER_SLOT`], or
-    /// [`INPUTS_PER_SLOT_WITH_HEALTH`] when the experiment lets joints break.
+    /// [`INPUTS_PER_SLOT_WITH_HEALTH`] when the experiment lets joints break,
+    /// plus [`BrainLayout::sensor_inputs`] when the experiment has sensors.
     pub slot_inputs: usize,
     /// Inputs describing the organism as a whole.
     pub global_inputs: usize,
+    /// Of `slot_inputs`, how many carry sensor readings. Zero in an experiment
+    /// without sensors, which is what keeps its weight vector the length it
+    /// always had.
+    #[serde(default)]
+    pub sensor_inputs: usize,
 }
 
 impl BrainLayout {
@@ -72,10 +88,42 @@ impl BrainLayout {
     }
 
     pub fn new_with(max_slots: usize, hidden: usize, health: bool, steer: bool) -> BrainLayout {
+        BrainLayout::new_full(max_slots, hidden, health, steer, 0)
+    }
+
+    /// `sensor_channels` is the number of range readings a sensing slot
+    /// contributes — one per ray — or zero in an experiment without sensors.
+    pub fn new_full(
+        max_slots: usize,
+        hidden: usize,
+        health: bool,
+        steer: bool,
+        sensor_channels: usize,
+    ) -> BrainLayout {
         assert!(max_slots > 0 && hidden > 0);
-        let slot_inputs = if health { INPUTS_PER_SLOT_WITH_HEALTH } else { INPUTS_PER_SLOT };
+        let base = if health { INPUTS_PER_SLOT_WITH_HEALTH } else { INPUTS_PER_SLOT };
+        let sensor_inputs = sensor_channels * CHANNELS_PER_RAY;
         let global_inputs = if steer { GLOBAL_INPUTS_WITH_COMMAND } else { GLOBAL_INPUTS };
-        BrainLayout { max_slots, hidden, slot_inputs, global_inputs }
+        BrainLayout {
+            max_slots,
+            hidden,
+            slot_inputs: base + sensor_inputs,
+            global_inputs,
+            sensor_inputs,
+        }
+    }
+
+    /// Whether this layout carries sensor readings at all.
+    #[inline]
+    pub fn senses_range(&self) -> bool {
+        self.sensor_inputs > 0
+    }
+
+    /// Index of the first sensor input for `slot`. Sensor channels sit after the
+    /// slot's proprioceptive ones, so adding them never moves an existing input.
+    #[inline]
+    pub fn sensor_input_base(&self, slot: usize) -> usize {
+        self.slot_input_base(slot) + (self.slot_inputs - self.sensor_inputs)
     }
 
     /// Whether this layout carries a commanded direction of travel.
@@ -87,7 +135,7 @@ impl BrainLayout {
     /// Whether this layout carries a health input for each slot.
     #[inline]
     pub fn senses_health(&self) -> bool {
-        self.slot_inputs >= INPUTS_PER_SLOT_WITH_HEALTH
+        self.slot_inputs - self.sensor_inputs >= INPUTS_PER_SLOT_WITH_HEALTH
     }
 
     #[inline]

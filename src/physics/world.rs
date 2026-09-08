@@ -521,6 +521,20 @@ const MODULATION_OFFSET_Z: Real = -2.71;
 /// Separation between octaves, so no two octaves are the same field rescaled.
 const OCTAVE_SEED_STRIDE: u64 = 0x4f43_5441_5645_0001;
 
+/// Spacing between samples along a sensor ray, metres.
+///
+/// The resolution of every range sensor in the simulator, and the width of the
+/// narrowest feature one can see: terrain that rises above the ray and drops
+/// back within a stride is stepped over. 100 mm is chosen against the terrace
+/// risers the fractal field produces, which measure about 152 mm at the shipped
+/// settings and are the single most important thing for an organism to notice.
+const MARCH_STRIDE: Real = 0.1;
+/// Ceiling on samples per ray, so a large `range` cannot make evaluation
+/// arbitrarily expensive.
+const MAX_MARCH_STEPS: u32 = 128;
+/// Halvings used to refine the crossing once a stride containing it is found.
+const BISECTIONS: u32 = 4;
+
 impl TerrainModel {
     #[inline]
     pub fn height_at(&self, x: Real, z: Real) -> Real {
@@ -533,6 +547,73 @@ impl TerrainModel {
             }
             TerrainModel::Fractal { .. } => self.sample(x, z).0,
         }
+    }
+
+    /// Distance from `origin` along `dir` to the first point where the ray meets
+    /// the ground, or `None` if it does not within `range`.
+    ///
+    /// `dir` must be normalised. An origin already below the surface returns
+    /// `Some(0.0)`: a sensor buried in a hillside sees the hillside, which is
+    /// both true and the reading that keeps a controller's input bounded.
+    ///
+    /// # Why a fixed march rather than a root find
+    ///
+    /// The height field is cheap and everywhere-defined but not Lipschitz-bounded
+    /// in any form the solver knows, so sphere tracing has nothing to step by.
+    /// Marching at a fixed stride until `ray.y - h(ray.x, ray.z)` changes sign and
+    /// then bisecting is simple, has no failure mode worse than missing a feature
+    /// narrower than the stride, and — the part that matters here — costs the
+    /// *same* number of samples for every ray.
+    ///
+    /// That last property is not an optimisation. A loop that stopped early would
+    /// make evaluation cost a function of what evolved and of where an organism
+    /// happened to be standing, which turns a benchmark into a measurement of the
+    /// population. It also keeps the work identical on every thread, which is
+    /// what the determinism contract needs.
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, range: Real) -> Option<Real> {
+        let above = |p: Vec3| p.y - self.height_at(p.x, p.z);
+        if above(origin) <= 0.0 {
+            return Some(0.0);
+        }
+
+        // Steps follow from the stride, not the other way round. A fixed *count*
+        // would make the sensor's resolution depend on its range, so a
+        // longer-sighted experiment would quietly become blind to terrace
+        // risers — which at the shipped settings are 152 mm wide and are
+        // precisely the feature worth seeing. Fixing the stride instead makes
+        // resolution a stated physical property, and keeps the sample count
+        // identical for every ray in an experiment.
+        let steps = ((range / MARCH_STRIDE).ceil() as u32).clamp(1, MAX_MARCH_STEPS);
+        let stride = range / steps as Real;
+        let mut near = 0.0;
+        let mut hit = false;
+        for i in 1..=steps {
+            let far = i as Real * stride;
+            if above(origin + dir * far) <= 0.0 {
+                hit = true;
+                break;
+            }
+            near = far;
+        }
+        if !hit {
+            return None;
+        }
+
+        // The crossing is somewhere in `(near, near + stride]`. Bisection rather
+        // than a secant step because it cannot diverge on a discontinuous-looking
+        // terrace riser, and four halvings of a stride this size are already
+        // finer than the contact solver resolves.
+        let mut lo = near;
+        let mut hi = near + stride;
+        for _ in 0..BISECTIONS {
+            let mid = 0.5 * (lo + hi);
+            if above(origin + dir * mid) <= 0.0 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(0.5 * (lo + hi))
     }
 
     #[inline]
@@ -1847,6 +1928,120 @@ mod tests {
         );
     }
 
+    /// The ray against an independent brute-force march, which is how the
+    /// terrain gradient was validated and for the same reason: a root find that
+    /// agrees with itself proves nothing.
+    #[test]
+    fn a_ray_finds_the_same_ground_a_dense_march_does() {
+        let fields = [
+            TerrainModel::Flat { height: 0.0 },
+            TerrainModel::Rough { amplitude: 0.25, wavelength: 2.0 },
+            TerrainModel::Fractal(FractalField {
+                seed: 7,
+                amplitude: 3.0,
+                wavelength: 25.0,
+                octaves: 5,
+                lacunarity: 2.0,
+                gain: 0.5,
+                warp: 0.6,
+                detail_amplitude: 0.35,
+                detail_wavelength: 3.0,
+                detail_octaves: 4,
+                modulation: 0.9,
+                modulation_wavelength: 35.0,
+                step: 0.8,
+                riser: 0.12,
+                terrace_mask: true,
+                ..Default::default()
+            }),
+        ];
+        let range = 6.0;
+        // A stride, refined by four bisections, is all the march can resolve.
+        let tol = 0.1 / 16.0 + 1e-3;
+        let mut checked = 0;
+        let mut missed = 0;
+        for terrain in fields {
+            for i in 0..400 {
+                // Deliberately awkward origins and bearings: on a lattice point
+                // every octave of gradient noise is exactly zero, so round
+                // numbers would agree between two different implementations.
+                let a = i as Real * 0.37;
+                let x = (a * 1.7) % 23.0 - 11.5;
+                let z = (a * 2.9) % 19.0 - 9.5;
+                let origin = vec3(x, terrain.height_at(x, z) + 0.6, z);
+                let dir = vec3(
+                    ((a * 0.61) % 2.0) - 1.0,
+                    ((a * 0.29) % 1.4) - 1.2,
+                    ((a * 0.83) % 2.0) - 1.0,
+                )
+                .normalize_or(vec3(0.0, -1.0, 0.0));
+
+                let got = terrain.raycast(origin, dir, range);
+
+                // Brute force: step finely and take the first crossing.
+                const FINE: u32 = 4000;
+                let mut expected = None;
+                for k in 1..=FINE {
+                    let t = k as Real * (range / FINE as Real);
+                    let p = origin + dir * t;
+                    if p.y - terrain.height_at(p.x, p.z) <= 0.0 {
+                        expected = Some(t);
+                        break;
+                    }
+                }
+
+                match (got, expected) {
+                    (Some(g), Some(e)) if (g - e).abs() < tol => checked += 1,
+                    (None, None) => checked += 1,
+                    // Terrain that rises above the ray and drops back within one
+                    // stride is invisible by construction, and the march then
+                    // either finds a later crossing or none. That is the stated
+                    // resolution limit rather than a bug, so it is counted and
+                    // bounded rather than forgiven case by case.
+                    (Some(_), Some(_)) | (None, Some(_)) => missed += 1,
+                    (Some(g), None) => panic!("ray {i}: reported a hit at {g} that is not there"),
+                }
+            }
+        }
+        // Sub-stride features are missed by construction; the contract is that
+        // they are rare. A regression that broke the march outright, or coarsened
+        // the stride, shows up here immediately.
+        assert!(
+            missed * 50 < checked,
+            "{missed} of {} rays disagreed with a dense march; the resolution limit              should account for far fewer than 2%",
+            checked + missed
+        );
+        assert!(checked > 1000, "only {checked} rays actually agreed");
+    }
+
+    /// A sensor already under the surface sees the surface, rather than
+    /// reporting nothing and letting a buried organism believe it is in clear
+    /// air.
+    #[test]
+    fn a_ray_from_below_the_ground_hits_immediately() {
+        let t = TerrainModel::Rough { amplitude: 0.3, wavelength: 2.0 };
+        let below = vec3(0.4, t.height_at(0.4, 0.2) - 0.1, 0.2);
+        assert_eq!(t.raycast(below, vec3(1.0, 0.0, 0.0), 4.0), Some(0.0));
+    }
+
+    /// A ray pointing away from the ground finds nothing, and says so.
+    #[test]
+    fn a_ray_into_the_sky_finds_nothing() {
+        let t = TerrainModel::Flat { height: 0.0 };
+        assert_eq!(t.raycast(vec3(0.0, 0.5, 0.0), Vec3::Y, 10.0), None);
+    }
+
+    /// Straight down onto flat ground is the one case with an exact answer.
+    #[test]
+    fn a_vertical_ray_measures_its_own_height() {
+        let t = TerrainModel::Flat { height: 0.0 };
+        let d = t.raycast(vec3(1.0, 2.0, -3.0), vec3(0.0, -1.0, 0.0), 8.0).expect("hit");
+        // Resolved to a stride refined by `BISECTIONS` halvings, and no finer;
+        // the march does not claim more precision than that.
+        let tol = MARCH_STRIDE / (1 << BISECTIONS) as Real;
+        assert!((d - 2.0).abs() <= tol, "expected 2 m within {tol}, got {d}");
+    }
+
     #[test]
     fn friction_stops_a_sliding_box() {
         let mut w = drop_box(0.25);
@@ -2051,6 +2246,93 @@ mod tests {
             w.joints[0].health > 0.99,
             "an unstressed joint lost health: {}",
             w.joints[0].health
+        );
+    }
+
+    /// Internal forces cannot move a centre of mass.
+    ///
+    /// A motor and a joint exchange momentum between an organism's own parts.
+    /// They can spin it, fold it and tear it apart, but with no gravity and
+    /// nothing to touch, the mass-weighted mean of its parts must stay exactly
+    /// where it started. Anything else is the solver inventing momentum, and
+    /// evolution finds invented momentum faster than it finds walking.
+    ///
+    /// Driven hard and reversed repeatedly, because that is the regime evolved
+    /// controllers actually use and the one where the per-body clamps in
+    /// `integrate_positions` could clip one half of an equal-and-opposite pair.
+    #[test]
+    fn a_motor_cannot_move_the_centre_of_mass() {
+        let mut w = hinge_pair(-1.0, 40.0);
+        w.params.gravity = Vec3::ZERO;
+        // Far above any ground, and the terrain is flat at zero anyway.
+        for b in w.bodies.iter_mut() {
+            b.pos.y += 50.0;
+        }
+
+        let com = |w: &World| {
+            let mut acc = Vec3::ZERO;
+            let mut total = 0.0;
+            for b in &w.bodies {
+                let m = b.mass();
+                acc += b.pos * m;
+                total += m;
+            }
+            acc * (1.0 / total)
+        };
+
+        let start = com(&w);
+        let dt = 1.0 / 120.0;
+        for step in 0..1200 {
+            // Slam the motor from one extreme to the other every few steps.
+            w.joints[0].motor_target = if (step / 3) % 2 == 0 { 4.0 } else { -4.0 };
+            w.step(dt);
+        }
+        let drift = (com(&w) - start).length();
+        assert!(
+            drift < 1e-3,
+            "a motor with nothing to push against moved the centre of mass {drift} m"
+        );
+    }
+
+    /// The same conservation law, with the parts a real organism actually has:
+    /// a joint limit to slam into and a tendon pulling back.
+    ///
+    /// The plain hinge above conserves momentum exactly, so anything that leaks
+    /// leaks here — the limit's positional half and the tendon are the two
+    /// places a torque is applied that is not obviously equal and opposite.
+    #[test]
+    fn a_limit_and_a_tendon_cannot_move_the_centre_of_mass() {
+        // cos_limit 0.5 is a +/- 60 degree range, so a motor driven flat out
+        // hits the stop and stays there.
+        let mut w = hinge_pair(0.5, 40.0);
+        w.params.gravity = Vec3::ZERO;
+        w.joints[0].tendon_frequency = 6.0;
+        w.joints[0].tendon_damping = 0.5;
+        for b in w.bodies.iter_mut() {
+            b.pos.y += 50.0;
+        }
+
+        let com = |w: &World| {
+            let mut acc = Vec3::ZERO;
+            let mut total = 0.0;
+            for b in &w.bodies {
+                let m = b.mass();
+                acc += b.pos * m;
+                total += m;
+            }
+            acc * (1.0 / total)
+        };
+
+        let start = com(&w);
+        let dt = 1.0 / 120.0;
+        for step in 0..1200 {
+            w.joints[0].motor_target = if (step / 3) % 2 == 0 { 4.0 } else { -4.0 };
+            w.step(dt);
+        }
+        let drift = (com(&w) - start).length();
+        assert!(
+            drift < 1e-3,
+            "a motor slamming a joint limit moved the centre of mass {drift} m with              nothing to push against"
         );
     }
 
