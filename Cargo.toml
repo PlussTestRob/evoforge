@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.82"
 description = "A headless evolutionary artificial-life simulator"
 license = "MIT"
+authors = ["PlussTestRob"]
+repository = "https://github.com/PlussTestRob/evoforge"
+homepage = "https://github.com/PlussTestRob/evoforge"
+readme = "README.md"
 
 [lib]
 name = "evoforge"

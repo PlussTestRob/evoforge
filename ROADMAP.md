@@ -137,10 +137,14 @@ joints with limits, motors, optional passive tendons, and optional wear leading
 to failure; optional bilateral symmetry and segmental repetition; optional
 self-collision; a fixed-topology feed-forward controller evolved rather than
 trained; flat, sine and seeded fractal terrain behind one analytic height
-function; four objectives over a recorded metric set; repeated trials with
-per-trial start, terrain and heading variation; tournament selection with
-elitism, slot-aligned crossover and mutation; checkpoint, resume and extension;
-selective recording and exact re-simulation; a browser replay viewer.
+function; four base objectives over a recorded metric set; elevation metrics
+(`climb_bonus`, `descent_penalty`, `cumulative_climb_bonus`,
+`cumulative_descent_penalty`, `fall_penalty`); a lidar-like range sensor carried
+by a body part; `evo rescore` for re-weighting finished runs without
+re-simulating; repeated trials with per-trial start, terrain and heading
+variation; tournament selection with elitism, slot-aligned crossover and
+mutation; checkpoint, resume and extension; selective recording and exact
+re-simulation; a browser replay viewer with run-browser and terrain rendering.
 
 Two items carried forward from the terrain work, both stated in
 [TERRAIN_PLAN_2.md](TERRAIN_PLAN_2.md):
@@ -152,7 +156,7 @@ Two items carried forward from the terrain work, both stated in
   corpse gate on every arm, so the comparison is valid again. What is still
   outstanding is a longer replicated run: thirty generations on one seed is a
   direction check, and the part-count result below deserves more than that. See
-  [README.md](README.md) for the full figures.
+  [RESULTS.md](RESULTS.md) for the full figures.
 - **Discrete obstacles were deferred** and remain the only proposed feature that
   produces a discontinuity at or above a wheel's own radius. Picked up in
   Phase 2.
@@ -170,28 +174,29 @@ The boundary that must survive: `fitness::score` reads `Metrics` and nothing
 else. An objective that can reach into the physics world acquires dependencies on
 solver details, and results stop being comparable across solver changes.
 
-Work:
+Done:
+
+- **Widen `Metrics` where evaluation needs it.** Elevation gained and lost are
+  recorded per organism: `net_gain`, `net_loss`, `climb`, `descent`,
+  `fall_distance`. Five configurable fitness terms read them. See
+  [FITNESS_PLAN.md](FITNESS_PLAN.md) for the implementation and calibration.
+- **Re-scoring without re-simulating.** `evo rescore` re-weights any finished run
+  from the command line — overriding any combination of climb/descent/fall/energy
+  terms — without touching the physics. With no overrides it is a round trip and
+  must reproduce stored fitness exactly.
+
+Open:
 
 - **Name the task.** Give a trial an explicit description of what was asked of it
   — today a commanded heading, later a target position or a sequence of them.
   Record it in the trace and in `organisms.jsonl` next to the metrics, so a
   result is self-describing: what the organism was asked, and what it did.
-- **Widen `Metrics` where evaluation needs it.** It is already the sole input to
-  scoring and is already recorded per organism. Elevation gained and lost, and
-  distance to a target, are the two additions Phase 2 needs. The elevation pair
-  is planned in [FITNESS_PLAN.md](FITNESS_PLAN.md), together with the weighting
-  and the re-scoring tool below.
-- **Re-scoring without re-simulating.** Because full metrics are stored for every
-  organism, an existing run can be scored under a different objective after the
-  fact. This is stated as a design intent in `fitness.rs` and is not yet
-  reachable from the command line. It is the cheapest possible way to ask "what
-  would this population have looked like under a different question", and it is
-  how a new objective gets a sanity check before anything is bred under it.
 - **Multiple tasks per experiment, sequentially.** An experiment already runs
   several trials and aggregates them. Letting different trials pose different
   tasks — a mean or a worst case across them — is the smallest change that makes
   evaluation multi-environment. This is not multi-objective optimisation: the
   result is still one scalar per organism.
+- **Distance to a target** in `Metrics`, for use once beacons exist.
 
 Exit test: a task can be added without touching the physics, the genome, or the
 breeding loop.
@@ -344,20 +349,31 @@ of what kind an organism may carry, the controller layout is sized for that, and
 an organism carrying fewer feeds zeros into the rest. An experiment that declares
 no sensors must draw the identical random stream it drew before sensors existed.
 
-In order:
+Done:
 
 - **Lidar-like.** A small fan of rays cast from a mounted part, returning
-  distance to the ground along each. Planned in
-  [SENSOR_PLAN.md](SENSOR_PLAN.md). Cheap, and well matched to what already
-  exists: `TerrainModel` is one analytic function over an unbounded domain with
-  an exact gradient, so a ray meets it by marching rather than by touching a
-  mesh, and there is no transcendental anywhere in it — which keeps the
-  determinism story intact. First because it is the least machinery for the most
-  information.
+  `1 - distance / range` per ray. Implemented against the same analytic terrain
+  function — no mesh, no transcendentals, full determinism. The sensor is carried
+  by a part: it has mass, hangs off a joint, and is aimed by whatever drives that
+  joint. `sensor_probability = 0` is exact; earlier results are unaffected. See
+  [SENSOR_PLAN.md](SENSOR_PLAN.md) for implementation notes and the 300-generation
+  comparison. `experiments/sensing-climbers.toml` ships the best settings found.
+
+Open:
+
+- **Beacon signature channel.** The range ray could return a beacon-detection
+  flag alongside distance, making one organ perceive both ground and target. Not
+  yet implemented; waiting on Phase 2 beacon tasks.
+- **Recording sensor readings.** Replays do not yet store per-step sensor values,
+  so what a sensing organism perceived during a replay cannot be verified from the
+  recording. This is a gap in the observability story.
+- **`HEIGHT` audit.** The existing `HEIGHT` input (`root.pos.y`) fails the
+  sensing rule — it hands the organism its altitude without an organ. Correcting
+  it moves every golden constant, so it is a versioned decision rather than a
+  tidy-up. Options: replace with clearance above ground beneath (exteroceptive but
+  organ-measurable), or delete and let a sensor supply it.
 - **Camera-like.** A low-resolution directional sample of what lies along a
-  bearing. What "what" means is the open question, and should be answered by the
-  task that first needs it — a beacon task needs to see beacons, an obstacle
-  course needs to see obstacles. Not specified further here.
+  bearing. Deferred until the task that first needs it is built.
 - **Hearing-like.** Requires sources in the world to hear. A beacon is the
   obvious first one. Later than the above, and deliberately left thin.
 - **Other kinds** as tasks demand them, and not before.
