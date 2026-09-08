@@ -314,6 +314,7 @@ fn accumulate(a: Metrics, b: Metrics) -> Metrics {
         displacement_x: a.displacement_x + b.displacement_x,
         path_length: a.path_length + b.path_length,
         max_displacement: a.max_displacement + b.max_displacement,
+        fall_distance: a.fall_distance + b.fall_distance,
         net_gain: a.net_gain + b.net_gain,
         net_loss: a.net_loss + b.net_loss,
         climb: a.climb + b.climb,
@@ -339,6 +340,7 @@ fn scale_metrics(m: &mut Metrics, k: Real) {
     m.displacement_x *= k;
     m.path_length *= k;
     m.max_displacement *= k;
+    m.fall_distance *= k;
     m.net_gain *= k;
     m.net_loss *= k;
     m.climb *= k;
@@ -494,6 +496,7 @@ fn run_trial_towards(
 
         if step >= settle_steps {
             let com = pheno.world.centre_of_mass();
+            let previous_y = previous_com.y;
             let delta = horizontal(com - previous_com);
             metrics.path_length += delta.length();
             previous_com = com;
@@ -516,6 +519,13 @@ fn run_trial_towards(
             // along is not the organism flying.
             if pheno.world.ground_clearance() > AIRBORNE_CLEARANCE {
                 metrics.airborne_seconds += dt;
+                // Height given away with nothing underfoot. Walking down a slope
+                // keeps contact and costs nothing here; stepping off a terrace
+                // does not, and that is the distinction `descent` cannot make.
+                let dropped = previous_y - com.y;
+                if dropped > 0.0 {
+                    metrics.fall_distance += dropped;
+                }
             }
 
             measured_steps += 1;

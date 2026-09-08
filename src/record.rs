@@ -85,7 +85,11 @@ const STREAM_SAMPLING: u64 = 0x5341_4d50_4c45_0001;
 ///   describes the organism it always described. An experiment that declares no
 ///   sensors draws no sensor gene and adds no controller input, so its results
 ///   are unaffected in the stronger sense of being bit-identical.
-pub const ARTIFACT_FORMAT: u32 = 9;
+/// * `10` — `Metrics` gained `fall_distance`: height lost while out of contact,
+///   which separates a fall from a walk downhill. Defaults to zero on read, and
+///   the weight that scores it defaults to zero, so a v9 record scores what it
+///   always scored.
+pub const ARTIFACT_FORMAT: u32 = 10;
 
 /// Oldest checkpoint layout this build can resume from. Read-only artefacts
 /// (manifests, stored genomes, replays) stay readable across the whole range;

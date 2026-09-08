@@ -394,7 +394,10 @@ impl Config {
         // wrong name — and a negative `descent_penalty` pays an organism to fall,
         // which is precisely the behaviour these terms exist to stop rewarding by
         // accident.
-        if self.fitness.descent_penalty < 0.0 || self.fitness.cumulative_descent_penalty < 0.0 {
+        if self.fitness.descent_penalty < 0.0
+            || self.fitness.cumulative_descent_penalty < 0.0
+            || self.fitness.fall_penalty < 0.0
+        {
             bad("fitness descent penalties must be non-negative")?;
         }
         if self.fitness.climb_deadband < 0.0 {
@@ -1027,6 +1030,16 @@ pub struct FitnessCfg {
     /// ascent over a whole run on rough ground, and 0.05 m of band removes all
     /// of it. Affects the recorded metrics whether or not they are scored.
     pub climb_deadband: Real,
+    /// Subtracted per metre of height lost while out of contact with the ground.
+    ///
+    /// The targeted form of `descent_penalty`. That term charges a controlled
+    /// walk downhill exactly what it charges a fall, so an objective leaning on
+    /// it makes standing still the safest strategy — measured: at
+    /// `descent_penalty = 8` a population converged on rising slightly while
+    /// travelling 0.20 m, against 1.57 m for the arm scored more gently. This
+    /// charges only for the descent an organism did not choose, so going
+    /// downhill on purpose stays free. Zero by default.
+    pub fall_penalty: Real,
 }
 
 impl Default for FitnessCfg {
@@ -1042,6 +1055,7 @@ impl Default for FitnessCfg {
             cumulative_climb_bonus: 0.0,
             cumulative_descent_penalty: 0.0,
             climb_deadband: 0.05,
+            fall_penalty: 0.0,
         }
     }
 }
@@ -1333,8 +1347,10 @@ fn fingerprint(cfg: &Config, include_bookkeeping: bool) -> u64 {
         || cfg.fitness.descent_penalty != 0.0
         || cfg.fitness.cumulative_climb_bonus != 0.0
         || cfg.fitness.cumulative_descent_penalty != 0.0
+        || cfg.fitness.fall_penalty != 0.0
     {
         f.tag(b"elevation");
+        f.real(cfg.fitness.fall_penalty);
         f.real(cfg.fitness.climb_bonus);
         f.real(cfg.fitness.descent_penalty);
         f.real(cfg.fitness.cumulative_climb_bonus);

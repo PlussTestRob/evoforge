@@ -941,6 +941,49 @@ spent on the caution gene, and the controller keeps its original input count, so
 the weight vector stays the length it always was and every earlier result
 reproduces bit for bit.
 
+### What 300 generations with a sensor actually showed
+
+Three arms, same seed and terrain, 300 generations each, differing only where
+stated. Travel is `heading_progress`, the distance an organism was actually
+asked to cover.
+
+| arm | controller weights | median travel | best travel | distinct structures |
+|---|---|---|---|---|
+| blind | 632 | 1.63 m | 2.90 m | 49 |
+| 1 ray | 728 | 3.47 m | 3.59 m | 19 |
+| 1 ray, `immigrant_rate` 0.12 | 728 | **3.87 m** | **4.04 m** | 26 |
+
+**Sensing pays, but only if it is cheap.** An earlier three-ray arm cost 920
+weights — 46% more than blind — and lost to the blind control on every measure
+over 150 generations. One ray costs 15% more and more than doubles median
+travel. The information was never the problem; the search space was.
+
+**Premature convergence was the binding constraint, not compute.** The 1-ray arm
+reached 5.884 by generation 49 and 6.015 by generation 299 — nothing in 250
+generations, with 12 distinct structures left out of 100. Raising
+`immigrant_rate` from 0.02 to 0.12 kept 26–34 distinct, was still improving at
+generation 300, and finished 10% higher. Both settings are now the shipped
+defaults in `experiments/sensing-climbers.toml`.
+
+**And a caution about reading fitness rather than behaviour.** Under the
+objective these arms actually ran (`climb_bonus = 10`), the *blind* arm scores
+highest — because its champion gained 0.22 m of elevation against the sensing
+arm's 0.09 m, and at weight 10 that 0.13 m outweighs a 0.7 m travel advantage.
+Re-scoring the same populations tells the real story:
+
+| weighting | blind | 1 ray | 1 ray + diversity |
+|---|---|---|---|
+| climb 10, descent 8 (as run) | **5.105** | 4.415 | 5.006 |
+| climb 2, descent 1 | 3.339 | 3.754 | **4.217** |
+| pure travel | 2.897 | 3.588 | **4.035** |
+
+`climb_bonus = 10` was set so half a metre of climb would be worth a whole run.
+Nothing climbs half a metre — the best organism in 300 generations managed
+0.22 m — so the weight is an order of magnitude above what it was calibrated
+against, and it turns noise in elevation into the dominant term. Weights want
+calibrating to what is *achievable*, which `evo rescore` will tell you from a
+finished run in seconds.
+
 ### Positional correction, and why it is small
 
 `simulation.baumgarte` controls how much of a contact's penetration is corrected
@@ -1058,6 +1101,26 @@ Two cautions, both of them measured rather than theoretical.
 it is not even charged for standing there. If `descent_penalty` outweighs what
 distance pays, the best strategy is to do nothing — keep a distance term in the
 objective. `standing_still_does_not_beat_travelling` is the gate.
+
+That hazard is not hypothetical. Measured over 150 generations at
+`descent_penalty = 8`, a population converged on rising slightly while
+travelling a median of **0.20 m**, against **1.57 m** for an arm under gentler
+scoring. It had found that standing still is the cheapest way to not descend.
+
+`fall_penalty` is the targeted replacement:
+
+```toml
+[fitness]
+fall_penalty = 8.0        # per metre lost while out of contact with the ground
+```
+
+It charges only for height given away *while no attached part is touching the
+ground* — the part of a descent the organism did not choose. Walking down a slope
+keeps contact and costs nothing; stepping off a terrace does not. That makes
+"do not fall" expressible without also making "do not go downhill" expressible,
+which is what any task involving a destination below you requires.
+`falling_is_charged_where_walking_downhill_is_not` and
+`fall_penalty_does_not_reward_standing_still` are the gates.
 
 **A climb bonus is worth nothing on ground with no reachable climb.** Across 150
 generations of the shipped fractal experiment, not one organism ever ended higher

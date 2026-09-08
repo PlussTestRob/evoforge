@@ -23,6 +23,14 @@ Stage 7 (`Objective::Climb`) and stage 8 (a run) are deliberately not done: the
 measurement in stage 3 says neither is worth doing until the terrain question
 below is settled.
 
+**Added afterwards, once §4's hazard turned up in a real run.** `Metrics` gained
+`fall_distance` — height lost while out of contact — and `FitnessCfg` gained
+`fall_penalty`, `ARTIFACT_FORMAT` 10. §4 predicted that `descent_penalty` would
+price immobility as the safest strategy, and a 150-generation run confirmed it:
+the population converged on rising slightly while travelling a median 0.20 m,
+against 1.57 m for a gentler arm. `fall_penalty` charges only the descent an
+organism did not choose, so going downhill on purpose stays free.
+
 > ### Correction from stage 3: `climb_bonus` currently does nothing
 >
 > Re-scoring all 15,000 organisms of the 150-generation fractal run under

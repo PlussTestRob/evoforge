@@ -97,6 +97,16 @@ pub struct Metrics {
     /// [`Metrics::climb`].
     #[serde(default)]
     pub descent: Real,
+    /// Height lost while no attached part was touching the ground: falling, as
+    /// opposed to walking downhill.
+    ///
+    /// `descent` charges a controlled descent exactly what it charges a tumble,
+    /// and an objective built on it makes standing still the best answer —
+    /// an organism that never moves never loses height. This separates the two.
+    /// Losing contact is what distinguishes a fall from a step down, and the
+    /// same clearance margin `airborne_seconds` uses decides it.
+    #[serde(default)]
+    pub fall_distance: Real,
     /// Joints that wore out and let a limb detach during the run.
     ///
     /// An outcome, not a rendering detail: this is recorded for *every*
@@ -151,6 +161,11 @@ pub fn score(cfg: &FitnessCfg, m: &Metrics) -> Real {
         - cfg.descent_penalty * m.net_loss
         + cfg.cumulative_climb_bonus * m.climb
         - cfg.cumulative_descent_penalty * m.descent
+        // Charged for height given away while out of contact, which is the part
+        // of a descent the organism did not choose. Distinct from
+        // `descent_penalty`, which cannot tell a controlled walk downhill from a
+        // fall and therefore prices immobility as the safest strategy.
+        - cfg.fall_penalty * m.fall_distance
 }
 
 #[cfg(test)]
@@ -178,6 +193,7 @@ mod tests {
             net_loss: 0.0,
             climb: 0.0,
             descent: 0.0,
+            fall_distance: 0.0,
             joints_lost: 0,
             diverged: false,
         }
@@ -265,6 +281,62 @@ mod tests {
         );
     }
 
+    /// The distinction the term exists to make.
+    ///
+    /// Two organisms end the run the same distance below where they started.
+    /// One walked down; one fell. `descent_penalty` cannot tell them apart and
+    /// charges both, which is why an objective built on it prices standing
+    /// still as the safest strategy. `fall_penalty` charges only the one that
+    /// lost contact with the ground.
+    #[test]
+    fn falling_is_charged_where_walking_downhill_is_not() {
+        let cfg = FitnessCfg { fall_penalty: 8.0, ..Default::default() };
+
+        let mut walker = metrics();
+        walker.net_loss = 0.5;
+        walker.fall_distance = 0.0;
+
+        let mut faller = metrics();
+        faller.net_loss = 0.5;
+        faller.fall_distance = 0.5;
+
+        assert_eq!(score(&cfg, &walker), score(&cfg, &metrics()), "descending on foot is free");
+        assert!(
+            (score(&cfg, &walker) - score(&cfg, &faller) - 4.0).abs() < 1e-4,
+            "half a metre dropped should cost fall_penalty/2"
+        );
+    }
+
+    /// And the failure mode it removes: under `descent_penalty`, doing nothing
+    /// beats going somewhere and losing a little height. Under `fall_penalty`
+    /// it does not.
+    #[test]
+    fn fall_penalty_does_not_reward_standing_still() {
+        let still = Metrics { diverged: false, ..Default::default() };
+        let mut walker = Metrics { diverged: false, ..Default::default() };
+        walker.displacement = 3.0;
+        walker.displacement_x = 3.0;
+        walker.net_loss = 0.4; // walked down a slope, never left the ground
+        walker.fall_distance = 0.0;
+
+        let harsh = FitnessCfg {
+            objective: Objective::DistanceX,
+            descent_penalty: 8.0,
+            ..Default::default()
+        };
+        assert!(
+            score(&harsh, &still) > score(&harsh, &walker),
+            "the behaviour being replaced: descent_penalty makes immobility win"
+        );
+
+        let targeted =
+            FitnessCfg { objective: Objective::DistanceX, fall_penalty: 8.0, ..Default::default() };
+        assert!(
+            score(&targeted, &walker) > score(&targeted, &still),
+            "fall_penalty must leave a controlled descent worth making"
+        );
+    }
+
     /// The weights are the only thing that turns these terms on, so a default
     /// configuration must score exactly as it did before they existed.
     #[test]
@@ -276,6 +348,7 @@ mod tests {
         m.net_loss = 3.0;
         m.climb = 9.0;
         m.descent = 9.0;
+        m.fall_distance = 9.0;
         assert_eq!(score(&cfg, &m), before, "an unweighted elevation term changed the score");
     }
 
