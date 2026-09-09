@@ -1,0 +1,29 @@
+---
+description: EvoForge core invariants — always apply these to every session
+alwaysApply: true
+---
+
+# EvoForge — Core Invariants
+
+EvoForge is a **headless evolutionary artificial-life simulator** in Rust. Organisms of jointed primitive parts are evolved in a physics simulation; the `evo` CLI is the only user-facing surface. There is no game engine, no ML framework, no GPU path.
+
+## The four invariants everything must preserve
+
+**1. Evaluation is a pure function of `(genome, config)`.**
+`sim::evaluate` reads no globals, no clock, no shared state. Never add ambient state or side effects to the evaluation path.
+
+**2. Randomness is derived, never ambient.**
+All streams come from `rng::derive_seed`. Never draw from a shared generator whose position depends on execution order.
+
+**3. Off is exact.**
+A feature disabled by setting its rate, probability, or weight to zero must draw the identical random stream, keep the identical controller input count, and reproduce every earlier result bit-for-bit. Enabling a new optional feature must satisfy this before it is merged.
+
+**4. `fitness::score` reads `Metrics` and nothing else.**
+It must never reach into the physics world. New fitness objectives go through recorded metrics + `evo rescore`, not through the solver.
+
+## What this means in practice
+
+- Do not change `ARTIFACT_FORMAT` unless the stored artifact schema changes; if you do, document it in `CHANGELOG.md`.
+- Do not add `std` transcendentals (`f32::sin`, `f64::ln`, etc.) anywhere in the hot path — use `src/math.rs` hand-rolled versions.
+- Module dependencies point downward only: `fitness` cannot see physics; `evolution` cannot see `RigidBody`.
+- The corpse gate (`a_dead_organism_does_not_travel`) and `travel_survives_refining_the_solver` are standing correctness tests — do not delete or weaken them.

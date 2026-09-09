@@ -1,0 +1,28 @@
+---
+description: Rules for the golden test suite — do not casually rewrite constants
+globs: tests/**/*.rs
+alwaysApply: false
+---
+
+# Golden Tests
+
+`tests/golden.rs` contains committed numeric constants compared against a short deterministic run on all three CI platforms (Ubuntu, Windows, macOS). They are the strongest correctness guarantee in the codebase.
+
+## Do not rewrite the constants casually
+
+A golden constant that changes means one of two things:
+
+1. **A deliberate, versioned change** — you intentionally altered simulator behaviour, incremented `ARTIFACT_FORMAT`, and updated `CHANGELOG.md`. In that case, regenerate with `cargo run --release --example golden_probe` and commit the new values with an explanation.
+2. **A bug** — the change was unintended. Find and fix the cause; do not update the constants to match broken output.
+
+If you are unsure which it is, treat it as a bug until proven otherwise.
+
+## Adding a new test
+
+- Gate tests (e.g. `a_dead_organism_does_not_travel`, `standing_still_does_not_beat_travelling`) follow the pattern: construct a minimal scenario, assert the invariant, give the test a name that is a complete sentence describing what must be true.
+- Determinism tests compare a run against itself across thread counts — not against hardcoded values. Use `evo verify` for this; the CLI job in CI already covers it.
+- Do not add `#[ignore]` to a failing test. Either fix it or delete it with a comment explaining why the invariant no longer holds.
+
+## The "off is exact" gate
+
+Any new optional feature needs a test asserting that `feature_disabled_reproduces_prior_golden`: run with the feature off and assert the output matches the pre-feature golden constants. This is non-negotiable before the feature is merged.

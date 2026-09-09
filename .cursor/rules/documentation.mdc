@@ -1,0 +1,33 @@
+---
+description: Documentation structure — what goes where in the EvoForge doc set
+globs: "**/*.md"
+alwaysApply: false
+---
+
+# Documentation Structure
+
+Each document has a single job. Put content in the right place rather than duplicating it.
+
+| File | What belongs here |
+|---|---|
+| `README.md` | Front door only: what it is, prerequisites, Quick Start commands, sensing rule, doc map, project status. Target ~250 lines. |
+| `RESULTS.md` | Measured findings from real runs: terrain A/B, corpse gate figures, sensor arm comparisons, Baumgarte notes, calibration failures. Cut-and-rehome from run notes; do not rewrite. |
+| `CONFIG.md` | TOML experiment guide: all config knobs with worked examples. Source of truth for what each field does in prose. `src/config.rs` is the source of truth for types and defaults. |
+| `ARCHITECTURE.md` | Why the code is shaped the way it is: purity, determinism, module map, pipeline, replaceable seams. Not a tutorial. |
+| `ROADMAP.md` | Phases, open questions, invariants. Update Phase 0 when something ships; mark done work explicitly in Done/Open sections. |
+| `CONTRIBUTING.md` | Build, test, lint commands; golden-test rules; how to add experiments and probes. |
+| `CHANGELOG.md` | `ARTIFACT_FORMAT` bumps and what changed. One entry per version. Do not invent history. |
+| `*_PLAN.md` | Implementation/lab notes. Leave historical plans as archives. Mark status at the top. |
+
+## README must not grow back
+
+Do not add config essays, measured results tables, or lab notes to `README.md`. Those go in `CONFIG.md` or `RESULTS.md` respectively. The README is a front door, not a notebook.
+
+## Stale claims to watch for
+
+- "not yet built" / "planned" / "future" for anything that is already shipped
+- Future-tense descriptions of the CLI when commands exist
+- Phase numbers in ROADMAP that contradict what is in Phase 0's inventory
+- "See README.md" links that should now point to `RESULTS.md` or `CONFIG.md`
+
+When fixing a stale claim, update it in place — do not add a correction note alongside the wrong text.

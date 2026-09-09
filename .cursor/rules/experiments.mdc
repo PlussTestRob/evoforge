@@ -1,0 +1,37 @@
+---
+description: Discipline for experiment TOML files — off is exact, document what you measure
+globs: experiments/**/*.toml
+alwaysApply: false
+---
+
+# Experiment TOML Files
+
+## Off is exact — never approximate
+
+Setting a rate, probability, or weight to `0` (or omitting a field that defaults to `0`) must produce the **identical random stream and controller layout** as if the feature did not exist. This is not a convention; it is a correctness contract enforced by `tests/golden.rs`.
+
+```toml
+# ✅ Disabling sensing is exact — no sensor gene drawn, controller unchanged
+sensor_probability = 0
+
+# ✅ Disabling joint wear is exact — no caution gene, same input count
+joint_endurance = 0
+
+# ❌ Never use a tiny nonzero value to "almost disable" a feature
+sensor_probability = 0.001  # draws randomness, changes controller layout
+```
+
+## Adding a new experiment
+
+- Copy the closest existing `.toml` and change only what you intend to test.
+- Give it a name that describes the independent variable, not the hypothesis (`brittle-walkers.toml`, not `joints-should-fail.toml`).
+- After running it, verify the corpse gate: `cargo run --release --example dead_organism_probe -- runs/<your-run>`. Record the result alongside your findings.
+- If the dynamics change (new terrain model, new solver setting, etc.) it is a new experiment — do not resume an old run under new settings.
+
+## Changing an existing experiment
+
+Changing any field that affects dynamics (physics, genome, terrain, solver) changes the experiment. The stored runs are no longer comparable to new runs. Note this explicitly if you change a shipped experiment file; consider making a new file instead.
+
+## Fields that affect `config digest`
+
+Any field in `fingerprint()` in `src/config.rs` is included in the resume guard. Changing such a field in a config file will prevent `--resume` from working on existing runs. This is intentional; do not add an escape hatch.

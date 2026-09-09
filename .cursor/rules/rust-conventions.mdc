@@ -1,0 +1,37 @@
+---
+description: Rust coding conventions for EvoForge source files
+globs: src/**/*.rs
+alwaysApply: false
+---
+
+# Rust Conventions
+
+## Formatting and lint
+
+- `rustfmt.toml`: `max_width = 100`, `use_small_heuristics = "Max"`. Run `cargo fmt` before every commit.
+- CI runs `cargo clippy --workspace --all-targets -- -D warnings`. All warnings are errors. Fix them, don't `#[allow]` them without a comment explaining why.
+
+## Transcendentals
+
+Never use `f32::sin`, `f32::cos`, `f32::ln`, `f32::tanh`, or any `std` floating-point transcendental in `src/`. Use the hand-rolled versions in `src/math.rs`. This is what makes results identical across platforms.
+
+```rust
+// ❌ BAD — platform libm, breaks cross-platform determinism
+let s = angle.sin();
+
+// ✅ GOOD
+use crate::math::sin;
+let s = sin(angle);
+```
+
+## Adding a new `Metrics` field
+
+1. Add the field to the `Metrics` struct in `src/sim.rs`.
+2. Record it in `sim::evaluate` (or the trial aggregation path).
+3. Expose it as an optional `FitnessCfg` term in `src/fitness.rs` — defaulting to zero so older runs are unaffected.
+4. Increment `ARTIFACT_FORMAT` in `src/record.rs` and add a fallback default for older artifacts.
+5. Add a gate test: a run with the term at zero must reproduce the pre-change golden exactly.
+
+## New config fields
+
+Add to `src/config.rs` with a `#[serde(default)]` so old TOML files load without the field. Include the field in `fingerprint()` only if it affects dynamics (i.e., would change simulation output). Fields that only affect recording or display do not belong in the fingerprint.
